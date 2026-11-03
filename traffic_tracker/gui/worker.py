@@ -22,15 +22,13 @@ class ProcessWorker(QThread):
 
     def __init__(
         self,
-        videos: list[Path],
-        geometry: Geometry,
+        jobs: list[tuple[Path, Geometry]],
         export_dir: Path,
         clock_start: datetime | None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        self._videos = videos
-        self._geometry = geometry
+        self._jobs = jobs
         self._export_dir = export_dir
         self._clock_start = clock_start
         self._cancel = False
@@ -41,7 +39,7 @@ class ProcessWorker(QThread):
     def run(self) -> None:
         results: list[ProcessResult] = []
         try:
-            for video in self._videos:
+            for video, geometry in self._jobs:
                 if self._cancel:
                     break
 
@@ -53,7 +51,7 @@ class ProcessWorker(QThread):
 
                 result = process_video(
                     str(video),
-                    self._geometry,
+                    geometry,
                     cancel_flag=lambda: self._cancel,
                     progress_cb=progress_cb,
                     preview_cb=preview_cb,
@@ -63,7 +61,7 @@ class ProcessWorker(QThread):
                 elif not result.error:
                     table = build_tmc_table(
                         result.trips,
-                        [route.name for route in self._geometry.routes],
+                        [route.name for route in geometry.routes],
                         result.video.duration_s,
                         self._clock_start,
                     )

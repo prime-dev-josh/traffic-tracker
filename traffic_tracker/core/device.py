@@ -8,10 +8,10 @@ _cached_device: str | None = None
 
 
 def detect_device(timeout_s: float = 4.0) -> str:
-    """Return 'cuda' when an NVIDIA GPU is usable, otherwise 'cpu'.
+    """Prefer CUDA, then Apple MPS, otherwise CPU.
 
-    The CUDA probe runs in a short-lived thread so a stuck driver check
-    cannot freeze the GUI. macOS MPS can be added later.
+    The probe runs in a short-lived thread so a stuck driver check
+    cannot freeze the GUI.
     """
     global _cached_device
     if _cached_device is not None:
@@ -25,6 +25,10 @@ def detect_device(timeout_s: float = 4.0) -> str:
 
             if torch.cuda.is_available():
                 result[0] = "cuda"
+                return
+            mps = getattr(torch.backends, "mps", None)
+            if mps is not None and mps.is_available():
+                result[0] = "mps"
         except Exception:
             pass
 
@@ -46,4 +50,8 @@ def describe_device(device: str) -> str:
             return f"CUDA ({name})"
         except Exception:
             return "CUDA"
-    return "CPU"
+    if device == "mps":
+        return "MPS (Apple Silicon)"
+    if device == "cpu":
+        return "CPU"
+    return device

@@ -20,7 +20,16 @@ VEHICLE_CLASS_NAMES = {
 }
 
 # Nano is the right default for a first useful desktop build.
-YOLO_MODEL_NAME = "yolo11n.pt"
+# Ultralytics AutoBackend loads .pt, .onnx, or an OpenVINO folder.
+YOLO_PT_NAME = "yolo11n.pt"
+YOLO_ONNX_NAME = "yolo11n.onnx"
+YOLO_MODEL_NAME = YOLO_PT_NAME
+OPENVINO_DIR_NAME = "yolo11n_openvino_model"
+EXPORT_IMGSZ = 640
+
+# auto | pt | onnx | openvino
+BACKEND_ENV = "TRAFFIC_TRACKER_BACKEND"
+MODEL_ENV = "TRAFFIC_TRACKER_MODEL"
 
 # Skip the very start/end when picking a drawing frame (often black or empty).
 RANDOM_FRAME_MARGIN = 0.10

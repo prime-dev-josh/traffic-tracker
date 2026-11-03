@@ -41,6 +41,17 @@ def _elapsed_label(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def tmc_tables_close(left: pd.DataFrame, right: pd.DataFrame, *, max_abs_diff: int = 1) -> bool:
+    """True when route counts match within a small per-cell tolerance."""
+    if list(left.columns) != list(right.columns) or len(left) != len(right):
+        return False
+    count_cols = [c for c in left.columns if c not in ("Interval Start", "Interval End")]
+    for col in count_cols:
+        if (left[col].astype(int) - right[col].astype(int)).abs().max() > max_abs_diff:
+            return False
+    return True
+
+
 def build_tmc_table(
     trips: list[Trip],
     route_names: list[str],

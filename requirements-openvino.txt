@@ -1,0 +1,5 @@
+# Intel CPU / iGPU OpenVINO export and runtime.
+# After install: python scripts/export_models.py --openvino
+# Then: set TRAFFIC_TRACKER_BACKEND=openvino
+-r requirements.txt
+openvino>=2024.0.0

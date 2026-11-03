@@ -1,0 +1,7 @@
+# ONNX Runtime CPU (default exported-model path).
+# Ultralytics AutoBackend uses this when yolo11n.onnx is present.
+# Do not install together with requirements-winml.txt.
+-r requirements.txt
+onnx>=1.16.0
+onnxslim>=0.1.82
+onnxruntime>=1.19.0

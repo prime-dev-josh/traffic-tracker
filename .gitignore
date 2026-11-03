@@ -8,6 +8,7 @@ __pycache__/
 .vscode/
 *.pt
 *.onnx
+*_openvino_model/
 *.xlsx
 *.xls
 *.csv

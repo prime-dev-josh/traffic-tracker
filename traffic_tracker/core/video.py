@@ -61,6 +61,58 @@ def probe_video(path: str | Path) -> VideoInfo:
         cap.release()
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m {secs:02d}s"
+
+
+def file_size_gb(path: str | Path) -> float:
+    try:
+        return Path(path).stat().st_size / (1024**3)
+    except OSError:
+        return 0.0
+
+
+def is_onedrive_path(path: str | Path) -> bool:
+    try:
+        parts = Path(path).resolve().parts
+    except OSError:
+        parts = Path(path).parts
+    return any("onedrive" in part.lower() for part in parts)
+
+
+def grab_frame_at(path: str | Path, time_s: float) -> tuple[np.ndarray, int]:
+    """Seek to a time (seconds) and return (BGR frame, frame index). Does not decode the file."""
+    info = probe_video(path)
+    duration = info.duration_s if info.duration_s > 0 else 0.0
+    t = min(max(0.0, time_s), max(0.0, duration - 0.05)) if duration else 0.0
+    index = int(t * info.fps) if info.fps > 0 else 0
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = cap.read()
+            index = 0
+        if not ok or frame is None:
+            raise RuntimeError(f"Could not read a frame from: {path}")
+        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or index)
+        return frame, max(0, pos - 1)
+    finally:
+        cap.release()
+
+
 def grab_random_frame(path: str | Path, rng: random.Random | None = None) -> tuple[np.ndarray, int]:
     """Return (BGR frame, frame index) from the middle portion of the video."""
     info = probe_video(path)

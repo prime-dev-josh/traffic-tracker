@@ -1,5 +1,6 @@
 # Traffic Tracker — Python 3.11
-ultralytics>=8.3.0
+# Extras: requirements-onnx.txt, requirements-winml.txt, requirements-openvino.txt
+ultralytics>=8.3.0,<8.5
 supervision>=0.25.0
 PyQt6>=6.7.0
 opencv-python>=4.10.0

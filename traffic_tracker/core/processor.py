@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from traffic_tracker.config import VEHICLE_CLASS_IDS, VEHICLE_CLASS_NAMES, YOLO_MODEL_NAME
+from traffic_tracker.config import VEHICLE_CLASS_IDS, VEHICLE_CLASS_NAMES
 from traffic_tracker.core.device import describe_device, detect_device
 from traffic_tracker.core.geometry import Geometry
+from traffic_tracker.core.models import ModelSource, resolve_model_source
 from traffic_tracker.core.report import Trip
 from traffic_tracker.core.video import VideoInfo, probe_video
 
@@ -26,6 +27,7 @@ class ProcessResult:
     device_label: str
     geometry: Geometry
     error: str | None = None
+    model_label: str = ""
 
 
 @dataclass
@@ -38,20 +40,34 @@ class _Pending:
 
 
 _model = None
+_model_source: ModelSource | None = None
 
 
 def _class_name(class_id: int) -> str:
     return VEHICLE_CLASS_NAMES.get(int(class_id), "vehicle")
 
 
-def _get_model():
-    """Load YOLO11 once so a batch of videos does not reload weights each time."""
-    global _model
-    if _model is None:
+def _get_model(source: ModelSource | None = None):
+    """Load YOLO11 once via Ultralytics AutoBackend (.pt, .onnx, or OpenVINO).
+
+    Do not replace this with a custom ORT/NMS path. ByteTrack stays in
+    ``model.track(persist=True)``.
+    """
+    global _model, _model_source
+    source = source or resolve_model_source()
+    if _model is None or _model_source != source:
         from ultralytics import YOLO
 
-        _model = YOLO(YOLO_MODEL_NAME)
-    return _model
+        _model = YOLO(str(source.path))
+        _model_source = source
+    return _model, source
+
+
+def reset_model_cache() -> None:
+    """Drop the cached Ultralytics model so a new backend can load."""
+    global _model, _model_source
+    _model = None
+    _model_source = None
 
 
 def _reset_tracker(model) -> None:
@@ -80,8 +96,9 @@ def process_video(
     if progress_cb:
         progress_cb(0, info.frame_count or 1, "Loading YOLO11 model…")
 
-    model = _get_model()
+    model, source = _get_model()
     _reset_tracker(model)
+    device_label = f"{device_label}  •  {source.label}"
 
     start_zones: list[tuple[str, sv.LineZone]] = []
     end_zones: list[tuple[str, sv.LineZone]] = []
@@ -113,13 +130,15 @@ def process_video(
 
     cap = cv2.VideoCapture(str(info.path))
     if not cap.isOpened():
-        return ProcessResult(info, [], device_label, fitted, error=f"Could not open {info.path}")
+        return ProcessResult(
+            info, [], device_label, fitted, error=f"Could not open {info.path}", model_label=source.label
+        )
 
     frame_idx = 0
     try:
         while True:
             if cancel_flag and cancel_flag():
-                return ProcessResult(info, trips, device_label, fitted, error="Cancelled")
+                return ProcessResult(info, trips, device_label, fitted, error="Cancelled", model_label=source.label)
 
             ok, frame = cap.read()
             if not ok:
@@ -171,7 +190,7 @@ def process_video(
 
     if progress_cb:
         progress_cb(info.frame_count or frame_idx, info.frame_count or frame_idx, f"Finished {info.name}")
-    return ProcessResult(info, trips, device_label, fitted)
+    return ProcessResult(info, trips, device_label, fitted, model_label=source.label)
 
 
 def _draw_route_overlay(frame: np.ndarray, geometry: Geometry) -> np.ndarray:

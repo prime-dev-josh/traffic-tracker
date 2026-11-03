@@ -1,0 +1,9 @@
+# Windows mixed GPU path (NVIDIA / AMD / Intel via WinML).
+# Best on Windows 11 24H2+. Mutually exclusive with other ORT wheels.
+#
+#   pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-directml
+#   pip install -r requirements-winml.txt
+#
+-r requirements.txt
+onnx>=1.16.0
+onnxruntime-windowsml
