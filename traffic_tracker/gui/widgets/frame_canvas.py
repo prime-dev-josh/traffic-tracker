@@ -7,13 +7,14 @@ from collections.abc import Callable
 import cv2
 import numpy as np
 from PyQt6.QtCore import QLineF, QPointF, Qt
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
-from traffic_tracker.core.geometry import Geometry, Line, Route
+from traffic_tracker.core.geometry import Geometry, Line
 
 START_COLOR = QColor(61, 214, 140)
 END_COLOR = QColor(255, 107, 107)
+NORTH_COLOR = QColor(61, 184, 253)
 DRAFT_COLOR = QColor(61, 139, 253)
 LABEL_COLOR = QColor(232, 234, 237)
 MATCH_COLOR = QColor(255, 214, 10)
@@ -31,7 +32,7 @@ class FrameCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
         self._pixmap = QPixmap()
         self._image_size = (1, 1)
-        self._routes: list[Route] = []
+        self._geometry = Geometry(1, 1)
         self._draft_start: QPointF | None = None
         self._draft_end: QPointF | None = None
         self._drawing = False
@@ -63,8 +64,12 @@ class FrameCanvas(QWidget):
         self._pixmap = QPixmap.fromImage(image)
         self.update()
 
-    def set_routes(self, routes: list[Route]) -> None:
-        self._routes = list(routes)
+    def set_geometry(self, geometry: Geometry | None) -> None:
+        self._geometry = geometry or Geometry(1, 1)
+        self.update()
+
+    def set_routes(self, _routes) -> None:
+        """Compatibility no-op; use set_geometry."""
         self.update()
 
     def set_drawing_enabled(self, enabled: bool) -> None:
@@ -83,8 +88,7 @@ class FrameCanvas(QWidget):
         return self._image_size
 
     def to_geometry(self) -> Geometry:
-        width, height = self._image_size
-        return Geometry(frame_width=width, frame_height=height, routes=list(self._routes))
+        return self._geometry
 
     def _display_rect(self):
         from PyQt6.QtCore import QRectF
@@ -193,14 +197,34 @@ class FrameCanvas(QWidget):
         def draw_labeled_line(line: Line, color: QColor, label: str) -> None:
             p1 = self._image_to_widget(line.x1, line.y1)
             p2 = self._image_to_widget(line.x2, line.y2)
-            pen = QPen(color, 3)
-            painter.setPen(pen)
+            painter.setPen(QPen(color, 3))
             painter.drawLine(QLineF(p1, p2))
+            painter.setPen(LABEL_COLOR)
             painter.drawText(p1 + QPointF(6, -6), label)
 
-        for route in self._routes:
-            draw_labeled_line(route.start, START_COLOR, f"{route.name} start")
-            draw_labeled_line(route.end, END_COLOR, f"{route.name} end")
+        def draw_north(line: Line) -> None:
+            p1 = self._image_to_widget(line.x1, line.y1)
+            p2 = self._image_to_widget(line.x2, line.y2)
+            painter.setPen(QPen(NORTH_COLOR, 3))
+            painter.drawLine(QLineF(p1, p2))
+            dx = p2.x() - p1.x()
+            dy = p2.y() - p1.y()
+            length = (dx * dx + dy * dy) ** 0.5 or 1.0
+            ux, uy = dx / length, dy / length
+            left = QPointF(p2.x() - ux * 14 + uy * 7, p2.y() - uy * 14 - ux * 7)
+            right = QPointF(p2.x() - ux * 14 - uy * 7, p2.y() - uy * 14 + ux * 7)
+            painter.setBrush(NORTH_COLOR)
+            painter.drawPolygon(QPolygonF([p2, left, right]))
+            painter.setPen(LABEL_COLOR)
+            painter.drawText(p2 + QPointF(8, -8), "North")
+
+        geom = self._geometry
+        if geom.north is not None:
+            draw_north(geom.north)
+        for item in geom.starts:
+            draw_labeled_line(item.line, START_COLOR, item.name or "Start")
+        for item in geom.ends:
+            draw_labeled_line(item.line, END_COLOR, item.name or "End")
 
         if self._draft_start is not None and self._draft_end is not None:
             p1 = self._image_to_widget(self._draft_start.x(), self._draft_start.y())

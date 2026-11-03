@@ -1,4 +1,4 @@
-"""Named start/end line pairs that define intersection routes."""
+"""Entry/exit lines named from a user-set North heading."""
 
 from __future__ import annotations
 
@@ -7,6 +7,34 @@ from pathlib import Path
 from typing import Any
 import json
 import math
+
+ORIGINS = ("N", "S", "E", "W")
+BOUNDS = ("NB", "SB", "EB", "WB")
+ORIGIN_TO_BOUND = {"N": "NB", "S": "SB", "E": "EB", "W": "WB"}
+MAX_GATES = 4
+_NAME_HEADING = {"N": 0.0, "NB": 0.0, "E": 90.0, "EB": 90.0, "S": 180.0, "SB": 180.0, "W": 270.0, "WB": 270.0}
+
+
+def movement_name(origin: str, bound: str) -> str:
+    """Cardinal origin plus exit bound, e.g. N-SB."""
+    return f"{origin}-{bound}"
+
+
+def all_movement_names() -> list[str]:
+    return [movement_name(origin, bound) for origin in ORIGINS for bound in BOUNDS]
+
+
+def ordered_origins(names: list[str]) -> list[str]:
+    return [name for name in ORIGINS if name in names]
+
+
+def ordered_bounds(names: list[str]) -> list[str]:
+    return [name for name in BOUNDS if name in names]
+
+
+def image_heading_deg(dx: float, dy: float) -> float:
+    """Heading in image space: 0 = up, clockwise, 0–360."""
+    return math.degrees(math.atan2(dx, -dy)) % 360.0
 
 
 @dataclass
@@ -19,9 +47,20 @@ class Line:
     def scaled(self, sx: float, sy: float) -> "Line":
         return Line(self.x1 * sx, self.y1 * sy, self.x2 * sx, self.y2 * sy)
 
+    def midpoint(self) -> tuple[float, float]:
+        return (self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0
+
+
+@dataclass
+class NamedLine:
+    name: str
+    line: Line
+
 
 @dataclass
 class Route:
+    """Derived movement label, not a drawn pair."""
+
     name: str
     start: Line
     end: Line
@@ -29,11 +68,7 @@ class Route:
 
 @dataclass
 class Transform:
-    """Map reference-scaled lines onto a shifted camera frame.
-
-    Similarity (translate / scale / rotate about the frame center) is the
-    default. A 3x3 homography, when set, replaces that similarity.
-    """
+    """Map reference-scaled lines onto a shifted camera frame."""
 
     tx: float = 0.0
     ty: float = 0.0
@@ -76,17 +111,15 @@ class Transform:
     def apply_geometry(self, geom: "Geometry") -> "Geometry":
         cx = geom.frame_width / 2.0
         cy = geom.frame_height / 2.0
+        north = None
+        if geom.north is not None:
+            north = self.apply_line(geom.north, cx, cy)
         return Geometry(
             frame_width=geom.frame_width,
             frame_height=geom.frame_height,
-            routes=[
-                Route(
-                    name=route.name,
-                    start=self.apply_line(route.start, cx, cy),
-                    end=self.apply_line(route.end, cx, cy),
-                )
-                for route in geom.routes
-            ],
+            north=north,
+            starts=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.starts],
+            ends=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.ends],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -118,7 +151,6 @@ def transform_from_matches(
     src_points: list[tuple[float, float]],
     dst_points: list[tuple[float, float]],
 ) -> Transform:
-    """Build a transform from landmark pairs (source → destination)."""
     if len(src_points) < 2 or len(src_points) != len(dst_points):
         raise ValueError("Need at least two matched landmark pairs.")
     import cv2
@@ -139,19 +171,93 @@ def transform_from_matches(
     c, d, ty = float(matrix[1, 0]), float(matrix[1, 1]), float(matrix[1, 2])
     scale = math.hypot(a, c)
     rotation_deg = math.degrees(math.atan2(c, a)) if scale > 1e-6 else 0.0
-    # estimateAffinePartial2D is about the origin, not the frame center.
-    # Store as homography so apply_point stays exact.
     homo = [a, b, tx, c, d, ty, 0.0, 0.0, 1.0]
     return Transform(tx=tx, ty=ty, scale=scale or 1.0, rotation_deg=rotation_deg, homography=homo)
 
 
+def _angle_error(heading: float, target: float) -> float:
+    return abs((heading - target + 180.0) % 360.0 - 180.0)
+
+
+def _assign_by_north(lines: list[Line], names: tuple[str, ...], north: Line, frame_w: int, frame_h: int) -> list[NamedLine]:
+    """Map 1–4 lines to the nearest unused cardinal, so one-way streets can omit a side."""
+    if not lines:
+        return []
+    cx = frame_w / 2.0
+    cy = frame_h / 2.0
+    mids = [line.midpoint() for line in lines]
+    cx = sum(p[0] for p in mids) / len(mids)
+    cy = sum(p[1] for p in mids) / len(mids)
+    north_heading = image_heading_deg(north.x2 - north.x1, north.y2 - north.y1)
+    scored: list[tuple[float, Line]] = []
+    for line in lines:
+        mx, my = line.midpoint()
+        heading = (image_heading_deg(mx - cx, my - cy) - north_heading) % 360.0
+        scored.append((heading, line))
+
+    unused = [name for name in names if name in _NAME_HEADING]
+    remaining = set(range(len(scored)))
+    assigned: list[NamedLine | None] = [None] * len(scored)
+    while remaining and unused:
+        best_i = None
+        best_name = None
+        best_err = 1e9
+        for index in remaining:
+            heading = scored[index][0]
+            for name in unused:
+                err = _angle_error(heading, _NAME_HEADING[name])
+                if err < best_err:
+                    best_i = index
+                    best_name = name
+                    best_err = err
+        if best_i is None or best_name is None:
+            break
+        assigned[best_i] = NamedLine(best_name, scored[best_i][1])
+        remaining.remove(best_i)
+        unused.remove(best_name)
+    return [item for item in assigned if item is not None]
+
+
 @dataclass
 class Geometry:
-    """Routes drawn on a reference frame of known pixel size."""
+    """North heading plus four entry lines and four exit lines."""
 
     frame_width: int
     frame_height: int
-    routes: list[Route] = field(default_factory=list)
+    north: Line | None = None
+    starts: list[NamedLine] = field(default_factory=list)
+    ends: list[NamedLine] = field(default_factory=list)
+
+    @property
+    def routes(self) -> list[Route]:
+        """Synthetic pairs for overlays that still expect Route objects."""
+        pairs: list[Route] = []
+        for start in self.starts:
+            for end in self.ends:
+                pairs.append(Route(movement_name(start.name, end.name), start.line, end.line))
+        return pairs
+
+    def is_ready(self) -> bool:
+        return self.north is not None and len(self.starts) >= 1 and len(self.ends) >= 1
+
+    def origin_names(self) -> list[str]:
+        return ordered_origins([item.name for item in self.starts if item.name])
+
+    def bound_names(self) -> list[str]:
+        return ordered_bounds([item.name for item in self.ends if item.name])
+
+    def movement_names(self) -> list[str]:
+        return [movement_name(origin, bound) for origin in self.origin_names() for bound in self.bound_names()]
+
+    def assign_names(self) -> None:
+        if self.north is None:
+            return
+        start_lines = [item.line for item in self.starts]
+        end_lines = [item.line for item in self.ends]
+        if start_lines:
+            self.starts = _assign_by_north(start_lines, ORIGINS, self.north, self.frame_width, self.frame_height)
+        if end_lines:
+            self.ends = _assign_by_north(end_lines, BOUNDS, self.north, self.frame_width, self.frame_height)
 
     def scaled_to(self, width: int, height: int) -> "Geometry":
         if width == self.frame_width and height == self.frame_height:
@@ -160,51 +266,46 @@ class Geometry:
             return self
         sx = width / self.frame_width
         sy = height / self.frame_height
+        north = self.north.scaled(sx, sy) if self.north else None
         return Geometry(
             frame_width=width,
             frame_height=height,
-            routes=[
-                Route(name=route.name, start=route.start.scaled(sx, sy), end=route.end.scaled(sx, sy))
-                for route in self.routes
-            ],
+            north=north,
+            starts=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.starts],
+            ends=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.ends],
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "frame_width": self.frame_width,
             "frame_height": self.frame_height,
-            "routes": [
-                {
-                    "name": route.name,
-                    "start": asdict(route.start),
-                    "end": asdict(route.end),
-                }
-                for route in self.routes
-            ],
+            "north": asdict(self.north) if self.north else None,
+            "starts": [{"name": item.name, "line": asdict(item.line)} for item in self.starts],
+            "ends": [{"name": item.name, "line": asdict(item.line)} for item in self.ends],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Geometry":
-        routes = []
-        for item in data.get("routes", []):
-            routes.append(
-                Route(
-                    name=str(item["name"]),
-                    start=Line(**item["start"]),
-                    end=Line(**item["end"]),
-                )
-            )
-        return cls(
-            frame_width=int(data["frame_width"]),
-            frame_height=int(data["frame_height"]),
-            routes=routes,
+        north = Line(**data["north"]) if data.get("north") else None
+        starts = [NamedLine(str(item["name"]), Line(**item["line"])) for item in data.get("starts", [])]
+        ends = [NamedLine(str(item["name"]), Line(**item["line"])) for item in data.get("ends", [])]
+        geom = cls(
+            frame_width=int(data.get("frame_width", 1)),
+            frame_height=int(data.get("frame_height", 1)),
+            north=north,
+            starts=starts,
+            ends=ends,
         )
+        # Legacy pair files: treat each pair as unnamed start/end segments.
+        if not starts and data.get("routes"):
+            for item in data["routes"]:
+                geom.starts.append(NamedLine(str(item.get("name", "start")), Line(**item["start"])))
+                geom.ends.append(NamedLine(str(item.get("name", "end")), Line(**item["end"])))
+        return geom
 
     def save(self, path: str | Path) -> None:
-        path = Path(path)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> "Geometry":
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls.from_dict(data)
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))

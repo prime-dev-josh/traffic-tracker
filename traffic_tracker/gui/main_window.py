@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -33,11 +32,11 @@ from PyQt6.QtWidgets import (
 
 from traffic_tracker.config import APP_NAME, APP_VERSION
 from traffic_tracker.core.device import describe_device, detect_device
-from traffic_tracker.core.geometry import Geometry, Line, Route, Transform, transform_from_matches
+from traffic_tracker.core.geometry import MAX_GATES, Geometry, Line, NamedLine, Transform, transform_from_matches
 from traffic_tracker.core.models import resolve_model_source
 from traffic_tracker.core.processor import ProcessResult
 from traffic_tracker.core.project import BundleProject, ClipRecord
-from traffic_tracker.core.report import build_tmc_table
+from traffic_tracker.core.report import build_gate_statistics_table
 from traffic_tracker.core.video import (
     file_size_gb,
     format_duration,
@@ -66,8 +65,6 @@ class MainWindow(QMainWindow):
         self.export_dir = Path.cwd() / "outputs"
         self.worker: ProcessWorker | None = None
         self.results: list[ProcessResult] = []
-        self._route_name = ""
-        self._pending_start: Line | None = None
         self._draw_step = "idle"
         self._align_index = 0
         self._ref_frame = None
@@ -75,7 +72,6 @@ class MainWindow(QMainWindow):
         self._match_ref: list[tuple[float, float]] = []
         self._match_clip: list[tuple[float, float]] = []
         self._match_side = "ref"
-        self._redraw_queue: list[str] = []
         self._redrawing = False
 
         root = QWidget()
@@ -206,8 +202,11 @@ class MainWindow(QMainWindow):
 
         left = self._card()
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(self._step_title("2. Draw start and end lines"))
-        self.route_hint = QLabel("Add a route, then click and drag each line on the reference frame.")
+        left_layout.addWidget(self._step_title("2. North, then entry and exit lines"))
+        self.route_hint = QLabel(
+            "Set North, then draw the entry and exit lines that exist. "
+            "One-way streets can omit a side. Names come from North as N/S/E/W and NB/SB/EB/WB."
+        )
         self.route_hint.setObjectName("hint")
         self.route_hint.setWordWrap(True)
         left_layout.addWidget(self.route_hint)
@@ -215,20 +214,33 @@ class MainWindow(QMainWindow):
         self.route_list = QListWidget()
         left_layout.addWidget(self.route_list, 1)
 
+        set_north = QPushButton("Set North")
+        set_north.setObjectName("primary")
+        set_north.clicked.connect(self._start_set_north)
+        left_layout.addWidget(set_north)
+
         route_btns = QHBoxLayout()
-        add_route = QPushButton("Add route")
-        add_route.setObjectName("primary")
-        delete_route = QPushButton("Delete")
-        delete_route.setObjectName("danger")
-        add_route.clicked.connect(self._start_add_route)
-        delete_route.clicked.connect(self._delete_route)
-        route_btns.addWidget(add_route)
-        route_btns.addWidget(delete_route)
+        draw_starts = QPushButton("Add start line")
+        draw_ends = QPushButton("Add end line")
+        draw_starts.clicked.connect(lambda: self._start_draw_lines("start"))
+        draw_ends.clicked.connect(lambda: self._start_draw_lines("end"))
+        route_btns.addWidget(draw_starts)
+        route_btns.addWidget(draw_ends)
         left_layout.addLayout(route_btns)
 
+        edit_btns = QHBoxLayout()
+        delete_line = QPushButton("Delete selected")
+        delete_line.clicked.connect(self._delete_selected_line)
+        clear_geom = QPushButton("Clear lines")
+        clear_geom.setObjectName("danger")
+        clear_geom.clicked.connect(self._clear_geometry_lines)
+        edit_btns.addWidget(delete_line)
+        edit_btns.addWidget(clear_geom)
+        left_layout.addLayout(edit_btns)
+
         io_btns = QHBoxLayout()
-        save_geom = QPushButton("Save routes")
-        load_geom = QPushButton("Load routes")
+        save_geom = QPushButton("Save geometry")
+        load_geom = QPushButton("Load geometry")
         save_geom.clicked.connect(self._save_geometry)
         load_geom.clicked.connect(self._load_geometry)
         io_btns.addWidget(save_geom)
@@ -305,6 +317,11 @@ class MainWindow(QMainWindow):
         extra.addWidget(match)
         extra.addWidget(redraw)
         left_layout.addLayout(extra)
+
+        self.finish_gates_btn = QPushButton("Finish start lines")
+        self.finish_gates_btn.clicked.connect(self._finish_redraw_phase)
+        self.finish_gates_btn.setVisible(False)
+        left_layout.addWidget(self.finish_gates_btn)
 
         apply_match = QPushButton("Apply matched points")
         apply_match.clicked.connect(self._apply_match_points)
@@ -397,7 +414,7 @@ class MainWindow(QMainWindow):
     def _build_report_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(self._step_title("5. 15-minute TMC"))
+        layout.addWidget(self._step_title("5. Gate statistics"))
         self.report_summary = QLabel("No results yet.")
         self.report_summary.setObjectName("hint")
         layout.addWidget(self.report_summary)
@@ -508,77 +525,132 @@ class MainWindow(QMainWindow):
             self._ref_size = (width, height)
             self.geometry.frame_width = width
             self.geometry.frame_height = height
-            self.canvas.set_routes(self.geometry.routes)
+            self.canvas.set_geometry(self.geometry)
             self.route_hint.setText(
-                f"Frame {index} from {self.videos[0].name}. Add a route, then drag its start line (green) and end line (red)."
+                f"Frame {index} from {self.videos[0].name}. Set North, then add the entry and exit lines that exist."
             )
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, str(exc))
 
     def _refresh_route_list(self) -> None:
         self.route_list.clear()
-        for route in self.geometry.routes:
-            self.route_list.addItem(route.name)
-        self.canvas.set_routes(self.geometry.routes)
+        if self.geometry.north is not None:
+            self.route_list.addItem("North heading set")
+        else:
+            self.route_list.addItem("North not set")
+        for item in self.geometry.starts:
+            self.route_list.addItem(f"Start  {item.name or '(unnamed)'}")
+        for item in self.geometry.ends:
+            self.route_list.addItem(f"End    {item.name or '(unnamed)'}")
+        if self.geometry.is_ready():
+            names = ", ".join(self.geometry.movement_names())
+            self.route_list.addItem(f"Movements: {names}")
+        self.canvas.set_geometry(self.geometry)
         self.project.geometry = self.geometry
 
-    def _start_add_route(self) -> None:
-        name, ok = QInputDialog.getText(self, "New route", "Route name (example: NB Left)")
-        name = name.strip()
-        if not ok or not name:
-            return
-        if any(route.name == name for route in self.geometry.routes):
-            QMessageBox.information(self, APP_NAME, "That route name is already used.")
-            return
-        self._route_name = name
-        self._pending_start = None
-        self._draw_step = "start"
+    def _start_set_north(self) -> None:
+        self._draw_step = "north"
         self.canvas.set_drawing_enabled(True)
-        self.route_hint.setText(f"Draw the START line for “{name}”. Click and drag on the frame.")
+        self.route_hint.setText("Drag an arrow on the frame that points toward geographic North.")
+
+    def _start_draw_lines(self, kind: str) -> None:
+        if self.geometry.north is None:
+            QMessageBox.information(self, APP_NAME, "Set North first so entry and exit lines can be named.")
+            return
+        existing = self.geometry.starts if kind == "start" else self.geometry.ends
+        if len(existing) >= MAX_GATES:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_GATES} {kind} lines. Delete one to replace it.")
+            return
+        self._draw_step = kind
+        label = "start (entry)" if kind == "start" else "end (exit)"
+        self.route_hint.setText(f"Draw a {label} line. Add only the approaches that exist.")
+        self.canvas.set_drawing_enabled(True)
+
+    def _clear_geometry_lines(self) -> None:
+        self.geometry.north = None
+        self.geometry.starts = []
+        self.geometry.ends = []
+        self._draw_step = "idle"
+        self.canvas.set_drawing_enabled(False)
+        self._refresh_route_list()
+        self.route_hint.setText("Cleared. Set North, then add the entry and exit lines that exist.")
+
+    def _delete_selected_line(self) -> None:
+        row = self.route_list.currentRow()
+        if row <= 0:
+            return
+        start_count = len(self.geometry.starts)
+        if 1 <= row <= start_count:
+            del self.geometry.starts[row - 1]
+        elif start_count < row <= start_count + len(self.geometry.ends):
+            del self.geometry.ends[row - 1 - start_count]
+        else:
+            return
+        self.geometry.assign_names()
+        self._refresh_route_list()
 
     def _on_line_drawn(self, line: Line) -> None:
-        if self._draw_step == "start":
-            self._pending_start = line
-            self._draw_step = "end"
-            self.route_hint.setText(f"Now draw the END line for “{self._route_name}”.")
-            return
-        if self._draw_step == "end" and self._pending_start is not None:
-            self.geometry.routes.append(Route(name=self._route_name, start=self._pending_start, end=line))
+        if self._draw_step == "north":
+            self.geometry.north = line
+            self.geometry.assign_names()
             self._draw_step = "idle"
-            self._pending_start = None
             self.canvas.set_drawing_enabled(False)
             self.canvas.clear_draft()
             self._refresh_route_list()
-            self.route_hint.setText(f"Saved “{self._route_name}”. Add another route or align the other clips.")
-
-    def _delete_route(self) -> None:
-        row = self.route_list.currentRow()
-        if row < 0:
+            self.route_hint.setText("North set. Add start (entry) lines, then end (exit) lines. Skip sides that do not exist.")
             return
-        del self.geometry.routes[row]
-        self._refresh_route_list()
+        if self._draw_step == "start":
+            if len(self.geometry.starts) >= MAX_GATES:
+                return
+            self.geometry.starts.append(NamedLine("", line))
+            self.geometry.assign_names()
+            self.canvas.clear_draft()
+            self._refresh_route_list()
+            count = len(self.geometry.starts)
+            if count >= MAX_GATES:
+                self._draw_step = "idle"
+                self.canvas.set_drawing_enabled(False)
+                self.route_hint.setText("Four start lines named. Add end (exit) lines, or continue if this intersection is ready.")
+                return
+            self.route_hint.setText(f"{count} start line(s). Draw another entry, or add end lines when this side is done.")
+            return
+        if self._draw_step == "end":
+            if len(self.geometry.ends) >= MAX_GATES:
+                return
+            self.geometry.ends.append(NamedLine("", line))
+            self.geometry.assign_names()
+            self.canvas.clear_draft()
+            self._refresh_route_list()
+            count = len(self.geometry.ends)
+            if count >= MAX_GATES:
+                self._draw_step = "idle"
+                self.canvas.set_drawing_enabled(False)
+                self.route_hint.setText("Four end lines named. Align the other clips when ready.")
+                return
+            self.route_hint.setText(f"{count} end line(s). Draw another exit, or go next when this intersection is ready.")
 
     def _save_geometry(self) -> None:
-        if not self.geometry.routes:
-            QMessageBox.information(self, APP_NAME, "Draw at least one route first.")
+        if not self.geometry.is_ready():
+            QMessageBox.information(self, APP_NAME, "Set North and draw at least one start line and one end line.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save routes", "routes.json", "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save geometry", "geometry.json", "JSON (*.json)")
         if path:
             self.geometry.save(path)
-            self.statusBar().showMessage(f"Saved routes to {path}")
+            self.statusBar().showMessage(f"Saved geometry to {path}")
 
     def _load_geometry(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load routes", "", "JSON (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Load geometry", "", "JSON (*.json)")
         if not path:
             return
         try:
             loaded = Geometry.load(path)
             width, height = self.canvas.image_size()
             self.geometry = loaded.scaled_to(width, height) if self.canvas.has_frame() else loaded
+            self.geometry.assign_names()
             self._refresh_route_list()
-            self.route_hint.setText(f"Loaded {len(self.geometry.routes)} route(s) from {Path(path).name}.")
+            self.route_hint.setText(f"Loaded geometry from {Path(path).name}.")
         except Exception as exc:
-            QMessageBox.warning(self, APP_NAME, f"Could not load routes: {exc}")
+            QMessageBox.warning(self, APP_NAME, f"Could not load geometry: {exc}")
 
     def _current_clip(self) -> ClipRecord | None:
         if not self.project.clips:
@@ -586,12 +658,12 @@ class MainWindow(QMainWindow):
         self._align_index = min(max(0, self._align_index), len(self.project.clips) - 1)
         return self.project.clips[self._align_index]
 
-    def _fitted_overlay(self, clip: ClipRecord) -> list[Route]:
+    def _fitted_overlay(self, clip: ClipRecord) -> Geometry:
         if clip.status == "redrawn" and clip.geometry_override is not None:
-            return clip.geometry_override.routes
+            return clip.geometry_override
         width, height = self.align_canvas.image_size()
         fitted = self.geometry.scaled_to(width, height)
-        return clip.transform.apply_geometry(fitted).routes
+        return clip.transform.apply_geometry(fitted)
 
     def _refresh_align_list(self) -> None:
         self.align_list.blockSignals(True)
@@ -609,8 +681,8 @@ class MainWindow(QMainWindow):
         self.align_list.blockSignals(False)
 
     def _go_align(self) -> None:
-        if not self.geometry.routes:
-            QMessageBox.information(self, APP_NAME, "Draw or load at least one route.")
+        if not self.geometry.is_ready():
+            QMessageBox.information(self, APP_NAME, "Set North and draw at least one start line and one end line.")
             return
         self.project.geometry = self.geometry
         self.project.ensure_clips(self.videos)
@@ -636,6 +708,7 @@ class MainWindow(QMainWindow):
         if clip is None:
             return
         self._redrawing = False
+        self.finish_gates_btn.setVisible(False)
         self._match_ref = []
         self._match_clip = []
         self._match_side = "ref"
@@ -652,12 +725,12 @@ class MainWindow(QMainWindow):
         self.rotate_spin.blockSignals(True)
         self.rotate_spin.setValue(clip.transform.rotation_deg)
         self.rotate_spin.blockSignals(False)
-        self.align_canvas.set_routes(self._fitted_overlay(clip))
+        self.align_canvas.set_geometry(self._fitted_overlay(clip))
         self.align_canvas.set_match_points([])
         self.ref_canvas.set_match_points([])
         if clip.status == "reference":
             self.align_canvas.set_mode("view")
-            self.align_hint.setText("This is the reference clip. Routes were drawn here. Other clips need alignment.")
+            self.align_hint.setText("This is the reference clip. Entry and exit lines were drawn here. Other clips need alignment.")
         else:
             self.align_canvas.set_mode("nudge")
             self.align_hint.setText(
@@ -676,7 +749,7 @@ class MainWindow(QMainWindow):
             t = index / info.fps if info.fps else 0
             self.align_time.setValue(int(t / info.duration_s * 1000) if info.duration_s else 0)
             self.align_time_label.setText(format_duration(t))
-            self.align_canvas.set_routes(self._fitted_overlay(clip))
+            self.align_canvas.set_geometry(self._fitted_overlay(clip))
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, str(exc))
 
@@ -690,7 +763,7 @@ class MainWindow(QMainWindow):
             frame, _ = grab_frame_at(clip.path, t)
             self.align_canvas.set_frame(frame)
             self.align_time_label.setText(format_duration(t))
-            self.align_canvas.set_routes(self._fitted_overlay(clip))
+            self.align_canvas.set_geometry(self._fitted_overlay(clip))
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, str(exc))
 
@@ -705,7 +778,7 @@ class MainWindow(QMainWindow):
             clip.transform.ty += dy
         if clip.status == "aligned":
             clip.status = "needs_align"
-        self.align_canvas.set_routes(self._fitted_overlay(clip))
+        self.align_canvas.set_geometry(self._fitted_overlay(clip))
 
     def _on_scale(self, factor: float) -> None:
         clip = self._current_clip()
@@ -717,7 +790,7 @@ class MainWindow(QMainWindow):
             clip.transform.scale = max(0.3, min(3.0, clip.transform.scale * factor))
         if clip.status == "aligned":
             clip.status = "needs_align"
-        self.align_canvas.set_routes(self._fitted_overlay(clip))
+        self.align_canvas.set_geometry(self._fitted_overlay(clip))
 
     def _on_rotate_changed(self, value: float) -> None:
         clip = self._current_clip()
@@ -729,7 +802,7 @@ class MainWindow(QMainWindow):
             clip.transform.rotation_deg = value
         if clip.status == "aligned":
             clip.status = "needs_align"
-        self.align_canvas.set_routes(self._fitted_overlay(clip))
+        self.align_canvas.set_geometry(self._fitted_overlay(clip))
 
     def _confirm_align(self) -> None:
         clip = self._current_clip()
@@ -739,7 +812,7 @@ class MainWindow(QMainWindow):
             self._next_unaligned()
             return
         if self._redrawing:
-            QMessageBox.information(self, APP_NAME, "Finish redrawing the routes on this clip first.")
+            QMessageBox.information(self, APP_NAME, "Finish redrawing the entry and exit lines on this clip first.")
             return
         clip.status = "aligned"
         self._refresh_align_list()
@@ -762,13 +835,14 @@ class MainWindow(QMainWindow):
         clip.geometry_override = None
         clip.status = "needs_align"
         self._redrawing = False
+        self.finish_gates_btn.setVisible(False)
         self._match_ref = []
         self._match_clip = []
         self.rotate_spin.blockSignals(True)
         self.rotate_spin.setValue(0)
         self.rotate_spin.blockSignals(False)
         self.align_canvas.set_mode("nudge")
-        self.align_canvas.set_routes(self._fitted_overlay(clip))
+        self.align_canvas.set_geometry(self._fitted_overlay(clip))
         self.align_canvas.set_match_points([])
         self.ref_canvas.set_match_points([])
         self._refresh_align_list()
@@ -831,28 +905,56 @@ class MainWindow(QMainWindow):
         clip.status = "needs_align"
         self.align_canvas.set_mode("nudge")
         self.ref_canvas.set_mode("view")
-        self.align_canvas.set_routes(self._fitted_overlay(clip))
+        self.align_canvas.set_geometry(self._fitted_overlay(clip))
         self.align_hint.setText("Overlay updated from landmarks. Nudge if needed, then Confirm alignment.")
         self._refresh_align_list()
 
     def _start_redraw_clip(self) -> None:
         clip = self._current_clip()
         if clip is None or clip.status == "reference":
-            QMessageBox.information(self, APP_NAME, "Redraw is for non-reference clips. Edit routes on step 2.")
+            QMessageBox.information(self, APP_NAME, "Redraw is for non-reference clips. Edit lines on step 2.")
             return
-        if not self.geometry.routes:
+        if not self.geometry.is_ready():
             return
         width, height = self.align_canvas.image_size()
-        clip.geometry_override = Geometry(width, height, [])
+        fitted = clip.transform.apply_geometry(self.geometry.scaled_to(width, height))
+        clip.geometry_override = Geometry(width, height, north=fitted.north)
         clip.status = "needs_align"
-        self._redraw_queue = [route.name for route in self.geometry.routes]
         self._redrawing = True
-        self._pending_start = None
         self._draw_step = "start"
-        self._route_name = self._redraw_queue[0]
-        self.align_canvas.set_routes([])
+        self.finish_gates_btn.setText("Finish start lines")
+        self.finish_gates_btn.setVisible(True)
+        self.align_canvas.set_geometry(clip.geometry_override)
         self.align_canvas.set_mode("draw")
-        self.align_hint.setText(f"Redraw START line for “{self._route_name}” on this clip.")
+        self.align_hint.setText("Redraw entry lines on this clip. Add only the sides that exist, then Finish start lines.")
+
+    def _finish_redraw_phase(self) -> None:
+        clip = self._current_clip()
+        if not self._redrawing or clip is None or clip.geometry_override is None:
+            return
+        if self._draw_step == "start":
+            if not clip.geometry_override.starts:
+                QMessageBox.information(self, APP_NAME, "Draw at least one start line.")
+                return
+            clip.geometry_override.assign_names()
+            self._draw_step = "end"
+            self.finish_gates_btn.setText("Finish end lines")
+            self.align_canvas.set_geometry(clip.geometry_override)
+            self.align_hint.setText("Now redraw exit lines. Add only the sides that exist, then Finish end lines.")
+            return
+        if self._draw_step == "end":
+            if not clip.geometry_override.ends:
+                QMessageBox.information(self, APP_NAME, "Draw at least one end line.")
+                return
+            clip.geometry_override.assign_names()
+            clip.status = "redrawn"
+            self._redrawing = False
+            self._draw_step = "idle"
+            self.finish_gates_btn.setVisible(False)
+            self.align_canvas.set_geometry(clip.geometry_override)
+            self.align_canvas.set_mode("view")
+            self.align_hint.setText("Custom entry and exit lines saved for this clip.")
+            self._refresh_align_list()
 
     def _on_redraw_line(self, line: Line) -> None:
         if not self._redrawing:
@@ -861,27 +963,24 @@ class MainWindow(QMainWindow):
         if clip is None or clip.geometry_override is None:
             return
         if self._draw_step == "start":
-            self._pending_start = line
-            self._draw_step = "end"
-            self.align_hint.setText(f"Now draw the END line for “{self._route_name}”.")
-            return
-        if self._draw_step == "end" and self._pending_start is not None:
-            clip.geometry_override.routes.append(
-                Route(name=self._route_name, start=self._pending_start, end=line)
-            )
-            self._redraw_queue.pop(0)
-            self._pending_start = None
-            self.align_canvas.set_routes(clip.geometry_override.routes)
-            if not self._redraw_queue:
-                clip.status = "redrawn"
-                self._redrawing = False
-                self.align_canvas.set_mode("view")
-                self.align_hint.setText("Custom routes saved for this clip.")
-                self._refresh_align_list()
+            if len(clip.geometry_override.starts) >= MAX_GATES:
+                self.align_hint.setText("Four start lines drawn. Click Finish start lines.")
                 return
-            self._route_name = self._redraw_queue[0]
-            self._draw_step = "start"
-            self.align_hint.setText(f"Redraw START line for “{self._route_name}”.")
+            clip.geometry_override.starts.append(NamedLine("", line))
+            clip.geometry_override.assign_names()
+            self.align_canvas.set_geometry(clip.geometry_override)
+            count = len(clip.geometry_override.starts)
+            self.align_hint.setText(f"{count} start line(s). Draw another, or Finish start lines.")
+            return
+        if self._draw_step == "end":
+            if len(clip.geometry_override.ends) >= MAX_GATES:
+                self.align_hint.setText("Four end lines drawn. Click Finish end lines.")
+                return
+            clip.geometry_override.ends.append(NamedLine("", line))
+            clip.geometry_override.assign_names()
+            self.align_canvas.set_geometry(clip.geometry_override)
+            count = len(clip.geometry_override.ends)
+            self.align_hint.setText(f"{count} end line(s). Draw another, or Finish end lines.")
 
     def _save_project(self) -> None:
         self.project.geometry = self.geometry
@@ -912,8 +1011,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded project ({len(self.videos)} clip(s) found)")
 
     def _go_process(self) -> None:
-        if not self.geometry.routes:
-            QMessageBox.information(self, APP_NAME, "Draw or load at least one route.")
+        if not self.geometry.is_ready():
+            QMessageBox.information(self, APP_NAME, "Set North and draw at least one start line and one end line.")
             return
         self.project.geometry = self.geometry
         self.project.ensure_clips(self.videos)
@@ -948,7 +1047,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._append_log(f"Model: {exc}")
         self._append_log(f"Processing {len(jobs)} clip(s); skipped {len(skipped)}")
-        self._append_log(f"Routes: {', '.join(r.name for r in self.geometry.routes)}")
+        self._append_log(f"Movements: {', '.join(self.geometry.movement_names())}")
 
         self.worker = ProcessWorker(
             jobs=jobs,
@@ -999,19 +1098,14 @@ class MainWindow(QMainWindow):
         total_trips = sum(len(result.trips) for result in ok_results)
         skipped = len(self.project.clips) - len(ok_results)
         self.report_summary.setText(
-            f"{len(ok_results)} video(s) processed  •  {total_trips} vehicles assigned to a route  •  "
+            f"{len(ok_results)} video(s) processed  •  {total_trips} trips  •  "
             f"{max(0, skipped)} skipped  •  Spreadsheets saved in {self.export_dir}"
         )
         if not ok_results:
             self.table.clear()
             return
         first = ok_results[0]
-        table = build_tmc_table(
-            first.trips,
-            [route.name for route in self.geometry.routes],
-            first.video.duration_s,
-            self._clock_start(),
-        )
+        table = build_gate_statistics_table(first.trips, first.geometry)
         self.table.setRowCount(len(table))
         self.table.setColumnCount(len(table.columns))
         self.table.setHorizontalHeaderLabels(list(table.columns))

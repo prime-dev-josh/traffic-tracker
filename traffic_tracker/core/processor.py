@@ -1,4 +1,4 @@
-"""Run YOLO11 + ByteTrack and count completed start→end route crossings."""
+"""Run YOLO11 + ByteTrack and record start/end crossings."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import numpy as np
 
 from traffic_tracker.config import VEHICLE_CLASS_IDS, VEHICLE_CLASS_NAMES
 from traffic_tracker.core.device import describe_device, detect_device
-from traffic_tracker.core.geometry import Geometry
+from traffic_tracker.core.geometry import Geometry, NamedLine
 from traffic_tracker.core.models import ModelSource, resolve_model_source
 from traffic_tracker.core.report import Trip
 from traffic_tracker.core.video import VideoInfo, probe_video
@@ -32,9 +32,9 @@ class ProcessResult:
 
 @dataclass
 class _Pending:
-    """Most recent start-line crossing for each route, per track."""
+    """Latest entry crossing per track, waiting for any exit line."""
 
-    starts: dict[str, float] = field(default_factory=dict)
+    starts: dict[int, tuple[str, float]] = field(default_factory=dict)
     classes: dict[int, str] = field(default_factory=dict)
     completed: set[int] = field(default_factory=set)
 
@@ -75,6 +75,13 @@ def _reset_tracker(model) -> None:
     model.predictor = None
 
 
+def _line_zone(sv, named: NamedLine):
+    return sv.LineZone(
+        start=sv.Point(int(named.line.x1), int(named.line.y1)),
+        end=sv.Point(int(named.line.x2), int(named.line.y2)),
+    )
+
+
 def process_video(
     video_path: str,
     geometry: Geometry,
@@ -100,27 +107,8 @@ def process_video(
     _reset_tracker(model)
     device_label = f"{device_label}  •  {source.label}"
 
-    start_zones: list[tuple[str, sv.LineZone]] = []
-    end_zones: list[tuple[str, sv.LineZone]] = []
-    for route in fitted.routes:
-        start_zones.append(
-            (
-                route.name,
-                sv.LineZone(
-                    start=sv.Point(int(route.start.x1), int(route.start.y1)),
-                    end=sv.Point(int(route.start.x2), int(route.start.y2)),
-                ),
-            )
-        )
-        end_zones.append(
-            (
-                route.name,
-                sv.LineZone(
-                    start=sv.Point(int(route.end.x1), int(route.end.y1)),
-                    end=sv.Point(int(route.end.x2), int(route.end.y2)),
-                ),
-            )
-        )
+    start_zones = [(item.name, _line_zone(sv, item)) for item in fitted.starts]
+    end_zones = [(item.name, _line_zone(sv, item)) for item in fitted.ends]
 
     annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.4)
@@ -194,13 +182,21 @@ def process_video(
 
 
 def _draw_route_overlay(frame: np.ndarray, geometry: Geometry) -> np.ndarray:
-    for route in geometry.routes:
-        start = (int(route.start.x1), int(route.start.y1)), (int(route.start.x2), int(route.start.y2))
-        end = (int(route.end.x1), int(route.end.y1)), (int(route.end.x2), int(route.end.y2))
-        cv2.line(frame, start[0], start[1], (140, 214, 61), 3)
-        cv2.line(frame, end[0], end[1], (107, 107, 255), 3)
-        cv2.putText(frame, f"{route.name} start", start[0], cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 214, 61), 1, cv2.LINE_AA)
-        cv2.putText(frame, f"{route.name} end", end[0], cv2.FONT_HERSHEY_SIMPLEX, 0.5, (107, 107, 255), 1, cv2.LINE_AA)
+    if geometry.north is not None:
+        p1 = (int(geometry.north.x1), int(geometry.north.y1))
+        p2 = (int(geometry.north.x2), int(geometry.north.y2))
+        cv2.arrowedLine(frame, p1, p2, (253, 184, 61), 3, tipLength=0.18)
+        cv2.putText(frame, "N", p2, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (253, 184, 61), 2, cv2.LINE_AA)
+    for item in geometry.starts:
+        a = (int(item.line.x1), int(item.line.y1))
+        b = (int(item.line.x2), int(item.line.y2))
+        cv2.line(frame, a, b, (140, 214, 61), 3)
+        cv2.putText(frame, item.name, a, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 214, 61), 1, cv2.LINE_AA)
+    for item in geometry.ends:
+        a = (int(item.line.x1), int(item.line.y1))
+        b = (int(item.line.x2), int(item.line.y2))
+        cv2.line(frame, a, b, (107, 107, 255), 3)
+        cv2.putText(frame, item.name, a, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (107, 107, 255), 1, cv2.LINE_AA)
     return frame
 
 
@@ -226,28 +222,29 @@ def _record_crossings(
         for tid, cls in zip(detections.tracker_id, detections.class_id):
             class_lookup[int(tid)] = _class_name(int(cls))
 
-    for route_name, zone in start_zones:
+    for origin, zone in start_zones:
         for tid in _crossed_ids(zone, detections):
             if tid in pending.completed:
                 continue
-            pending.starts[f"{tid}:{route_name}"] = elapsed_s
+            pending.starts[tid] = (origin, elapsed_s)
             if tid in class_lookup:
                 pending.classes[tid] = class_lookup[tid]
 
-    for route_name, zone in end_zones:
+    for bound, zone in end_zones:
         for tid in _crossed_ids(zone, detections):
-            if tid in pending.completed:
+            if tid in pending.completed or tid not in pending.starts:
                 continue
-            key = f"{tid}:{route_name}"
-            if key not in pending.starts:
-                continue
+            origin, start_time_s = pending.starts[tid]
             trips.append(
                 Trip(
                     video_name=video_name,
                     track_id=tid,
-                    route_name=route_name,
-                    completed_at_s=elapsed_s,
+                    start_destination=origin,
+                    start_time_s=start_time_s,
+                    end_destination=bound,
+                    end_time_s=elapsed_s,
                     vehicle_class=pending.classes.get(tid, class_lookup.get(tid, "vehicle")),
                 )
             )
             pending.completed.add(tid)
+            pending.starts.pop(tid, None)

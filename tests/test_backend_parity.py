@@ -13,22 +13,22 @@ from traffic_tracker.core.report import Trip, build_tmc_table, tmc_tables_close
 class TmcToleranceTests(unittest.TestCase):
     def test_tables_close_within_one(self) -> None:
         left = build_tmc_table(
-            [Trip("a.mp4", 1, "NB Left", 30, "car")],
-            ["NB Left", "SB Through"],
+            [Trip("a.mp4", 1, "N", 30, "SB", 30, "car")],
+            ["N-SB", "S-NB"],
             900,
         )
         right = build_tmc_table(
-            [Trip("a.mp4", 1, "NB Left", 40, "car"), Trip("a.mp4", 2, "NB Left", 50, "car")],
-            ["NB Left", "SB Through"],
+            [Trip("a.mp4", 1, "N", 40, "SB", 40, "car"), Trip("a.mp4", 2, "N", 50, "SB", 50, "car")],
+            ["N-SB", "S-NB"],
             900,
         )
         self.assertTrue(tmc_tables_close(left, right, max_abs_diff=1))
 
     def test_tables_reject_large_drift(self) -> None:
-        left = build_tmc_table([Trip("a.mp4", 1, "NB Left", 30, "car")], ["NB Left"], 900)
+        left = build_tmc_table([Trip("a.mp4", 1, "N", 30, "SB", 30, "car")], ["N-SB"], 900)
         right = build_tmc_table(
-            [Trip("a.mp4", i, "NB Left", 30, "car") for i in range(5)],
-            ["NB Left"],
+            [Trip("a.mp4", i, "N", 30, "SB", 30, "car") for i in range(5)],
+            ["N-SB"],
             900,
         )
         self.assertFalse(tmc_tables_close(left, right, max_abs_diff=1))
@@ -47,7 +47,7 @@ class LiveParityTests(unittest.TestCase):
         from traffic_tracker.core.report import build_tmc_table
 
         geometry = Geometry.load(routes)
-        names = [route.name for route in geometry.routes]
+        names = geometry.movement_names()
 
         os.environ["TRAFFIC_TRACKER_BACKEND"] = "pt"
         reset_model_cache()

@@ -10,7 +10,7 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
-from traffic_tracker.core.report import Trip, build_tmc_table, export_tmc_workbook
+from traffic_tracker.core.report import Trip, export_tmc_workbook
 
 
 class ProcessWorker(QThread):
@@ -59,21 +59,15 @@ class ProcessWorker(QThread):
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")
                 elif not result.error:
-                    table = build_tmc_table(
-                        result.trips,
-                        [route.name for route in geometry.routes],
-                        result.video.duration_s,
-                        self._clock_start,
-                    )
                     export_path = self._export_dir / f"{video.stem}_tmc.xlsx"
                     export_tmc_workbook(
                         export_path,
-                        table,
+                        result.trips,
+                        geometry,
                         video_name=result.video.name,
                         duration_s=result.video.duration_s,
                         clock_start=self._clock_start,
                         device_label=result.device_label,
-                        trip_count=len(result.trips),
                     )
                 results.append(result)
                 self.video_done.emit(result)
@@ -84,4 +78,7 @@ class ProcessWorker(QThread):
 
 
 def trips_to_rows(trips: list[Trip]) -> list[tuple]:
-    return [(t.video_name, t.route_name, t.track_id, t.vehicle_class, f"{t.completed_at_s:.1f}s") for t in trips]
+    return [
+        (t.start_destination, f"{t.start_time_s:.1f}s", t.end_destination, f"{t.end_time_s:.1f}s")
+        for t in trips
+    ]

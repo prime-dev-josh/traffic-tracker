@@ -1,6 +1,6 @@
 # Traffic Tracker
 
-Desktop app for turning-movement counts from intersection videos. Upload one video or a folder of videos, draw a start line and an end line for every route on a random frame, then export a 15-minute TMC spreadsheet.
+Desktop app for turning-movement counts from intersection videos. Upload one video or a folder of videos, set North, draw the entry and exit lines that exist, then export Overview, Gate Statistics, and a 15-minute TMC Summary.
 
 ## Stack
 
@@ -79,15 +79,15 @@ Ship the whole `dist\Traffic Tracker\` folder. It is large (often 1–3 GB+) bec
 
 1. Add a bundle of clips from the same camera (15–30 min / multi‑GB files stay on disk).
 2. Optionally enter the video start clock time so 15-minute bins use real time instead of elapsed time.
-3. On a random frame of the **first** clip, add each route and drag its **start** then **end** line.
+3. On a random frame of the **first** clip, drag an arrow toward **North**, then draw the **start (entry)** and **end (exit)** lines that exist. One-way streets can omit a side. Lines are named from that heading: entries `N/S/E/W`, exits `NB/SB/EB/WB`. A completed movement is `{origin}-{bound}` (example: `N-SB`).
 4. **Align** later clips: drag/scale/rotate the overlay (or match 2–4 landmarks). Confirm each clip. Unconfirmed clips are skipped.
-5. Process confirmed clips sequentially. Each writes `{video_name}_tmc.xlsx`.
+5. Process confirmed clips sequentially. Each writes `{video_name}_tmc.xlsx` with **Overview**, **Gate Statistics**, and **TMC Summary** sheets.
 
 Save **project** (`bundle.ttproj.json`) so alignments survive an overnight stop. Prefer a local disk — OneDrive sync of 2–5 GB files stalls seeking.
 
-A vehicle is counted on a route when its track crosses that route's start line and later its end line. MVP counts cars, motorcycles, buses, and trucks as vehicles. Pedestrians and bicycles are ignored.
+A trip is recorded when a track crosses any start line and later any end line. Start destination is the entry origin (`N`, `S`, `E`, `W`); end destination is the exit bound (`NB`, `SB`, `EB`, `WB`). MVP counts cars, motorcycles, buses, and trucks as vehicles. Pedestrians and bicycles are ignored.
 
-Draw each line so vehicles cross it (roughly perpendicular to travel). One completed route is recorded per vehicle.
+Draw each line so vehicles cross it (roughly perpendicular to travel). One completed trip is recorded per vehicle.
 
 ## More docs
 

@@ -1,33 +1,38 @@
-import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from traffic_tracker.core.geometry import Geometry, Line, Route, Transform, transform_from_matches
+from traffic_tracker.core.geometry import Geometry, Line, NamedLine, Transform, transform_from_matches
 from traffic_tracker.core.project import BundleProject, ClipRecord
 from traffic_tracker.core.video import format_duration, is_onedrive_path
 
 
-class TransformTests(unittest.TestCase):
-    def _geom(self) -> Geometry:
-        return Geometry(200, 100, [Route("NB Left", Line(10, 20, 30, 40), Line(50, 60, 70, 80))])
+def _geom(width: int = 200, height: int = 100) -> Geometry:
+    return Geometry(
+        width,
+        height,
+        north=Line(width / 2, height * 0.9, width / 2, height * 0.1),
+        starts=[NamedLine("N", Line(10, 20, 30, 40))],
+        ends=[NamedLine("SB", Line(50, 60, 70, 80))],
+    )
 
+
+class TransformTests(unittest.TestCase):
     def test_identity_leaves_points(self) -> None:
-        geom = Transform().apply_geometry(self._geom())
-        self.assertEqual(geom.routes[0].start.x1, 10)
-        self.assertEqual(geom.routes[0].start.y1, 20)
+        geom = Transform().apply_geometry(_geom())
+        self.assertEqual(geom.starts[0].line.x1, 10)
+        self.assertEqual(geom.starts[0].line.y1, 20)
 
     def test_translate(self) -> None:
-        geom = Transform(tx=5, ty=-3).apply_geometry(self._geom())
-        self.assertAlmostEqual(geom.routes[0].start.x1, 15)
-        self.assertAlmostEqual(geom.routes[0].start.y1, 17)
+        geom = Transform(tx=5, ty=-3).apply_geometry(_geom())
+        self.assertAlmostEqual(geom.starts[0].line.x1, 15)
+        self.assertAlmostEqual(geom.starts[0].line.y1, 17)
 
     def test_scale_about_center(self) -> None:
-        # Center is (100, 50). Point (10, 20) -> dx=-90, dy=-30; scale 2 -> (10, 20) wait
-        # (10-100)*2 + 100 = -80; (20-50)*2+50 = -10
-        geom = Transform(scale=2).apply_geometry(self._geom())
-        self.assertAlmostEqual(geom.routes[0].start.x1, -80)
-        self.assertAlmostEqual(geom.routes[0].start.y1, -10)
+        # Center is (100, 50). Point (10, 20): (10-100)*2 + 100 = -80; (20-50)*2+50 = -10
+        geom = Transform(scale=2).apply_geometry(_geom())
+        self.assertAlmostEqual(geom.starts[0].line.x1, -80)
+        self.assertAlmostEqual(geom.starts[0].line.y1, -10)
 
     def test_homography_identity(self) -> None:
         t = Transform(homography=[1, 0, 0, 0, 1, 0, 0, 0, 1])
@@ -58,7 +63,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(project.clips[1].status, "needs_align")
 
     def test_ready_jobs_skips_unaligned(self) -> None:
-        geom = Geometry(100, 100, [Route("NB", Line(0, 0, 10, 0), Line(0, 10, 10, 10))])
+        geom = Geometry(100, 100, starts=[NamedLine("N", Line(0, 0, 10, 0))], ends=[NamedLine("SB", Line(0, 10, 10, 10))])
         project = BundleProject(geometry=geom)
         project.clips = [
             ClipRecord(Path("a.mp4"), status="reference"),
@@ -69,7 +74,13 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(jobs[0][0], Path("a.mp4"))
 
     def test_project_file_roundtrip(self) -> None:
-        geom = Geometry(10, 10, [Route("NB", Line(1, 2, 3, 4), Line(5, 6, 7, 8))])
+        geom = Geometry(
+            10,
+            10,
+            north=Line(5, 9, 5, 1),
+            starts=[NamedLine("N", Line(1, 2, 3, 4))],
+            ends=[NamedLine("SB", Line(5, 6, 7, 8))],
+        )
         project = BundleProject(reference=Path("a.mp4"), geometry=geom)
         project.clips = [ClipRecord(Path("a.mp4"), status="reference")]
         with TemporaryDirectory() as raw:
@@ -77,7 +88,8 @@ class ProjectTests(unittest.TestCase):
             project.save(path)
             loaded = BundleProject.load(path)
         self.assertEqual(loaded.clips[0].status, "reference")
-        self.assertEqual(loaded.geometry.routes[0].name, "NB")
+        self.assertEqual(loaded.geometry.starts[0].name, "N")
+        self.assertEqual(loaded.geometry.ends[0].name, "SB")
 
 
 class VideoHelperTests(unittest.TestCase):
