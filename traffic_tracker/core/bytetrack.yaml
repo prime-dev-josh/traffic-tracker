@@ -1,0 +1,9 @@
+# Aligned with nadir-drone conf (~0.08). Default 0.25 never opens tracks
+# on the weak boxes YOLO assigns to top-down cars.
+tracker_type: bytetrack
+track_high_thresh: 0.08
+track_low_thresh: 0.02
+new_track_thresh: 0.08
+track_buffer: 150
+match_thresh: 0.55
+fuse_score: True

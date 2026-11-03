@@ -25,12 +25,14 @@ class ProcessWorker(QThread):
         jobs: list[tuple[Path, Geometry]],
         export_dir: Path,
         clock_start: datetime | None,
+        overhead_drone: bool = True,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._jobs = jobs
         self._export_dir = export_dir
         self._clock_start = clock_start
+        self._overhead_drone = overhead_drone
         self._cancel = False
 
     def cancel(self) -> None:
@@ -55,6 +57,7 @@ class ProcessWorker(QThread):
                     cancel_flag=lambda: self._cancel,
                     progress_cb=progress_cb,
                     preview_cb=preview_cb,
+                    overhead_drone=self._overhead_drone,
                 )
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")

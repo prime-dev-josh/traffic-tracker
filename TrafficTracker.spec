@@ -13,6 +13,12 @@ project_root = Path(SPECPATH)
 datas: list = []
 binaries: list = []
 hiddenimports: list = collect_submodules("traffic_tracker")
+datas.append(
+    (
+        str(project_root / "traffic_tracker" / "core" / "bytetrack.yaml"),
+        "traffic_tracker/core",
+    )
+)
 
 for pkg in (
     "PyQt6",

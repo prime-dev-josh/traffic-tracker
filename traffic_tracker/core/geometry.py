@@ -179,21 +179,58 @@ def _angle_error(heading: float, target: float) -> float:
     return abs((heading - target + 180.0) % 360.0 - 180.0)
 
 
+def intersection_center(north: Line | None, frame_w: int, frame_h: int) -> tuple[float, float]:
+    """Intersection is the tail of the North arrow; otherwise the frame center."""
+    if north is not None:
+        return north.x1, north.y1
+    return frame_w / 2.0, frame_h / 2.0
+
+
+def heading_from_north(x: float, y: float, north: Line, frame_w: int, frame_h: int) -> float:
+    """0 = toward North, clockwise, from the intersection center."""
+    cx, cy = intersection_center(north, frame_w, frame_h)
+    north_heading = image_heading_deg(north.x2 - north.x1, north.y2 - north.y1)
+    return (image_heading_deg(x - cx, y - cy) - north_heading) % 360.0
+
+
+def side_from_point(
+    x: float,
+    y: float,
+    north: Line,
+    frame_w: int,
+    frame_h: int,
+) -> str:
+    """Geographic side of a point: N, S, E, or W from the North arrow."""
+    heading = heading_from_north(x, y, north, frame_w, frame_h)
+    return min(ORIGINS, key=lambda name: _angle_error(heading, _NAME_HEADING[name]))
+
+
+def name_from_north(
+    line: Line,
+    names: tuple[str, ...],
+    north: Line,
+    frame_w: int,
+    frame_h: int,
+    taken: set[str] | None = None,
+) -> str:
+    """Nearest cardinal to this line. Unused sides are skipped, not filled in order."""
+    mx, my = line.midpoint()
+    heading = heading_from_north(mx, my, north, frame_w, frame_h)
+    taken = taken or set()
+    available = [name for name in names if name in _NAME_HEADING and name not in taken] or [
+        name for name in names if name in _NAME_HEADING
+    ]
+    return min(available, key=lambda name: _angle_error(heading, _NAME_HEADING[name]))
+
+
 def _assign_by_north(lines: list[Line], names: tuple[str, ...], north: Line, frame_w: int, frame_h: int) -> list[NamedLine]:
-    """Map 1–4 lines to the nearest unused cardinal, so one-way streets can omit a side."""
+    """Map 1–4 lines to the nearest unused cardinal from North, not draw order."""
     if not lines:
         return []
-    cx = frame_w / 2.0
-    cy = frame_h / 2.0
-    mids = [line.midpoint() for line in lines]
-    cx = sum(p[0] for p in mids) / len(mids)
-    cy = sum(p[1] for p in mids) / len(mids)
-    north_heading = image_heading_deg(north.x2 - north.x1, north.y2 - north.y1)
     scored: list[tuple[float, Line]] = []
     for line in lines:
         mx, my = line.midpoint()
-        heading = (image_heading_deg(mx - cx, my - cy) - north_heading) % 360.0
-        scored.append((heading, line))
+        scored.append((heading_from_north(mx, my, north, frame_w, frame_h), line))
 
     unused = [name for name in names if name in _NAME_HEADING]
     remaining = set(range(len(scored)))
@@ -258,6 +295,24 @@ class Geometry:
             self.starts = _assign_by_north(start_lines, ORIGINS, self.north, self.frame_width, self.frame_height)
         if end_lines:
             self.ends = _assign_by_north(end_lines, BOUNDS, self.north, self.frame_width, self.frame_height)
+
+    def add_gate(self, kind: str, line: Line, name: str | None = None) -> NamedLine | None:
+        """Add one entry or exit. ``name`` is used as-is; otherwise derive from North."""
+        if kind not in ("start", "end") or self.north is None:
+            return None
+        pool = self.starts if kind == "start" else self.ends
+        names = ORIGINS if kind == "start" else BOUNDS
+        if len(pool) >= MAX_GATES:
+            return None
+        taken = {item.name for item in pool if item.name}
+        chosen = name if name in names else name_from_north(
+            line, names, self.north, self.frame_width, self.frame_height, taken
+        )
+        if chosen in taken:
+            return None
+        item = NamedLine(chosen, line)
+        pool.append(item)
+        return item
 
     def scaled_to(self, width: int, height: int) -> "Geometry":
         if width == self.frame_width and height == self.frame_height:

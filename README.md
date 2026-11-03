@@ -1,12 +1,13 @@
 # Traffic Tracker
 
-Desktop app for turning-movement counts from intersection videos. Upload one video or a folder of videos, set North, draw the entry and exit lines that exist, then export Overview, Gate Statistics, and a 15-minute TMC Summary.
+Desktop app for turning-movement counts from **overhead drone** intersection videos. Upload one video or a folder of videos, set North, draw the entry and exit lines that exist, then export Overview, Gate Statistics, and a 15-minute TMC Summary.
 
 ## Stack
 
 - Python 3.11
 - Ultralytics YOLO11 **detect + ByteTrack** (`model.track`) — do not replace with a custom NMS path
-- Supervision **LineZone** for start/end crossings
+- Path-intersection gate crossings (not Supervision LineZone)
+- Default **nadir drone** detection (larger imgsz; boat/airplane labels kept as cars)
 - PyQt6 desktop UI (see [docs/LICENSE_UI.md](docs/LICENSE_UI.md) before shipping a closed-source `.exe`)
 - Auto device: NVIDIA CUDA, then Apple MPS, otherwise CPU
 - Optional exported weights via Ultralytics AutoBackend: **ONNX**, **OpenVINO**, later CoreML
@@ -77,7 +78,7 @@ Ship the whole `dist\Traffic Tracker\` folder. It is large (often 1–3 GB+) bec
 
 ## Workflow
 
-1. Add a bundle of clips from the same camera (15–30 min / multi‑GB files stay on disk).
+1. Add a bundle of clips from the same camera (15–30 min / multi‑GB files stay on disk). Leave **Footage is overhead drone** checked for nadir (straight-down) video.
 2. Optionally enter the video start clock time so 15-minute bins use real time instead of elapsed time.
 3. On a random frame of the **first** clip, drag an arrow toward **North**, then draw the **start (entry)** and **end (exit)** lines that exist. One-way streets can omit a side. Lines are named from that heading: entries `N/S/E/W`, exits `NB/SB/EB/WB`. A completed movement is `{origin}-{bound}` (example: `N-SB`).
 4. **Align** later clips: drag/scale/rotate the overlay (or match 2–4 landmarks). Confirm each clip. Unconfirmed clips are skipped.

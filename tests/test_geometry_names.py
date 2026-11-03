@@ -1,6 +1,13 @@
 import unittest
 
-from traffic_tracker.core.geometry import Geometry, Line, NamedLine, all_movement_names, movement_name
+from traffic_tracker.core.geometry import (
+    Geometry,
+    Line,
+    NamedLine,
+    all_movement_names,
+    movement_name,
+    side_from_point,
+)
 
 
 class NamingTests(unittest.TestCase):
@@ -58,6 +65,33 @@ class NamingTests(unittest.TestCase):
         )
         geom.assign_names()
         self.assertEqual({item.name for item in geom.starts}, {"N", "S"})
+
+    def test_single_south_start_is_s_not_n(self) -> None:
+        geom = Geometry(200, 200, north=Line(100, 100, 100, 20))
+        added = geom.add_gate("start", Line(80, 180, 120, 180))
+        self.assertIsNotNone(added)
+        self.assertEqual(added.name, "S")
+
+    def test_one_way_north_to_southbound(self) -> None:
+        geom = Geometry(200, 200, north=Line(100, 100, 100, 20))
+        start = geom.add_gate("start", Line(80, 20, 120, 20))
+        end = geom.add_gate("end", Line(80, 180, 120, 180))
+        self.assertEqual(start.name, "N")
+        self.assertEqual(end.name, "SB")
+        self.assertEqual(geom.movement_names(), ["N-SB"])
+
+    def test_explicit_gate_name_skips_auto_order(self) -> None:
+        geom = Geometry(200, 200, north=Line(100, 100, 100, 20))
+        added = geom.add_gate("start", Line(80, 180, 120, 180), name="N")
+        self.assertEqual(added.name, "N")
+        self.assertIsNone(geom.add_gate("start", Line(10, 10, 20, 10), name="N"))
+
+    def test_side_from_point_uses_north_arrow(self) -> None:
+        north = Line(100, 100, 100, 20)
+        self.assertEqual(side_from_point(100, 30, north, 200, 200), "N")
+        self.assertEqual(side_from_point(100, 170, north, 200, 200), "S")
+        self.assertEqual(side_from_point(170, 100, north, 200, 200), "E")
+        self.assertEqual(side_from_point(30, 100, north, 200, 200), "W")
 
 
 if __name__ == "__main__":
