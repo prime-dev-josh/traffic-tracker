@@ -1,0 +1,5 @@
+path: C:/Users/Josh.Marrero/OneDrive - PRIME AE Group, Inc/Desktop/Project Process AI Work/traffic-tracker/training/dataset
+train: images/train
+val: images/val
+names:
+  0: vehicle
