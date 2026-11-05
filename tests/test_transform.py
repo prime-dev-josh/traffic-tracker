@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from traffic_tracker.core.geometry import Geometry, Line, NamedLine, Transform, transform_from_matches
+from traffic_tracker.core.geometry import Box, Geometry, Line, NamedLine, Transform, transform_from_matches
 from traffic_tracker.core.project import BundleProject, ClipRecord
 from traffic_tracker.core.video import format_duration, is_onedrive_path
 
@@ -14,6 +14,7 @@ def _geom(width: int = 200, height: int = 100) -> Geometry:
         north=Line(width / 2, height * 0.9, width / 2, height * 0.1),
         starts=[NamedLine("N", Line(10, 20, 30, 40))],
         ends=[NamedLine("SB", Line(50, 60, 70, 80))],
+        vehicle_refs=[Box(40, 30, 70, 50)],
     )
 
 
@@ -27,6 +28,8 @@ class TransformTests(unittest.TestCase):
         geom = Transform(tx=5, ty=-3).apply_geometry(_geom())
         self.assertAlmostEqual(geom.starts[0].line.x1, 15)
         self.assertAlmostEqual(geom.starts[0].line.y1, 17)
+        self.assertAlmostEqual(geom.vehicle_refs[0].x1, 45)
+        self.assertAlmostEqual(geom.vehicle_refs[0].y1, 27)
 
     def test_scale_about_center(self) -> None:
         # Center is (100, 50). Point (10, 20): (10-100)*2 + 100 = -80; (20-50)*2+50 = -10

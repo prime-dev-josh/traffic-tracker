@@ -1,6 +1,7 @@
 import unittest
 
 from traffic_tracker.core.geometry import (
+    Box,
     Geometry,
     Line,
     NamedLine,
@@ -85,6 +86,27 @@ class NamingTests(unittest.TestCase):
         added = geom.add_gate("start", Line(80, 180, 120, 180), name="N")
         self.assertEqual(added.name, "N")
         self.assertIsNone(geom.add_gate("start", Line(10, 10, 20, 10), name="N"))
+
+    def test_vehicle_mask_sets_area_band_and_scales(self) -> None:
+        geom = Geometry(200, 200, vehicle_refs=[Box(10, 20, 50, 50)])
+        self.assertEqual(int(geom.vehicle_refs[0].area()), 1200)
+        lo, hi = geom.vehicle_area_limits()
+        self.assertLess(lo, 1200)
+        self.assertGreater(hi, 1200)
+        scaled = geom.scaled_to(100, 100)
+        self.assertAlmostEqual(scaled.vehicle_refs[0].width(), 20)
+        self.assertAlmostEqual(scaled.vehicle_refs[0].height(), 15)
+        loaded = Geometry.from_dict(geom.to_dict())
+        self.assertEqual(loaded.vehicle_refs[0].area(), 1200)
+
+    def test_multiple_masks_span_size_band(self) -> None:
+        geom = Geometry(200, 200, vehicle_refs=[Box(0, 0, 20, 20), Box(0, 0, 80, 80)])
+        lo, hi = geom.vehicle_area_limits()
+        self.assertLess(lo, 400)
+        self.assertGreater(hi, 6400)
+        legacy = Geometry.from_dict({"frame_width": 10, "frame_height": 10, "vehicle_ref": {"x1": 0, "y1": 0, "x2": 10, "y2": 10}})
+        self.assertEqual(len(legacy.vehicle_refs), 1)
+        self.assertEqual(legacy.vehicle_refs[0].area(), 100)
 
     def test_side_from_point_uses_north_arrow(self) -> None:
         north = Line(100, 100, 100, 20)

@@ -23,29 +23,64 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSlider,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from traffic_tracker.config import APP_NAME, APP_VERSION
-from traffic_tracker.core.device import describe_device, detect_device
+from traffic_tracker.config import APP_NAME, APP_VERSION, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
 from traffic_tracker.core.geometry import (
     BOUNDS,
     MAX_GATES,
     ORIGINS,
+    MAX_VEHICLE_REFS,
+    Box,
     Geometry,
     Line,
+    NamedLine,
     Transform,
     transform_from_matches,
 )
-from traffic_tracker.core.models import resolve_model_source
+
+
+def bind_row_action(callback):
+    """Run a row callback without Qt's clicked(checked) overwriting default args."""
+
+    def _run(*_args):
+        callback()
+
+    return _run
 from traffic_tracker.core.processor import ProcessResult
 from traffic_tracker.core.project import BundleProject, ClipRecord
-from traffic_tracker.core.report import build_gate_statistics_table
+from traffic_tracker.core.report import (
+    build_gate_statistics_table,
+    build_overview_table,
+    build_tmc_summary_table,
+)
+from traffic_tracker.core.settings import AppSettings, load_settings, save_settings
+from traffic_tracker.core.detector import reset_detector_cache, resolve_detector_weights
+from traffic_tracker.core.device import device_report
+from traffic_tracker.core.training import (
+    LabeledFrame,
+    TrainingSession,
+    delete_session,
+    export_training_archive,
+    has_trained_weights,
+    import_training_archive,
+    list_sessions,
+    load_session,
+    prior_areas,
+    save_session,
+    trained_weights_path,
+    training_inventory,
+    training_root,
+)
+from traffic_tracker.gui.style import stylesheet_for
 from traffic_tracker.core.video import (
     file_size_gb,
     format_duration,
@@ -57,9 +92,20 @@ from traffic_tracker.core.video import (
     probe_video,
 )
 from traffic_tracker.gui.widgets.frame_canvas import FrameCanvas
-from traffic_tracker.gui.worker import ProcessWorker
+from traffic_tracker.gui.widgets.home_menu import HomeStage
+from traffic_tracker.gui.worker import ProcessWorker, TrainWorker
 
-PAGE_SETUP, PAGE_ROUTES, PAGE_ALIGN, PAGE_PROCESS, PAGE_REPORT = range(5)
+(
+    PAGE_HOME,
+    PAGE_SETUP,
+    PAGE_ROUTES,
+    PAGE_ALIGN,
+    PAGE_PROCESS,
+    PAGE_REPORT,
+    PAGE_TRAINING,
+    PAGE_SETTINGS,
+) = range(8)
+PROCESS_PAGES = {PAGE_SETUP, PAGE_ROUTES, PAGE_ALIGN, PAGE_PROCESS, PAGE_REPORT}
 
 
 class MainWindow(QMainWindow):
@@ -71,11 +117,15 @@ class MainWindow(QMainWindow):
         self.videos: list[Path] = []
         self.project = BundleProject()
         self.geometry = Geometry(frame_width=1, frame_height=1)
-        self.export_dir = Path.cwd() / "outputs"
+        self.settings = load_settings()
+        self.export_dir = Path(self.settings.export_dir) if self.settings.export_dir else Path.cwd() / "outputs"
         self.worker: ProcessWorker | None = None
+        self.train_worker: TrainWorker | None = None
         self.results: list[ProcessResult] = []
         self._draw_step = "idle"
         self._draw_gate_name: str | None = None
+        self._redraw_index: int | None = None
+        self._redraw_target = None
         self._align_index = 0
         self._ref_frame = None
         self._ref_size = (1, 1)
@@ -83,13 +133,23 @@ class MainWindow(QMainWindow):
         self._match_clip: list[tuple[float, float]] = []
         self._match_side = "ref"
         self._redrawing = False
+        self._train_video: Path | None = None
+        self._train_session: TrainingSession | None = None
+        self._train_frame = None
+        self._train_frame_index = 0
+        self._train_time_s = 0.0
+        self._train_boxes: list[Box] = []
+        self._train_frames_bgr: dict[int, np.ndarray] = {}
 
         root = QWidget()
         self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        self._root_layout = QVBoxLayout(root)
+        self._root_layout.setContentsMargins(0, 0, 0, 0)
+        self._root_layout.setSpacing(0)
 
+        self.header_bar = QWidget()
+        title_row = QHBoxLayout(self.header_bar)
+        title_row.setContentsMargins(16, 16, 16, 0)
         header = QVBoxLayout()
         title = QLabel(APP_NAME)
         title.setObjectName("title")
@@ -97,27 +157,273 @@ class MainWindow(QMainWindow):
         subtitle.setObjectName("subtitle")
         header.addWidget(title)
         header.addWidget(subtitle)
-        layout.addLayout(header)
+        title_row.addLayout(header, 1)
+        self.home_btn = QPushButton("Home")
+        self.home_btn.clicked.connect(self._go_home)
+        self.home_btn.setVisible(False)
+        title_row.addWidget(self.home_btn, 0, Qt.AlignmentFlag.AlignTop)
+        self.header_bar.setVisible(False)
+        self._root_layout.addWidget(self.header_bar)
 
         self.steps = QLabel("1. Videos   →   2. Routes   →   3. Align   →   4. Process   →   5. Report")
         self.steps.setObjectName("hint")
-        layout.addWidget(self.steps)
+        self.steps.setContentsMargins(16, 8, 16, 0)
+        self.steps.setVisible(False)
+        self._root_layout.addWidget(self.steps)
 
         self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_home_page())
         self.stack.addWidget(self._build_setup_page())
         self.stack.addWidget(self._build_routes_page())
         self.stack.addWidget(self._build_align_page())
         self.stack.addWidget(self._build_process_page())
         self.stack.addWidget(self._build_report_page())
-        layout.addWidget(self.stack, 1)
+        self.stack.addWidget(self._build_training_page())
+        self.stack.addWidget(self._build_settings_page())
+        self.stack.currentChanged.connect(self._on_page_changed)
+        self.content_shell = QWidget()
+        self.content_layout = QVBoxLayout(self.content_shell)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(0)
+        self.content_layout.addWidget(self.stack)
+        self._root_layout.addWidget(self.content_shell, 1)
 
-        self.statusBar().showMessage("Ready")
+        self.statusBar().hide()
+        self._apply_theme(self.settings.theme)
+        self._sync_detector_ui()
         QTimer.singleShot(0, self._refresh_device_status)
 
     def _card(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("card")
         return frame
+
+    def _build_home_page(self) -> QWidget:
+        self.home_stage = HomeStage(
+            [
+                (
+                    "01",
+                    "Process",
+                    "Add clips, set North and gates, align later videos, then export the TMC.",
+                    self._go_process_feature,
+                ),
+                (
+                    "02",
+                    "Training",
+                    "Box every vehicle on sample frames, then Train detector for site weights.",
+                    self._go_training,
+                ),
+                (
+                    "03",
+                    "Settings",
+                    "Export folder, OneDrive warning, and detector mode. Motion stays on until site weights exist.",
+                    self._go_settings,
+                ),
+            ]
+        )
+        return self.home_stage
+
+    def _build_training_page(self) -> QWidget:
+        page = QWidget()
+        row = QHBoxLayout(page)
+        row.setSpacing(16)
+
+        left = self._card()
+        left_layout = QVBoxLayout(left)
+        left_layout.addWidget(self._step_title("Training"))
+        hint = QLabel(
+            "Box every vehicle you can see, including cars stopped at a light. "
+            "Aim for 150+ frames and 400+ boxes across clips. "
+            f"{TRAIN_MIN_FRAMES} frames and {TRAIN_MIN_BOXES} boxes is the minimum to Train detector. "
+            "North and gates are not required here."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        left_layout.addWidget(hint)
+
+        pick = QPushButton("Open video")
+        pick.clicked.connect(self._training_pick_video)
+        left_layout.addWidget(pick)
+
+        self.train_video_label = QLabel("No video selected.")
+        self.train_video_label.setObjectName("hint")
+        self.train_video_label.setWordWrap(True)
+        left_layout.addWidget(self.train_video_label)
+
+        self.train_status = QLabel("Open a clip, then box every vehicle you can see.")
+        self.train_status.setObjectName("hint")
+        self.train_status.setWordWrap(True)
+        left_layout.addWidget(self.train_status)
+
+        left_layout.addWidget(self._section("Saved sessions"))
+        self.train_sessions = QListWidget()
+        self.train_sessions.itemSelectionChanged.connect(self._training_select_session)
+        left_layout.addWidget(self.train_sessions, 1)
+
+        session_btns = QHBoxLayout()
+        load_sess = QPushButton("Load")
+        load_sess.clicked.connect(self._training_load_selected)
+        delete_sess = QPushButton("Delete session")
+        delete_sess.setObjectName("danger")
+        delete_sess.clicked.connect(self._training_delete_selected)
+        session_btns.addWidget(load_sess)
+        session_btns.addWidget(delete_sess)
+        left_layout.addLayout(session_btns)
+
+        actions = QHBoxLayout()
+        next_frame = QPushButton("Next frame")
+        next_frame.clicked.connect(self._training_next_frame)
+        undo_box = QPushButton("Undo box")
+        undo_box.clicked.connect(self._training_undo_box)
+        save_sess = QPushButton("Save session")
+        save_sess.setObjectName("primary")
+        save_sess.clicked.connect(self._training_save)
+        actions.addWidget(next_frame)
+        actions.addWidget(undo_box)
+        actions.addWidget(save_sess)
+        left_layout.addLayout(actions)
+
+        left_layout.addWidget(self._section("Site detector"))
+        self.train_ready_label = QLabel("No labeled frames yet.")
+        self.train_ready_label.setObjectName("hint")
+        self.train_ready_label.setWordWrap(True)
+        left_layout.addWidget(self.train_ready_label)
+        train_row = QHBoxLayout()
+        self.train_detector_btn = QPushButton("Train detector")
+        self.train_detector_btn.setObjectName("primary")
+        self.train_detector_btn.clicked.connect(self._start_detector_train)
+        self.train_visdrone_btn = QPushButton("Train on VisDrone")
+        self.train_visdrone_btn.clicked.connect(self._start_visdrone_train)
+        self.cancel_train_btn = QPushButton("Cancel train")
+        self.cancel_train_btn.setEnabled(False)
+        self.cancel_train_btn.clicked.connect(self._cancel_detector_train)
+        train_row.addWidget(self.train_detector_btn)
+        train_row.addWidget(self.train_visdrone_btn)
+        train_row.addWidget(self.cancel_train_btn)
+        left_layout.addLayout(train_row)
+        self.train_progress = QProgressBar()
+        self.train_progress.setValue(0)
+        left_layout.addWidget(self.train_progress)
+        self.train_log = QPlainTextEdit()
+        self.train_log.setReadOnly(True)
+        self.train_log.setMaximumHeight(120)
+        self.train_log.setPlaceholderText("Training log")
+        left_layout.addWidget(self.train_log)
+
+        right = self._card()
+        right_layout = QVBoxLayout(right)
+        right_layout.addWidget(self._step_title("Box every vehicle on this frame"))
+        self.train_canvas = FrameCanvas()
+        self.train_canvas.on_box_drawn = self._training_box_drawn
+        right_layout.addWidget(self.train_canvas, 1)
+
+        row.addWidget(left, 0)
+        row.addWidget(right, 1)
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setSpacing(16)
+        card = self._card()
+        form = QVBoxLayout(card)
+        form.addWidget(self._step_title("Settings"))
+
+        form.addWidget(self._section("Appearance"))
+        theme_row = QHBoxLayout()
+        theme_label = QLabel("Theme")
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Dark", "dark")
+        self.theme_combo.addItem("Light", "light")
+        self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(self.settings.theme)))
+        self.theme_combo.currentIndexChanged.connect(self._theme_changed)
+        theme_row.addWidget(theme_label)
+        theme_row.addWidget(self.theme_combo, 1)
+        form.addLayout(theme_row)
+
+        export_row = QHBoxLayout()
+        self.settings_export_label = QLabel(f"Export folder: {self.export_dir}")
+        self.settings_export_label.setObjectName("hint")
+        self.settings_export_label.setWordWrap(True)
+        choose = QPushButton("Change folder")
+        choose.clicked.connect(self._choose_export_dir)
+        export_row.addWidget(self.settings_export_label, 1)
+        export_row.addWidget(choose)
+        form.addLayout(export_row)
+
+        self.warn_onedrive_check = QCheckBox("Warn when videos are on OneDrive")
+        self.warn_onedrive_check.setChecked(self.settings.warn_onedrive)
+        self.warn_onedrive_check.toggled.connect(self._settings_changed)
+        form.addWidget(self.warn_onedrive_check)
+
+        form.addWidget(self._section("Detection mode"))
+        mode_hint = QLabel(
+            "Motion mask is the default. Trained detector uses a YOLO .pt file — "
+            "site weights at training/weights/best.pt if present, otherwise a weights file you choose "
+            "(or yolo11n.pt). You can also change this on the Align step before Process."
+        )
+        mode_hint.setObjectName("hint")
+        mode_hint.setWordWrap(True)
+        form.addWidget(mode_hint)
+        self.detector_combo = QComboBox()
+        self.detector_combo.addItem("Motion mask", "motion")
+        self.detector_combo.addItem("Trained detector", "trained")
+        self.detector_combo.currentIndexChanged.connect(self._detector_mode_changed)
+        form.addWidget(self.detector_combo)
+        weights_row = QHBoxLayout()
+        self.detector_status = QLabel("")
+        self.detector_status.setObjectName("hint")
+        self.detector_status.setWordWrap(True)
+        choose_weights = QPushButton("Choose weights…")
+        choose_weights.clicked.connect(self._choose_detector_weights)
+        weights_row.addWidget(self.detector_status, 1)
+        weights_row.addWidget(choose_weights)
+        form.addLayout(weights_row)
+
+        form.addWidget(self._section("Training data"))
+        train_hint = QLabel(
+            "Boxed frames live under training/sessions. Use Training → Train detector to "
+            "fine-tune site weights (training/weights/best.pt). Export a zip to share or back up. "
+            "Import a zip or folder to merge sessions into this machine."
+        )
+        train_hint.setObjectName("hint")
+        train_hint.setWordWrap(True)
+        form.addWidget(train_hint)
+        self.training_summary = QLabel("No training data yet.")
+        self.training_summary.setObjectName("hint")
+        self.training_summary.setWordWrap(True)
+        form.addWidget(self.training_summary)
+        self.settings_train_list = QListWidget()
+        self.settings_train_list.setMinimumHeight(140)
+        form.addWidget(self.settings_train_list)
+        train_btns = QHBoxLayout()
+        export_data = QPushButton("Export…")
+        export_data.clicked.connect(self._export_training_data)
+        import_data = QPushButton("Import…")
+        import_data.clicked.connect(self._import_training_data)
+        open_train = QPushButton("Open folder")
+        open_train.clicked.connect(self._open_training_folder)
+        train_btns.addWidget(export_data)
+        train_btns.addWidget(import_data)
+        train_btns.addWidget(open_train)
+        train_btns.addStretch(1)
+        form.addLayout(train_btns)
+
+        form.addStretch(1)
+        layout.addWidget(card, 1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        return page
+
+    def _section(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("sectionLabel")
+        return label
 
     def _build_setup_page(self) -> QWidget:
         page = QWidget()
@@ -153,14 +459,6 @@ class MainWindow(QMainWindow):
         buttons.addWidget(add_folder)
         buttons.addWidget(remove)
         left_layout.addLayout(buttons)
-
-        self.overhead_drone = QCheckBox("Footage is overhead drone (looking straight down)")
-        self.overhead_drone.setChecked(True)
-        self.overhead_drone.setToolTip(
-            "Nadir cars are tiny and often labeled boat/airplane by YOLO. "
-            "This uses a larger inference size, lower confidence, and those extra classes."
-        )
-        left_layout.addWidget(self.overhead_drone)
 
         self.use_clock = QCheckBox("Use real clock time for 15-min bins")
         self.clock_edit = QDateTimeEdit()
@@ -206,8 +504,9 @@ class MainWindow(QMainWindow):
             "On the Align step, drag the overlay to match poles and curbs, then confirm. "
             "Unconfirmed clips are not processed.\n\n"
             "Keep large bundles on a local disk. OneDrive sync can stall seeking 2–5 GB files.\n\n"
-            "Overhead drone footage is the intended use. Street-level YOLO often misses "
-            "or mislabels cars seen from directly above — leave “overhead drone” checked."
+            "Processing is a motion mask, not a car classifier. On the drawing step, "
+            "mask one or more typical vehicles (car, truck, …) so processing knows "
+            "the size band. The preview shows each box as width×height."
         )
         help_text.setWordWrap(True)
         right_layout.addWidget(help_text)
@@ -222,68 +521,55 @@ class MainWindow(QMainWindow):
 
         left = self._card()
         left_layout = QVBoxLayout(left)
-        left_layout.addWidget(self._step_title("2. North, then entry and exit lines"))
+        left_layout.addWidget(self._step_title("2. Draw on the reference frame"))
         self.route_hint = QLabel(
-            "Set North, then add each gate and pick its name (or Auto from North). "
-            "Draw every line across the travel lanes (a tripwire), not along the curb. "
-            "For N-SB: green across the north inbound lanes, red across the south outbound lanes. "
+            "1) Set North  2) Draw entry and exit lines across the lanes  "
+            "3) Box a typical vehicle. Use the buttons on each row to rename, redraw, or delete."
         )
         self.route_hint.setObjectName("hint")
         self.route_hint.setWordWrap(True)
         left_layout.addWidget(self.route_hint)
 
-        self.route_list = QListWidget()
-        left_layout.addWidget(self.route_list, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        host = QWidget()
+        self.route_items = QVBoxLayout(host)
+        self.route_items.setContentsMargins(0, 0, 0, 0)
+        self.route_items.setSpacing(6)
+        self.route_items.addStretch(1)
+        scroll.setWidget(host)
+        left_layout.addWidget(scroll, 1)
 
+        add_row = QHBoxLayout()
         set_north = QPushButton("Set North")
         set_north.setObjectName("primary")
         set_north.clicked.connect(self._start_set_north)
-        left_layout.addWidget(set_north)
+        add_entry = QPushButton("Add entry")
+        add_entry.clicked.connect(lambda: self._start_draw_lines("start"))
+        add_exit = QPushButton("Add exit")
+        add_exit.clicked.connect(lambda: self._start_draw_lines("end"))
+        add_mask = QPushButton("Add vehicle")
+        add_mask.setToolTip("Drag a box around one typical vehicle. Add several sizes if needed.")
+        add_mask.clicked.connect(self._start_mask_vehicle)
+        add_row.addWidget(set_north)
+        add_row.addWidget(add_entry)
+        add_row.addWidget(add_exit)
+        add_row.addWidget(add_mask)
+        left_layout.addLayout(add_row)
 
-        start_pick = QHBoxLayout()
-        self.start_gate = QComboBox()
-        self.start_gate.addItem("Auto from North", None)
-        for origin in ORIGINS:
-            self.start_gate.addItem(origin, origin)
-        draw_starts = QPushButton("Add start line")
-        draw_starts.clicked.connect(lambda: self._start_draw_lines("start"))
-        start_pick.addWidget(self.start_gate, 1)
-        start_pick.addWidget(draw_starts)
-        left_layout.addLayout(start_pick)
-
-        end_pick = QHBoxLayout()
-        self.end_gate = QComboBox()
-        self.end_gate.addItem("Auto from North", None)
-        for bound in BOUNDS:
-            self.end_gate.addItem(bound, bound)
-        draw_ends = QPushButton("Add end line")
-        draw_ends.clicked.connect(lambda: self._start_draw_lines("end"))
-        end_pick.addWidget(self.end_gate, 1)
-        end_pick.addWidget(draw_ends)
-        left_layout.addLayout(end_pick)
-
-        edit_btns = QHBoxLayout()
-        rename_line = QPushButton("Rename selected")
-        rename_line.clicked.connect(self._rename_selected_line)
-        delete_line = QPushButton("Delete selected")
-        delete_line.clicked.connect(self._delete_selected_line)
-        edit_btns.addWidget(rename_line)
-        edit_btns.addWidget(delete_line)
-        left_layout.addLayout(edit_btns)
-
-        clear_geom = QPushButton("Clear lines")
+        extra = QHBoxLayout()
+        save_geom = QPushButton("Save")
+        load_geom = QPushButton("Load")
+        clear_geom = QPushButton("Clear all")
         clear_geom.setObjectName("danger")
-        clear_geom.clicked.connect(self._clear_geometry_lines)
-        left_layout.addWidget(clear_geom)
-
-        io_btns = QHBoxLayout()
-        save_geom = QPushButton("Save geometry")
-        load_geom = QPushButton("Load geometry")
         save_geom.clicked.connect(self._save_geometry)
         load_geom.clicked.connect(self._load_geometry)
-        io_btns.addWidget(save_geom)
-        io_btns.addWidget(load_geom)
-        left_layout.addLayout(io_btns)
+        clear_geom.clicked.connect(self._clear_geometry_lines)
+        extra.addWidget(save_geom)
+        extra.addWidget(load_geom)
+        extra.addWidget(clear_geom)
+        left_layout.addLayout(extra)
 
         nav = QHBoxLayout()
         back = QPushButton("Back")
@@ -306,10 +592,13 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(canvas_header)
         self.canvas = FrameCanvas()
         self.canvas.on_line_drawn = self._on_line_drawn
+        self.canvas.on_box_drawn = self._on_vehicle_mask_drawn
         right_layout.addWidget(self.canvas, 1)
         row.addWidget(left, 0)
         row.addWidget(right, 1)
-        left.setMaximumWidth(360)
+        left.setMinimumWidth(400)
+        left.setMaximumWidth(440)
+        self._refresh_route_list()
         return page
 
     def _build_align_page(self) -> QWidget:
@@ -364,6 +653,17 @@ class MainWindow(QMainWindow):
         apply_match = QPushButton("Apply matched points")
         apply_match.clicked.connect(self._apply_match_points)
         left_layout.addWidget(apply_match)
+
+        left_layout.addWidget(self._section("Detection before process"))
+        self.process_detector_combo = QComboBox()
+        self.process_detector_combo.addItem("Motion mask", "motion")
+        self.process_detector_combo.addItem("Trained detector", "trained")
+        self.process_detector_combo.currentIndexChanged.connect(self._detector_mode_changed)
+        left_layout.addWidget(self.process_detector_combo)
+        self.process_detector_status = QLabel("")
+        self.process_detector_status.setObjectName("hint")
+        self.process_detector_status.setWordWrap(True)
+        left_layout.addWidget(self.process_detector_status)
 
         nav = QHBoxLayout()
         back = QPushButton("Back")
@@ -452,12 +752,26 @@ class MainWindow(QMainWindow):
     def _build_report_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(self._step_title("5. Gate statistics"))
+        layout.addWidget(self._step_title("5. Report"))
         self.report_summary = QLabel("No results yet.")
         self.report_summary.setObjectName("hint")
+        self.report_summary.setWordWrap(True)
         layout.addWidget(self.report_summary)
+        clip_row = QHBoxLayout()
+        self.report_clip_label = QLabel("Workbook")
+        clip_row.addWidget(self.report_clip_label)
+        self.report_clip = QComboBox()
+        self.report_clip.currentIndexChanged.connect(self._show_report_clip)
+        clip_row.addWidget(self.report_clip, 1)
+        layout.addLayout(clip_row)
+        self.report_tabs = QTabWidget()
+        self.overview_table = QTableWidget()
         self.table = QTableWidget()
-        layout.addWidget(self.table, 1)
+        self.tmc_table = QTableWidget()
+        self.report_tabs.addTab(self.overview_table, "Overview")
+        self.report_tabs.addTab(self.table, "Gate Statistics")
+        self.report_tabs.addTab(self.tmc_table, "TMC Summary")
+        layout.addWidget(self.report_tabs, 1)
         nav = QHBoxLayout()
         again = QPushButton("New batch")
         again.clicked.connect(self._reset_flow)
@@ -471,7 +785,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _refresh_device_status(self) -> None:
-        self.statusBar().showMessage(f"Ready  •  {describe_device(detect_device())}")
+        self.statusBar().showMessage("Ready  •  motion mask")
 
     def _step_title(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -496,7 +810,7 @@ class MainWindow(QMainWindow):
         self.video_list.clear()
         for path in self.videos:
             self.video_list.addItem(self._video_label(path))
-        if self.videos and any(is_onedrive_path(p) for p in self.videos):
+        if self.settings.warn_onedrive and self.videos and any(is_onedrive_path(p) for p in self.videos):
             self.onedrive_warn.setText(
                 "These files are under OneDrive. Seeking 2–5 GB clips over sync is slow and can stall. "
                 "Copy the bundle to a local disk when you can."
@@ -541,6 +855,9 @@ class MainWindow(QMainWindow):
         if folder:
             self.export_dir = Path(folder)
             self.export_label.setText(f"Export folder: {self.export_dir}")
+            if hasattr(self, "settings_export_label"):
+                self.settings_export_label.setText(f"Export folder: {self.export_dir}")
+            self._persist_settings()
 
     def _go_routes(self) -> None:
         if not self.videos:
@@ -564,139 +881,358 @@ class MainWindow(QMainWindow):
             self.geometry.frame_width = width
             self.geometry.frame_height = height
             self.canvas.set_geometry(self.geometry)
+            self._refresh_route_list()
             self.route_hint.setText(
-                f"Frame {index} from {self.videos[0].name}. Set North, then add the entry and exit lines that exist."
+                f"Frame {index} from {self.videos[0].name}. Set North, then add entry and exit lines across the lanes."
             )
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, str(exc))
 
+    def _clear_layout(self, layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.blockSignals(True)
+                for child in widget.findChildren(QWidget):
+                    child.blockSignals(True)
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _section_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("sectionLabel")
+        return label
+
+    def _item_row(
+        self,
+        title: str,
+        *,
+        name_options: tuple[str, ...] | None = None,
+        current_name: str | None = None,
+        on_name=None,
+        on_redraw=None,
+        on_delete=None,
+        redraw_label: str = "Redraw",
+        delete_label: str = "Delete",
+    ) -> QWidget:
+        row = QWidget()
+        row.setObjectName("itemRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+        label = QLabel(title)
+        layout.addWidget(label, 1)
+        if name_options and on_name:
+            combo = QComboBox()
+            for name in name_options:
+                combo.addItem(name, name)
+            if current_name:
+                combo.setCurrentText(current_name)
+            combo.activated.connect(lambda _idx, box=combo: on_name(box.currentData()))
+            layout.addWidget(combo)
+        if on_redraw:
+            redraw = QPushButton(redraw_label)
+            redraw.setObjectName("rowAction")
+            redraw.clicked.connect(bind_row_action(on_redraw))
+            layout.addWidget(redraw)
+        if on_delete:
+            delete = QPushButton(delete_label)
+            delete.setObjectName("rowDanger")
+            delete.clicked.connect(bind_row_action(on_delete))
+            layout.addWidget(delete)
+        return row
+
     def _refresh_route_list(self) -> None:
-        self.route_list.clear()
+        self._clear_layout(self.route_items)
+        self.route_items.addWidget(self._section_label("NORTH"))
         if self.geometry.north is not None:
-            self.route_list.addItem("North heading set")
+            self.route_items.addWidget(
+                self._item_row(
+                    "North heading",
+                    on_redraw=self._start_set_north,
+                    on_delete=self._clear_north,
+                    delete_label="Reset",
+                )
+            )
         else:
-            self.route_list.addItem("North not set")
+            self.route_items.addWidget(
+                self._item_row("North not set yet", on_redraw=self._start_set_north, redraw_label="Set")
+            )
+
+        self.route_items.addWidget(self._section_label("ENTRIES  (vehicles enter here)"))
+        if not self.geometry.starts:
+            empty = QLabel("No entry lines. Click Add entry, then drag across the inbound lanes.")
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self.route_items.addWidget(empty)
         for item in self.geometry.starts:
-            self.route_list.addItem(f"Start  {item.name or '(unnamed)'}")
+            self.route_items.addWidget(
+                self._item_row(
+                    "Entry",
+                    name_options=ORIGINS,
+                    current_name=item.name,
+                    on_name=lambda name, gate=item: self._rename_gate_item(gate, name),
+                    on_redraw=lambda gate=item: self._redraw_gate_item(gate),
+                    on_delete=lambda gate=item: self._delete_gate_item(gate),
+                )
+            )
+
+        self.route_items.addWidget(self._section_label("EXITS  (vehicles leave here)"))
+        if not self.geometry.ends:
+            empty = QLabel("No exit lines. Click Add exit, then drag across the outbound lanes.")
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self.route_items.addWidget(empty)
         for item in self.geometry.ends:
-            self.route_list.addItem(f"End    {item.name or '(unnamed)'}")
+            self.route_items.addWidget(
+                self._item_row(
+                    "Exit",
+                    name_options=BOUNDS,
+                    current_name=item.name,
+                    on_name=lambda name, gate=item: self._rename_gate_item(gate, name),
+                    on_redraw=lambda gate=item: self._redraw_gate_item(gate),
+                    on_delete=lambda gate=item: self._delete_gate_item(gate),
+                )
+            )
+
+        self.route_items.addWidget(self._section_label("VEHICLE SIZE"))
+        if not self.geometry.vehicle_refs:
+            empty = QLabel("No size masks. Click Add vehicle and box a typical car or truck.")
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self.route_items.addWidget(empty)
+        for box in self.geometry.vehicle_refs:
+            self.route_items.addWidget(
+                self._item_row(
+                    f"Vehicle  {int(box.width())}×{int(box.height())}  ({int(box.area())} px²)",
+                    on_redraw=lambda mask=box: self._redraw_vehicle_item(mask),
+                    on_delete=lambda mask=box: self._delete_vehicle_item(mask),
+                )
+            )
+        limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
+        if limits:
+            extra = "masks plus Training boxes" if prior_areas() else "these masks"
+            band = QLabel(f"Keeping blobs {limits[0]}–{limits[1]} px² from {extra}.")
+            band.setObjectName("hint")
+            band.setWordWrap(True)
+            self.route_items.addWidget(band)
         if self.geometry.is_ready():
-            names = ", ".join(self.geometry.movement_names())
-            self.route_list.addItem(f"Movements: {names}")
+            ready = QLabel("Movements: " + ", ".join(self.geometry.movement_names()))
+            ready.setObjectName("hint")
+            ready.setWordWrap(True)
+            self.route_items.addWidget(ready)
+        self.route_items.addStretch(1)
         self.canvas.set_geometry(self.geometry)
         self.project.geometry = self.geometry
 
-    def _start_set_north(self) -> None:
+    def _start_set_north(self, *_args) -> None:
         self._draw_step = "north"
+        self._redraw_index = None
+        self._redraw_target = None
         self.canvas.set_drawing_enabled(True)
         self.route_hint.setText(
-            "Click in the middle of the intersection, then drag toward geographic North and release. "
-            "If North is at the bottom of the photo, drag downward — the top of the frame does not have to be North."
+            "On the photo: click the middle of the intersection, drag toward geographic North, release. "
+            "If North is at the bottom of the photo, drag downward."
         )
 
-    def _start_draw_lines(self, kind: str) -> None:
+    def _start_draw_lines(self, kind: str, *, replace=None) -> None:
         if self.geometry.north is None:
             QMessageBox.information(self, APP_NAME, "Set North first so entry and exit lines can be named.")
             return
         existing = self.geometry.starts if kind == "start" else self.geometry.ends
-        if len(existing) >= MAX_GATES:
-            QMessageBox.information(self, APP_NAME, f"At most {MAX_GATES} {kind} lines. Delete one to replace it.")
+        if replace is None and len(existing) >= MAX_GATES:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_GATES} {kind} lines. Delete one to add another.")
             return
-        combo = self.start_gate if kind == "start" else self.end_gate
-        chosen = combo.currentData()
-        taken = {item.name for item in existing if item.name}
-        if chosen and chosen in taken:
-            QMessageBox.information(self, APP_NAME, f"{chosen} is already drawn. Pick another name or delete it first.")
+        live = self._live_gate(replace) if replace is not None else None
+        if replace is not None and (live is None or live[0] != kind):
             return
         self._draw_step = kind
-        self._draw_gate_name = chosen
-        if chosen:
-            self.route_hint.setText(f"Draw the {chosen} {'entry' if kind == 'start' else 'exit'} line.")
-        else:
-            self.route_hint.setText(
-                f"Draw an {'entry' if kind == 'start' else 'exit'} line. "
-                "It will be named from its side of the intersection relative to North."
-            )
+        self._redraw_target = live[1] if live is not None else None
+        self._redraw_index = None
+        self._draw_gate_name = live[1].name if live is not None else None
+        label = "entry" if kind == "start" else "exit"
+        self.route_hint.setText(f"On the photo: drag a line across the {label} lanes, then release.")
         self.canvas.set_drawing_enabled(True)
 
+    def _start_mask_vehicle(self, *_args, replace=None) -> None:
+        if replace is None and len(self.geometry.vehicle_refs) >= MAX_VEHICLE_REFS:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_VEHICLE_REFS} vehicle masks. Delete one to add another.")
+            return
+        live = self._live_vehicle(replace) if replace is not None else None
+        if replace is not None and live is None:
+            return
+        self._draw_step = "vehicle"
+        self._redraw_target = live
+        self._redraw_index = None
+        self.canvas.set_drawing_enabled(True, box=True)
+        self.route_hint.setText("On the photo: drag a box around one typical vehicle, then release.")
+
+    def _live_gate(self, item) -> tuple[str, NamedLine] | None:
+        if not isinstance(item, NamedLine) or not item.name:
+            return None
+        for gate in self.geometry.starts:
+            if gate is item or gate.name == item.name:
+                return "start", gate
+        for gate in self.geometry.ends:
+            if gate is item or gate.name == item.name:
+                return "end", gate
+        return None
+
+    def _live_vehicle(self, box) -> Box | None:
+        if not isinstance(box, Box):
+            return None
+        for item in self.geometry.vehicle_refs:
+            if item is box or item == box:
+                return item
+        return None
+
+    def _redraw_gate_item(self, item) -> None:
+        live = self._live_gate(item)
+        if live is None:
+            return
+        self._start_draw_lines(live[0], replace=live[1])
+
+    def _redraw_vehicle_item(self, box: Box) -> None:
+        live = self._live_vehicle(box)
+        if live is None:
+            return
+        self._start_mask_vehicle(replace=live)
+
+    def _delete_gate_item(self, item) -> None:
+        live = self._live_gate(item)
+        if live is None:
+            return
+        kind, gate = live
+        if kind == "start":
+            self.geometry.starts = [existing for existing in self.geometry.starts if existing is not gate]
+        else:
+            self.geometry.ends = [existing for existing in self.geometry.ends if existing is not gate]
+        if self._redraw_target is gate:
+            self._redraw_target = None
+            self._draw_step = "idle"
+            self.canvas.set_drawing_enabled(False)
+        self._refresh_route_list()
+
+    def _delete_vehicle_item(self, box: Box) -> None:
+        live = self._live_vehicle(box)
+        if live is None:
+            return
+        self.geometry.vehicle_refs = [item for item in self.geometry.vehicle_refs if item is not live]
+        if self._redraw_target is live:
+            self._redraw_target = None
+            self._draw_step = "idle"
+            self.canvas.set_drawing_enabled(False)
+        self._refresh_route_list()
+
+    def _rename_gate_item(self, item, name: str | None) -> None:
+        if not name:
+            return
+        live = self._live_gate(item)
+        if live is None:
+            return
+        _kind, item = live
+        pool = self.geometry.starts if _kind == "start" else self.geometry.ends
+        taken = {other.name for other in pool if other is not item}
+        if name in taken:
+            QMessageBox.information(self, APP_NAME, f"{name} is already used on another line.")
+            self._refresh_route_list()
+            return
+        if item.name == name:
+            return
+        item.name = name
+        self._refresh_route_list()
+
+    def _clear_north(self, *_args) -> None:
+        self.geometry.north = None
+        self._refresh_route_list()
+        self.route_hint.setText("North cleared. Set it again before adding entry or exit lines.")
+
+    def _on_vehicle_mask_drawn(self, box: Box) -> None:
+        if self._draw_step != "vehicle":
+            return
+        if box.area() < 20:
+            QMessageBox.information(self, APP_NAME, "That box is too small. Drag around a whole vehicle.")
+            return
+        if self._redraw_target is not None:
+            index = next(
+                (i for i, item in enumerate(self.geometry.vehicle_refs) if item is self._redraw_target),
+                None,
+            )
+            if index is None:
+                return
+            self.geometry.vehicle_refs[index] = box
+        elif len(self.geometry.vehicle_refs) >= MAX_VEHICLE_REFS:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_VEHICLE_REFS} vehicle masks.")
+            return
+        else:
+            self.geometry.vehicle_refs.append(box)
+        self._draw_step = "idle"
+        self._redraw_index = None
+        self._redraw_target = None
+        self.canvas.set_drawing_enabled(False)
+        self.canvas.clear_draft()
+        self._refresh_route_list()
+        limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
+        band = f" Keeping blobs {limits[0]}–{limits[1]} px²." if limits else ""
+        self.route_hint.setText(f"Saved vehicle {int(box.width())}×{int(box.height())}.{band}")
+
     def _clear_geometry_lines(self) -> None:
+        go = QMessageBox.question(
+            self,
+            APP_NAME,
+            "Clear North, all entry/exit lines, and vehicle masks?",
+        )
+        if go != QMessageBox.StandardButton.Yes:
+            return
         self.geometry.north = None
         self.geometry.starts = []
         self.geometry.ends = []
+        self.geometry.vehicle_refs = []
         self._draw_step = "idle"
+        self._redraw_index = None
+        self._redraw_target = None
         self.canvas.set_drawing_enabled(False)
         self._refresh_route_list()
         self.route_hint.setText("Cleared. Set North, then add the entry and exit lines that exist.")
-
-    def _delete_selected_line(self) -> None:
-        row = self.route_list.currentRow()
-        if row <= 0:
-            return
-        start_count = len(self.geometry.starts)
-        if 1 <= row <= start_count:
-            del self.geometry.starts[row - 1]
-        elif start_count < row <= start_count + len(self.geometry.ends):
-            del self.geometry.ends[row - 1 - start_count]
-        else:
-            return
-        self._refresh_route_list()
-
-    def _rename_selected_line(self) -> None:
-        row = self.route_list.currentRow()
-        if row <= 0:
-            QMessageBox.information(self, APP_NAME, "Select a start or end line to rename.")
-            return
-        start_count = len(self.geometry.starts)
-        if 1 <= row <= start_count:
-            name = self.start_gate.currentData()
-            if not name:
-                QMessageBox.information(self, APP_NAME, "Pick N, S, E, or W in the start dropdown, then rename.")
-                return
-            taken = {item.name for i, item in enumerate(self.geometry.starts) if i != row - 1}
-            if name in taken:
-                QMessageBox.information(self, APP_NAME, f"{name} is already used. Delete or rename that line first.")
-                return
-            self.geometry.starts[row - 1].name = name
-        elif start_count < row <= start_count + len(self.geometry.ends):
-            name = self.end_gate.currentData()
-            if not name:
-                QMessageBox.information(self, APP_NAME, "Pick NB, SB, EB, or WB in the end dropdown, then rename.")
-                return
-            idx = row - 1 - start_count
-            taken = {item.name for i, item in enumerate(self.geometry.ends) if i != idx}
-            if name in taken:
-                QMessageBox.information(self, APP_NAME, f"{name} is already used. Delete or rename that line first.")
-                return
-            self.geometry.ends[idx].name = name
-        else:
-            return
-        self._refresh_route_list()
 
     def _on_line_drawn(self, line: Line) -> None:
         if self._draw_step == "north":
             self.geometry.north = line
             self.geometry.assign_names()
             self._draw_step = "idle"
+            self._redraw_index = None
+            self._redraw_target = None
             self.canvas.set_drawing_enabled(False)
             self.canvas.clear_draft()
             self._refresh_route_list()
-            self.route_hint.setText(
-                "North set. Pick a gate name (or Auto from North), then add only the entries and exits that exist."
-            )
+            self.route_hint.setText("North set. Add entry and exit lines across the lanes.")
             return
         if self._draw_step in ("start", "end"):
-            added = self.geometry.add_gate(self._draw_step, line, self._draw_gate_name)
+            pool = self.geometry.starts if self._draw_step == "start" else self.geometry.ends
+            if self._redraw_target is not None and any(item is self._redraw_target for item in pool):
+                self._redraw_target.line = line
+                added_name = self._redraw_target.name
+            else:
+                added = self.geometry.add_gate(self._draw_step, line, self._draw_gate_name)
+                if added is None:
+                    QMessageBox.information(self, APP_NAME, "Could not add that gate. It may already exist or the set is full.")
+                    self.canvas.clear_draft()
+                    self.canvas.set_drawing_enabled(False)
+                    self._draw_step = "idle"
+                    self._redraw_index = None
+                    self._redraw_target = None
+                    return
+                added_name = added.name
             self.canvas.clear_draft()
             self.canvas.set_drawing_enabled(False)
             self._draw_step = "idle"
+            self._redraw_index = None
+            self._redraw_target = None
             self._refresh_route_list()
-            if added is None:
-                QMessageBox.information(self, APP_NAME, "Could not add that gate. It may already exist or the set is full.")
-                return
-            kind = "start" if added.name in ORIGINS else "end"
-            self.route_hint.setText(
-                f"Saved {added.name} {kind} line. Add another gate, or go next if this one-way / intersection is complete."
-            )
+            kind = "entry" if added_name in ORIGINS else "exit"
+            self.route_hint.setText(f"Saved {added_name} {kind} line. Change the name on that row if needed.")
 
     def _save_geometry(self) -> None:
         if not self.geometry.is_ready():
@@ -1105,24 +1641,30 @@ class MainWindow(QMainWindow):
         self.results = []
         self.progress.setValue(0)
         self.cancel_btn.setEnabled(True)
-        self._append_log(f"Device: {describe_device(detect_device())}")
-        try:
-            self._append_log(f"Model: {resolve_model_source().label}")
-        except Exception as exc:
-            self._append_log(f"Model: {exc}")
+        mode = self.settings.detector_mode
+        weights = resolve_detector_weights(self.settings.detector_weights)
+        if mode == "trained":
+            self._append_log(f"Detection: trained detector  •  {weights}")
+        else:
+            self._append_log("Detection: motion mask (all vehicles the same)")
+        limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
+        if limits:
+            extra = f" + {len(prior_areas())} training box(es)" if prior_areas() else ""
+            self._append_log(
+                f"Box size from {len(self.geometry.vehicle_refs)} vehicle mask(s){extra}: "
+                f"{limits[0]}–{limits[1]} px²"
+            )
+        else:
+            self._append_log("Box size: default frame band (no vehicle masks or Training boxes)")
         self._append_log(f"Processing {len(jobs)} clip(s); skipped {len(skipped)}")
         self._append_log(f"Movements: {', '.join(self.geometry.movement_names())}")
-        self._append_log(
-            "Detection: overhead drone (larger imgsz, boat/airplane kept as cars)"
-            if self.overhead_drone.isChecked()
-            else "Detection: street-level classes only"
-        )
 
         self.worker = ProcessWorker(
             jobs=jobs,
             export_dir=self.export_dir,
             clock_start=self._clock_start(),
-            overhead_drone=self.overhead_drone.isChecked(),
+            detector_mode=mode,
+            weights_path=self.settings.detector_weights or str(weights),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.preview.connect(self._on_preview)
@@ -1172,20 +1714,66 @@ class MainWindow(QMainWindow):
             f"{len(ok_results)} video(s) processed  •  {total_trips} trips  •  "
             f"{max(0, skipped)} skipped  •  Spreadsheets saved in {self.export_dir}"
         )
+        self.report_clip.blockSignals(True)
+        self.report_clip.clear()
+        for result in ok_results:
+            self.report_clip.addItem(result.video.name)
+        multi = len(ok_results) > 1
+        self.report_clip.setVisible(multi)
+        self.report_clip_label.setVisible(multi)
+        self.report_clip.blockSignals(False)
         if not ok_results:
-            self.table.clear()
+            self._fill_table(self.overview_table, None)
+            self._fill_table(self.table, None)
+            self._fill_table(self.tmc_table, None)
             return
-        first = ok_results[0]
-        table = build_gate_statistics_table(first.trips, first.geometry)
-        self.table.setRowCount(len(table))
-        self.table.setColumnCount(len(table.columns))
-        self.table.setHorizontalHeaderLabels(list(table.columns))
-        for r_idx, row in table.iterrows():
+        self.report_clip.setCurrentIndex(0)
+        self._show_report_clip()
+
+    def _show_report_clip(self) -> None:
+        ok_results = [result for result in self.results if not result.error]
+        if not ok_results:
+            return
+        index = max(0, min(self.report_clip.currentIndex(), len(ok_results) - 1))
+        result = ok_results[index]
+        clock = self._clock_start()
+        overview = build_overview_table(
+            result.trips,
+            video_name=result.video.name,
+            duration_s=result.video.duration_s,
+            clock_start=clock,
+            device_label=result.device_label,
+        )
+        gates = build_gate_statistics_table(result.trips, result.geometry)
+        tmc = build_tmc_summary_table(
+            result.trips, result.geometry, result.video.duration_s, clock
+        )
+        self._fill_table(self.overview_table, overview, left_align_first=True)
+        self._fill_table(self.table, gates)
+        self._fill_table(self.tmc_table, tmc, left_align_first=True)
+
+    def _fill_table(self, widget: QTableWidget, table, *, left_align_first: bool = False) -> None:
+        widget.clear()
+        widget.setRowCount(0)
+        widget.setColumnCount(0)
+        if table is None or table.empty:
+            return
+        widget.setRowCount(len(table))
+        widget.setColumnCount(len(table.columns))
+        widget.setHorizontalHeaderLabels([str(col) for col in table.columns])
+        for r_idx, (_, row) in enumerate(table.iterrows()):
             for c_idx, value in enumerate(row):
-                item = QTableWidgetItem(str(value))
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(r_idx, c_idx, item)
-        self.table.resizeColumnsToContents()
+                text = "" if value is None or value == "" else str(value)
+                item = QTableWidgetItem(text)
+                if c_idx == 0 and left_align_first:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+                else:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                widget.setItem(r_idx, c_idx, item)
+        widget.resizeColumnsToContents()
+        header = widget.horizontalHeader()
+        if header is not None:
+            header.setStretchLastSection(True)
 
     def _open_export_dir(self) -> None:
         from PyQt6.QtCore import QUrl
@@ -1197,6 +1785,552 @@ class MainWindow(QMainWindow):
     def _reset_flow(self) -> None:
         self.stack.setCurrentIndex(PAGE_SETUP)
 
+    def _on_page_changed(self, index: int) -> None:
+        home = index == PAGE_HOME
+        self.header_bar.setVisible(not home)
+        self.steps.setVisible(index in PROCESS_PAGES)
+        self.home_btn.setVisible(not home)
+        if home:
+            self.content_layout.setContentsMargins(0, 0, 0, 0)
+            self.statusBar().hide()
+            self.home_stage.focus_menu()
+        else:
+            self.content_layout.setContentsMargins(16, 12, 16, 16)
+            self.statusBar().show()
+        if index == PAGE_TRAINING:
+            self._refresh_training_sessions()
+        if index == PAGE_SETTINGS:
+            self._refresh_settings_page()
+        if index == PAGE_ALIGN:
+            self._sync_detector_ui()
+
+    def _go_home(self) -> None:
+        self.stack.setCurrentIndex(PAGE_HOME)
+
+    def _go_process_feature(self) -> None:
+        self.stack.setCurrentIndex(PAGE_SETUP)
+
+    def _go_training(self) -> None:
+        self.stack.setCurrentIndex(PAGE_TRAINING)
+        self._refresh_train_ready_status()
+
+    def _go_settings(self) -> None:
+        self.stack.setCurrentIndex(PAGE_SETTINGS)
+
+    def _persist_settings(self) -> None:
+        mode = "motion"
+        if hasattr(self, "detector_combo"):
+            mode = self.detector_combo.currentData() or "motion"
+        warn = self.settings.warn_onedrive
+        if hasattr(self, "warn_onedrive_check"):
+            warn = self.warn_onedrive_check.isChecked()
+        theme = self.settings.theme
+        if hasattr(self, "theme_combo"):
+            theme = self.theme_combo.currentData() or "dark"
+        self.settings = AppSettings(
+            export_dir=str(self.export_dir),
+            warn_onedrive=warn,
+            detector_mode=mode,
+            detector_weights=self.settings.detector_weights,
+            theme=theme if theme in ("dark", "light") else "dark",
+        )
+        save_settings(self.settings)
+        self._refresh_setup_list()
+
+    def _settings_changed(self, *_args) -> None:
+        self._persist_settings()
+
+    def _detector_mode_changed(self, *_args) -> None:
+        sender = self.sender()
+        if sender is not None and hasattr(sender, "currentData"):
+            mode = sender.currentData() or "motion"
+            for combo in (getattr(self, "detector_combo", None), getattr(self, "process_detector_combo", None)):
+                if combo is None or combo is sender:
+                    continue
+                combo.blockSignals(True)
+                combo.setCurrentIndex(max(0, combo.findData(mode)))
+                combo.blockSignals(False)
+        self._persist_settings()
+        self._refresh_detector_status()
+
+    def _choose_detector_weights(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose detector weights",
+            str(trained_weights_path().parent),
+            "YOLO weights (*.pt *.onnx);;All files (*.*)",
+        )
+        if not path:
+            return
+        self.settings.detector_weights = path
+        if hasattr(self, "detector_combo"):
+            self.detector_combo.blockSignals(True)
+            self.detector_combo.setCurrentIndex(max(0, self.detector_combo.findData("trained")))
+            self.detector_combo.blockSignals(False)
+        if hasattr(self, "process_detector_combo"):
+            self.process_detector_combo.blockSignals(True)
+            self.process_detector_combo.setCurrentIndex(max(0, self.process_detector_combo.findData("trained")))
+            self.process_detector_combo.blockSignals(False)
+        self._persist_settings()
+        self._refresh_detector_status()
+
+    def _sync_detector_ui(self) -> None:
+        mode = self.settings.detector_mode if self.settings.detector_mode in ("motion", "trained") else "motion"
+        for combo in (getattr(self, "detector_combo", None), getattr(self, "process_detector_combo", None)):
+            if combo is None:
+                continue
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(mode)))
+            combo.blockSignals(False)
+        self._refresh_detector_status()
+
+    def _refresh_detector_status(self) -> None:
+        weights = resolve_detector_weights(self.settings.detector_weights)
+        if has_trained_weights() and (
+            not self.settings.detector_weights or Path(self.settings.detector_weights) == trained_weights_path()
+        ):
+            text = f"Using site weights: {trained_weights_path()}"
+        elif self.settings.detector_weights and Path(self.settings.detector_weights).is_file():
+            text = f"Using {self.settings.detector_weights}"
+        elif weights.is_file():
+            text = f"Using {weights} (no site best.pt yet)"
+        else:
+            text = (
+                f"Will load {weights.name} on process (download if needed). "
+                "Choose a .pt file to use your own weights."
+            )
+        if hasattr(self, "detector_status"):
+            self.detector_status.setText(text)
+        if hasattr(self, "process_detector_status"):
+            self.process_detector_status.setText(text)
+
+    def _theme_changed(self, *_args) -> None:
+        self._persist_settings()
+        self._apply_theme(self.settings.theme)
+
+    def _apply_theme(self, theme: str) -> None:
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet_for(theme))
+        if hasattr(self, "home_stage"):
+            self.home_stage.set_theme(theme)
+
+    def _refresh_training_inventory(self) -> None:
+        info = training_inventory()
+        prior = "size prior on" if info["has_prior"] else "no size prior"
+        weights = "weights present" if info["has_weights"] else "no weights"
+        self.training_summary.setText(
+            f"{info['root']}  •  {info['session_count']} session(s), "
+            f"{info['frame_count']} frame(s), {info['box_count']} box(es)  •  {prior}, {weights}"
+        )
+        self.settings_train_list.clear()
+        for session in info["sessions"]:
+            self.settings_train_list.addItem(self._training_session_label(session))
+        self._refresh_train_ready_status()
+
+    def _export_training_data(self) -> None:
+        info = training_inventory()
+        if info["session_count"] == 0:
+            QMessageBox.information(self, APP_NAME, "No training sessions to export yet.")
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export training data",
+            str(Path.cwd() / "training-data.zip"),
+            "Zip archive (*.zip)",
+        )
+        if not dest:
+            return
+        try:
+            path = export_training_archive(Path(dest))
+        except (OSError, FileNotFoundError) as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self.statusBar().showMessage(f"Exported training data to {path}")
+        QMessageBox.information(self, APP_NAME, f"Saved {path}")
+
+    def _import_training_data(self) -> None:
+        src, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import training data",
+            "",
+            "Zip archive (*.zip);;All files (*.*)",
+        )
+        folder = ""
+        if not src:
+            folder = QFileDialog.getExistingDirectory(self, "Or choose a training folder")
+            if not folder:
+                return
+            src = folder
+        incoming = training_inventory()
+        replace = False
+        if incoming["session_count"]:
+            go = QMessageBox.question(
+                self,
+                APP_NAME,
+                "Replace existing sessions with the same name?\n\n"
+                "Yes replaces matches. No keeps yours and only adds new names.",
+            )
+            replace = go == QMessageBox.StandardButton.Yes
+        try:
+            result = import_training_archive(Path(src), replace=replace)
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self._refresh_training_inventory()
+        self._refresh_training_sessions()
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            f"Imported {result['imported']}, replaced {result['replaced']}, skipped {result['skipped']}.",
+        )
+
+    def _open_training_folder(self) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        folder = training_root()
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
+    def _refresh_settings_page(self) -> None:
+        self.settings_export_label.setText(f"Export folder: {self.export_dir}")
+        self.warn_onedrive_check.blockSignals(True)
+        self.warn_onedrive_check.setChecked(self.settings.warn_onedrive)
+        self.warn_onedrive_check.blockSignals(False)
+        self.theme_combo.blockSignals(True)
+        self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(self.settings.theme)))
+        self.theme_combo.blockSignals(False)
+        self._refresh_training_inventory()
+        self._sync_detector_ui()
+
+    def _training_session_label(self, session: TrainingSession) -> str:
+        saved = session.saved_at[:19].replace("T", " ") if session.saved_at else "unsaved"
+        return (
+            f"{session.video_stem}  •  {len(session.frames)} frame(s), "
+            f"{session.box_count()} box(es)  •  {saved}"
+        )
+
+    def _refresh_training_sessions(self) -> None:
+        self.train_sessions.clear()
+        for session in list_sessions():
+            self.train_sessions.addItem(self._training_session_label(session))
+            self.train_sessions.item(self.train_sessions.count() - 1).setData(
+                Qt.ItemDataRole.UserRole, session.video_stem
+            )
+        areas = prior_areas()
+        if areas:
+            limits = self.geometry.vehicle_area_limits(extra_areas=areas)
+            if limits:
+                self.train_status.setText(
+                    f"{len(areas)} training box(es) in the size prior. "
+                    f"Process will keep blobs {limits[0]}–{limits[1]} px²."
+                )
+        self._refresh_train_ready_status()
+
+    def _refresh_train_ready_status(self) -> None:
+        if not hasattr(self, "train_ready_label"):
+            return
+        info = training_inventory()
+        report = device_report()
+        extra = " — this will take a long time" if report.device == "cpu" else ""
+        self.train_ready_label.setText(
+            f"{info['frame_count']} labeled frame(s)  •  {info['box_count']} box(es)  •  "
+            f"{report.label}{extra}"
+        )
+
+    def _set_train_busy(self, busy: bool) -> None:
+        if hasattr(self, "train_detector_btn"):
+            self.train_detector_btn.setEnabled(not busy)
+        if hasattr(self, "train_visdrone_btn"):
+            self.train_visdrone_btn.setEnabled(not busy)
+        if hasattr(self, "cancel_train_btn"):
+            self.cancel_train_btn.setEnabled(busy)
+
+    def _start_detector_train(self) -> None:
+        if self.train_worker and self.train_worker.isRunning():
+            return
+        info = training_inventory()
+        if info["frame_count"] < TRAIN_MIN_FRAMES or info["box_count"] < TRAIN_MIN_BOXES:
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                f"Need at least {TRAIN_MIN_FRAMES} labeled frames and {TRAIN_MIN_BOXES} boxes. "
+                f"Found {info['frame_count']} frame(s) and {info['box_count']} box(es). "
+                "Box every vehicle on more frames, then try again.",
+            )
+            return
+        report = device_report()
+        if report.device == "cpu":
+            go = QMessageBox.question(
+                self,
+                APP_NAME,
+                report.warning or "Fine-tuning YOLO on CPU can take hours. Continue?",
+            )
+            if go != QMessageBox.StandardButton.Yes:
+                return
+        self._launch_train_worker("site", "Starting site detector training…")
+
+    def _start_visdrone_train(self) -> None:
+        if self.train_worker and self.train_worker.isRunning():
+            return
+        go = QMessageBox.question(
+            self,
+            APP_NAME,
+            "This downloads VisDrone2019-DET (~2 GB) and fine-tunes YOLO11n. "
+            "It can take hours. Your boxed Training sessions stay in place so we can compare. Continue?",
+        )
+        if go != QMessageBox.StandardButton.Yes:
+            return
+        report = device_report()
+        if report.device == "cpu":
+            go = QMessageBox.question(
+                self,
+                APP_NAME,
+                report.warning or "Fine-tuning YOLO on CPU can take hours. Continue?",
+            )
+            if go != QMessageBox.StandardButton.Yes:
+                return
+        self._launch_train_worker("visdrone", "Starting VisDrone training…")
+
+    def _launch_train_worker(self, source: str, start_message: str) -> None:
+        self.train_log.clear()
+        self.train_progress.setValue(0)
+        self.train_log.appendPlainText(start_message)
+        self.train_worker = TrainWorker(self, source=source)
+        self.train_worker.progress.connect(self._on_train_progress)
+        self.train_worker.log_line.connect(self._on_train_log)
+        self.train_worker.failed.connect(self._on_train_failed)
+        self.train_worker.train_done.connect(self._on_train_done)
+        self._set_train_busy(True)
+        self.train_worker.start()
+
+    def _cancel_detector_train(self) -> None:
+        if self.train_worker and self.train_worker.isRunning():
+            self.train_worker.cancel()
+            self.train_log.appendPlainText("Cancel requested. The current epoch may finish first.")
+
+    def _on_train_progress(self, current: int, total: int, message: str) -> None:
+        self.train_progress.setMaximum(max(int(total), 1))
+        self.train_progress.setValue(int(current))
+        if message:
+            self.train_log.appendPlainText(message)
+
+    def _on_train_log(self, message: str) -> None:
+        if message:
+            self.train_log.appendPlainText(message)
+
+    def _on_train_failed(self, message: str) -> None:
+        self._set_train_busy(False)
+        self.train_log.appendPlainText(message)
+        QMessageBox.warning(self, APP_NAME, message)
+
+    def _on_train_done(self, path: str) -> None:
+        self._set_train_busy(False)
+        self.train_progress.setValue(self.train_progress.maximum())
+        self.train_log.appendPlainText(f"Saved {path}")
+        reset_detector_cache()
+        self.settings.detector_weights = str(trained_weights_path())
+        for combo in (getattr(self, "detector_combo", None), getattr(self, "process_detector_combo", None)):
+            if combo is None:
+                continue
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData("trained")))
+            combo.blockSignals(False)
+        self._persist_settings()
+        self._refresh_detector_status()
+        self._refresh_training_inventory()
+        self._refresh_train_ready_status()
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            "Site weights saved. Process will use Trained detector. "
+            "Change it back to Motion mask in Settings if you need the old path.",
+        )
+
+    def _training_pick_video(self) -> None:
+        start = str(self.videos[0].parent) if self.videos else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a training video",
+            start,
+            "Video files (*.mp4 *.mov *.avi *.mkv *.m4v *.wmv);;All files (*.*)",
+        )
+        if not path:
+            return
+        video = Path(path)
+        self._train_video = video
+        self.train_video_label.setText(self._video_label(video))
+        try:
+            self._train_session = load_session(video.stem)
+        except (OSError, ValueError, KeyError, TypeError):
+            self._train_session = TrainingSession(video_path=str(video), video_stem=video.stem)
+        else:
+            self._train_session.video_path = str(video)
+        self._train_frames_bgr = {}
+        self._training_next_frame()
+
+    def _training_select_session(self) -> None:
+        return None
+
+    def _training_load_selected(self) -> None:
+        items = self.train_sessions.selectedItems()
+        if not items:
+            return
+        stem = items[0].data(Qt.ItemDataRole.UserRole)
+        if not stem:
+            return
+        try:
+            session = load_session(str(stem))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not load session: {exc}")
+            return
+        self._train_session = session
+        video = Path(session.video_path)
+        if video.is_file():
+            self._train_video = video
+            self.train_video_label.setText(self._video_label(video))
+        else:
+            self._train_video = None
+            self.train_video_label.setText(f"{session.video_stem} (video missing — pick the file to continue)")
+        self._train_frames_bgr = {}
+        if session.frames:
+            last = session.frames[-1]
+            self._train_boxes = list(last.boxes)
+            self._train_frame_index = last.frame_index
+            self._train_time_s = last.time_s
+            if video.is_file():
+                try:
+                    frame, index = grab_frame_at(video, last.time_s)
+                    self._train_frame = frame
+                    self._train_frame_index = index
+                    self._train_frames_bgr[index] = frame
+                    self._show_training_frame()
+                    return
+                except Exception:
+                    pass
+        if video.is_file():
+            self._training_next_frame()
+        else:
+            self._show_training_frame()
+
+    def _training_delete_selected(self) -> None:
+        items = self.train_sessions.selectedItems()
+        if not items:
+            return
+        stem = items[0].data(Qt.ItemDataRole.UserRole)
+        if not stem:
+            return
+        go = QMessageBox.question(self, APP_NAME, f"Delete training session {stem}?")
+        if go != QMessageBox.StandardButton.Yes:
+            return
+        delete_session(str(stem))
+        if self._train_session and self._train_session.video_stem == stem:
+            self._train_session = None
+            self._train_boxes = []
+            self._train_frame = None
+        self._refresh_training_sessions()
+
+    def _stash_training_frame(self) -> None:
+        if self._train_session is None or self._train_frame is None:
+            return
+        height, width = self._train_frame.shape[:2]
+        image_name = f"frame_{self._train_frame_index:06d}.jpg"
+        labeled = LabeledFrame(
+            frame_index=self._train_frame_index,
+            image_name=image_name,
+            width=width,
+            height=height,
+            boxes=list(self._train_boxes),
+            time_s=self._train_time_s,
+        )
+        existing = [f for f in self._train_session.frames if f.frame_index != self._train_frame_index]
+        if self._train_boxes:
+            existing.append(labeled)
+            self._train_frames_bgr[self._train_frame_index] = self._train_frame
+        self._train_session.frames = sorted(existing, key=lambda item: item.frame_index)
+
+    def _training_next_frame(self) -> None:
+        if self._train_video is None:
+            if self.videos:
+                self._train_video = self.videos[0]
+                self.train_video_label.setText(self._video_label(self._train_video))
+                if self._train_session is None:
+                    try:
+                        self._train_session = load_session(self._train_video.stem)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        self._train_session = TrainingSession(
+                            video_path=str(self._train_video),
+                            video_stem=self._train_video.stem,
+                        )
+            else:
+                QMessageBox.information(self, APP_NAME, "Open a video first.")
+                return
+        self._stash_training_frame()
+        try:
+            frame, index = grab_random_frame(self._train_video)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not read a frame: {exc}")
+            return
+        self._train_frame = frame
+        self._train_frame_index = index
+        info = probe_video(self._train_video)
+        self._train_time_s = index / info.fps if info.fps else 0.0
+        reused = None
+        if self._train_session:
+            reused = next((f for f in self._train_session.frames if f.frame_index == index), None)
+        self._train_boxes = list(reused.boxes) if reused else []
+        self._train_frames_bgr[index] = frame
+        self._show_training_frame()
+
+    def _show_training_frame(self) -> None:
+        if self._train_frame is None:
+            self.train_canvas.set_geometry(None)
+            return
+        self.train_canvas.set_frame(self._train_frame)
+        height, width = self._train_frame.shape[:2]
+        geom = Geometry(width, height, vehicle_refs=list(self._train_boxes))
+        self.train_canvas.set_geometry(geom)
+        self.train_canvas.set_drawing_enabled(True, box=True)
+        boxed = len(self._train_boxes)
+        labeled = len(self._train_session.frames) if self._train_session else 0
+        self.train_status.setText(
+            f"Frame {self._train_frame_index}  •  {boxed} box(es) on this frame  •  "
+            f"{labeled} labeled frame(s) in the session. Drag a box around each vehicle."
+        )
+
+    def _training_box_drawn(self, box: Box) -> None:
+        if box.area() < 4:
+            return
+        self._train_boxes.append(box.normalized())
+        self._show_training_frame()
+
+    def _training_undo_box(self) -> None:
+        if self._train_boxes:
+            self._train_boxes.pop()
+            self._show_training_frame()
+
+    def _training_save(self) -> None:
+        if self._train_session is None:
+            QMessageBox.information(self, APP_NAME, "Open a video and box vehicles first.")
+            return
+        self._stash_training_frame()
+        if not self._train_session.frames:
+            QMessageBox.information(self, APP_NAME, "Box at least one vehicle before saving.")
+            return
+        folder = save_session(self._train_session, self._train_frames_bgr)
+        self._refresh_training_sessions()
+        if hasattr(self, "settings_train_list"):
+            self._refresh_training_inventory()
+        self.statusBar().showMessage(f"Saved training session to {folder}")
+        QMessageBox.information(
+            self,
+            APP_NAME,
+            "Session saved. Process will use these box sizes even if you drew no route masks.",
+        )
+
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text)
 
@@ -1204,4 +2338,7 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(2000)
+        if self.train_worker and self.train_worker.isRunning():
+            self.train_worker.cancel()
+            self.train_worker.wait(2000)
         event.accept()

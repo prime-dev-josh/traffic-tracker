@@ -5,11 +5,12 @@ from tempfile import TemporaryDirectory
 
 from openpyxl import load_workbook
 
-from traffic_tracker.core.geometry import Geometry, Line, NamedLine
+from traffic_tracker.core.geometry import Box, Geometry, Line, NamedLine
 from traffic_tracker.core.report import (
     Trip,
     build_gate_statistics_table,
     build_overview_rows,
+    build_overview_table,
     build_tmc_summary_table,
     build_tmc_table,
     build_trip_table,
@@ -58,12 +59,22 @@ class ReportTests(unittest.TestCase):
             Trip("a.mp4", 3, "S", 50, "NB", 60, "truck"),
         ]
         overview = dict(build_overview_rows(trips))
-        self.assertEqual(overview["Number of tracked objects"], 3)
-        self.assertEqual(overview["Car count"], 2)
-        self.assertEqual(overview["Truck count"], 1)
+        self.assertEqual(overview["Motor Vehicle Count"], 3)
+        sheet = build_overview_table(
+            trips,
+            video_name="a.mp4",
+            duration_s=120,
+            clock_start=None,
+            device_label="motion mask (CPU)",
+        )
+        self.assertEqual(list(sheet.columns), ["Field", "Value"])
+        self.assertIn("Motor Vehicle Count", list(sheet["Field"]))
+        self.assertEqual(int(sheet.loc[sheet["Field"] == "Motor Vehicle Count", "Value"].iloc[0]), 3)
+        self.assertNotIn("Car count", overview)
         gates = build_gate_statistics_table(trips, geom)
-        self.assertEqual(int(gates.loc[gates["Category"] == "Car count", "N (Entry)"].iloc[0]), 2)
-        self.assertEqual(int(gates.loc[gates["Category"] == "Number of all vehicles", "NB (Exit)"].iloc[0]), 2)
+        self.assertEqual(list(gates["Category"]), ["Motor Vehicle Count"])
+        self.assertEqual(int(gates.loc[0, "N (Entry)"]), 2)
+        self.assertEqual(int(gates.loc[0, "NB (Exit)"]), 2)
 
     def test_tmc_summary_groups_by_entry(self) -> None:
         geom = Geometry(
@@ -105,7 +116,8 @@ class ReportTests(unittest.TestCase):
             )
             wb = load_workbook(path)
             self.assertEqual(wb.sheetnames, ["Overview", "Gate Statistics", "TMC Summary"])
-            self.assertIn("Car count", [wb["Overview"]["B9"].value, wb["Overview"]["B10"].value, wb["Overview"]["B11"].value])
+            self.assertIn("Motor Vehicle Count", [wb["Overview"]["B8"].value, wb["Overview"]["B9"].value])
+            self.assertEqual(wb["Gate Statistics"]["B5"].value, "Motor Vehicle Count")
             self.assertEqual(wb["Gate Statistics"]["B2"].value, "Survey report - Gate Statistics")
             self.assertEqual(wb["TMC Summary"]["A1"].value, "TMC Summary")
             self.assertEqual(wb["TMC Summary"]["C3"].value, "ENTRY N")
@@ -117,11 +129,13 @@ class ReportTests(unittest.TestCase):
             north=Line(960, 1000, 960, 80),
             starts=[NamedLine("N", Line(10, 20, 30, 40))],
             ends=[NamedLine("SB", Line(50, 60, 70, 80))],
+            vehicle_refs=[Box(100, 200, 140, 240)],
         )
         data = geom.to_dict()
         loaded = Geometry.from_dict(data)
         self.assertEqual(loaded.starts[0].name, "N")
         self.assertEqual(loaded.ends[0].name, "SB")
+        self.assertEqual(loaded.vehicle_refs[0].area(), 1600)
         scaled = loaded.scaled_to(960, 540)
         self.assertEqual(scaled.starts[0].line.x1, 5)
 

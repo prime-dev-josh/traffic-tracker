@@ -14,13 +14,7 @@ from traffic_tracker.config import APP_NAME, INTERVAL_SECONDS
 from traffic_tracker.core.geometry import Geometry, movement_name
 
 
-CLASS_ORDER = ("car", "truck", "bus", "motorcycle")
-CLASS_LABELS = {
-    "car": "Car count",
-    "truck": "Truck count",
-    "bus": "Bus count",
-    "motorcycle": "Motorcycle count",
-}
+VEHICLE_LABEL = "Motor Vehicle Count"
 
 
 @dataclass
@@ -157,42 +151,43 @@ def build_tmc_table(
     return pd.DataFrame(rows, columns=columns)
 
 
-def class_counts(trips: list[Trip]) -> dict[str, int]:
-    counts = {name: 0 for name in CLASS_ORDER}
-    for trip in trips:
-        if trip.vehicle_class in counts:
-            counts[trip.vehicle_class] += 1
-    return counts
-
-
 def build_overview_rows(trips: list[Trip]) -> list[tuple[str, int | str]]:
-    counts = class_counts(trips)
-    rows: list[tuple[str, int | str]] = [
+    return [
         ("Overall statistics for all vehicles seen", ""),
-        ("Number of tracked objects", len(trips)),
+        (VEHICLE_LABEL, len(trips)),
     ]
-    for name in CLASS_ORDER:
-        rows.append((CLASS_LABELS[name], counts[name]))
-    return rows
+
+
+def build_overview_table(
+    trips: list[Trip],
+    *,
+    video_name: str,
+    duration_s: float,
+    clock_start: datetime | None,
+    device_label: str,
+) -> pd.DataFrame:
+    clock_text = clock_start.strftime("%A %B %d %Y") if clock_start else "Elapsed video time"
+    rows = [
+        ("Report", f"{APP_NAME} Report"),
+        ("Video", video_name),
+        ("Time basis", clock_text),
+        ("Duration", _elapsed_label(duration_s)),
+        ("Device", device_label),
+        ("", ""),
+        *[(label, value) for label, value in build_overview_rows(trips)],
+    ]
+    return pd.DataFrame(rows, columns=["Field", "Value"])
 
 
 def build_gate_statistics_table(trips: list[Trip], geometry: Geometry) -> pd.DataFrame:
     origins = geometry.origin_names()
     bounds = geometry.bound_names()
-    columns = [f"{name} (Entry)" for name in origins] + [f"{name} (Exit)" for name in bounds]
-    data: dict[str, list[int]] = {col: [] for col in columns}
-    labels = [CLASS_LABELS[name] for name in CLASS_ORDER] + ["Number of all vehicles"]
-    for class_name in CLASS_ORDER:
-        subset = [trip for trip in trips if trip.vehicle_class == class_name]
-        for origin in origins:
-            data[f"{origin} (Entry)"].append(sum(1 for trip in subset if trip.start_destination == origin))
-        for bound in bounds:
-            data[f"{bound} (Exit)"].append(sum(1 for trip in subset if trip.end_destination == bound))
+    data: dict[str, list[int]] = {}
     for origin in origins:
-        data[f"{origin} (Entry)"].append(sum(1 for trip in trips if trip.start_destination == origin))
+        data[f"{origin} (Entry)"] = [sum(1 for trip in trips if trip.start_destination == origin)]
     for bound in bounds:
-        data[f"{bound} (Exit)"].append(sum(1 for trip in trips if trip.end_destination == bound))
-    table = pd.DataFrame(data, index=labels)
+        data[f"{bound} (Exit)"] = [sum(1 for trip in trips if trip.end_destination == bound)]
+    table = pd.DataFrame(data, index=[VEHICLE_LABEL])
     table.insert(0, "Category", list(table.index))
     return table.reset_index(drop=True)
 
@@ -325,7 +320,7 @@ def _write_gate_statistics(ws, trips: list[Trip], geometry: Geometry) -> None:
 
     for r_idx, row in table.iterrows():
         excel_row = header_row + 1 + int(r_idx)
-        is_total = str(row.iloc[0]) == "Number of all vehicles"
+        is_total = str(row.iloc[0]) == VEHICLE_LABEL
         for c_idx, value in enumerate(row):
             cell = ws.cell(excel_row, start_col + c_idx, value)
             cell.border = thin

@@ -25,3 +25,5 @@ Thumbs.db
 runs/
 ultralytics/
 outputs/
+training/
+

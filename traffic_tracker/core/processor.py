@@ -1,4 +1,4 @@
-"""Run YOLO11 + ByteTrack and record start/end crossings."""
+"""Motion-mask blobs and record start/end crossings. No vehicle classes."""
 
 from __future__ import annotations
 
@@ -10,16 +10,12 @@ import cv2
 import numpy as np
 
 from traffic_tracker.config import (
-    DRONE_VEHICLE_CLASS_IDS,
-    STREET_TRACK_CONF,
-    STREET_TRACK_IMGSZ,
-    STREET_VEHICLE_CLASS_IDS,
-    TRACK_CONF,
-    TRACK_IMGSZ,
-    VEHICLE_CLASS_NAMES,
+    MOTION_COAST_S,
+    MOTION_HOLD_S,
+    MOTION_HOLD_SPEED_PX_S,
+    MOTION_WARMUP_S,
 )
-from traffic_tracker.core.crossings import bbox_center, path_cross_t
-from traffic_tracker.core.device import describe_device, detect_device
+from traffic_tracker.core.crossings import bbox_center, box_hits_line, path_cross_t
 from traffic_tracker.core.geometry import (
     ORIGIN_TO_BOUND,
     ORIGINS,
@@ -28,16 +24,25 @@ from traffic_tracker.core.geometry import (
     name_from_north,
     side_from_point,
 )
-from traffic_tracker.core.models import ModelSource, resolve_model_source
+from traffic_tracker.core.detector import (
+    boxes_from_detector,
+    load_detector,
+    reset_detector_cache,
+    resolve_detector_weights,
+)
+from traffic_tracker.core.motion import (
+    blobs_from_frame,
+    create_subtractor,
+    default_area_limits,
+    process_scale,
+)
 from traffic_tracker.core.report import Trip
+from traffic_tracker.core.training import prior_areas
 from traffic_tracker.core.video import VideoInfo, probe_video
-
-COAST_S = 4.0
 
 
 ProgressCb = Callable[[int, int, str], None]
 PreviewCb = Callable[[np.ndarray], None]
-TRACKER_PATH = Path(__file__).with_name("bytetrack.yaml")
 
 
 @dataclass
@@ -47,7 +52,7 @@ class ProcessResult:
     device_label: str
     geometry: Geometry
     error: str | None = None
-    model_label: str = ""
+    model_label: str = "motion mask"
     start_crossings: int = 0
     end_crossings: int = 0
     frames_with_tracks: int = 0
@@ -60,71 +65,28 @@ class _TrackState:
     first_xy: tuple[float, float]
     first_time_s: float
     last_time_s: float
+    last_motion_s: float = 0.0
     cls: str = "vehicle"
     start: tuple[str, float] | None = None
     bbox_wh: tuple[float, float] = (20.0, 20.0)
+    last_xyxy: tuple[float, float, float, float] | None = None
+    speed: float = 0.0
+    sightings: int = 1
+    holding: bool = False
     had_gate_trip: bool = False
+    last_side: str | None = None
 
 
 @dataclass
 class _Pending:
-    """Live tracks. IDs are remapped when ByteTrack drops a crowded nadir car."""
+    """Centroid tracks. A nearby new blob continues the same vehicle."""
 
     live: dict[int, _TrackState] = field(default_factory=dict)
-    next_synth: int = 10000
-
-
-_model = None
-_model_source: ModelSource | None = None
-
-
-def _class_name(class_id: int) -> str:
-    return VEHICLE_CLASS_NAMES.get(int(class_id), "vehicle")
-
-
-def _get_model(source: ModelSource | None = None):
-    """Load YOLO11 once via Ultralytics AutoBackend (.pt, .onnx, or OpenVINO).
-
-    Do not replace this with a custom ORT/NMS path. ByteTrack stays in
-    ``model.track(persist=True)``.
-    """
-    global _model, _model_source
-    source = source or resolve_model_source()
-    if _model is None or _model_source != source:
-        from ultralytics import YOLO
-
-        _model = YOLO(str(source.path))
-        _model_source = source
-    return _model, source
+    next_synth: int = 1
 
 
 def reset_model_cache() -> None:
-    """Drop the cached Ultralytics model so a new backend can load."""
-    global _model, _model_source
-    _model = None
-    _model_source = None
-
-
-def _reset_tracker(model) -> None:
-    """Clear Ultralytics persist-state so IDs do not carry across videos."""
-    model.predictor = None
-
-
-def _track_imgsz(width: int, height: int, *, overhead_drone: bool) -> int:
-    longest = max(width, height)
-    if overhead_drone:
-        return TRACK_IMGSZ if longest >= 1280 else 1280
-    if longest >= 1600:
-        return max(STREET_TRACK_IMGSZ, 1280)
-    return STREET_TRACK_IMGSZ
-
-
-def _detections_from_result(sv, result):
-    detections = sv.Detections.from_ultralytics(result)
-    boxes = getattr(result, "boxes", None)
-    if detections.tracker_id is None and boxes is not None and getattr(boxes, "id", None) is not None:
-        detections.tracker_id = boxes.id.cpu().numpy().astype(int)
-    return detections
+    reset_detector_cache()
 
 
 def process_video(
@@ -136,40 +98,65 @@ def process_video(
     progress_cb: ProgressCb | None = None,
     preview_cb: PreviewCb | None = None,
     preview_every: int = 15,
+    min_area: int | None = None,
+    max_area: int | None = None,
     overhead_drone: bool = True,
+    training_base: Path | None = None,
+    detector_mode: str = "motion",
+    weights_path: str | None = None,
 ) -> ProcessResult:
-    """Process one video. Heavy imports stay inside so the GUI can open quickly."""
-    import supervision as sv
-
+    """Process one video. Moving blobs or YOLO boxes in the size band are vehicles."""
+    del device, overhead_drone
     info = probe_video(video_path)
-    device = device or detect_device(timeout_s=20)
-    device_label = describe_device(device)
     fitted = geometry.scaled_to(info.width, info.height)
-    imgsz = _track_imgsz(info.width, info.height, overhead_drone=overhead_drone)
-    class_ids = list(DRONE_VEHICLE_CLASS_IDS if overhead_drone else STREET_VEHICLE_CLASS_IDS)
-    conf = TRACK_CONF if overhead_drone else STREET_TRACK_CONF
+    suggested_min, suggested_max = default_area_limits(info.width, info.height)
+    ref_limits = fitted.vehicle_area_limits(extra_areas=prior_areas(training_base))
+    if ref_limits is not None:
+        min_area, max_area = ref_limits
+    else:
+        min_area = suggested_min if min_area is None else int(min_area)
+        max_area = suggested_max if max_area is None else int(max_area)
+    scale = process_scale(info.width, info.height)
+    use_detector = detector_mode == "trained"
+    detector = None
+    weights = None
+    if use_detector:
+        weights = resolve_detector_weights(weights_path, training_base)
+        try:
+            detector = load_detector(weights)
+        except Exception as exc:
+            return ProcessResult(
+                info,
+                [],
+                f"trained detector ({weights.name})",
+                fitted,
+                error=f"Could not load detector weights {weights}: {exc}",
+            )
+        device_label = f"trained detector ({weights.name})"
+        model_label = device_label
+    else:
+        device_label = "motion mask (CPU)"
+        model_label = "motion mask"
 
     if progress_cb:
-        mode = "overhead drone" if overhead_drone else "street-level"
-        progress_cb(0, info.frame_count or 1, f"Loading YOLO11 ({mode}, imgsz={imgsz})…")
-
-    model, source = _get_model()
-    _reset_tracker(model)
-    device_label = f"{device_label}  •  {source.label}"
-
-    annotator = sv.BoxAnnotator(thickness=2)
-    label_annotator = sv.LabelAnnotator(text_thickness=1, text_scale=0.4)
+        progress_cb(
+            0,
+            info.frame_count or 1,
+            f"{device_label}  •  box {min_area}–{max_area} px²",
+        )
 
     pending = _Pending()
     trips: list[Trip] = []
     start_crossings = 0
     end_crossings = 0
     frames_with_tracks = 0
+    subtractor = None if use_detector else create_subtractor()
+    prev_gray = None
 
     cap = cv2.VideoCapture(str(info.path))
     if not cap.isOpened():
         return ProcessResult(
-            info, [], device_label, fitted, error=f"Could not open {info.path}", model_label=source.label
+            info, [], device_label, fitted, error=f"Could not open {info.path}"
         )
 
     frame_idx = 0
@@ -182,7 +169,6 @@ def process_video(
                     device_label,
                     fitted,
                     error="Cancelled",
-                    model_label=source.label,
                     start_crossings=start_crossings,
                     end_crossings=end_crossings,
                     frames_with_tracks=frames_with_tracks,
@@ -193,48 +179,38 @@ def process_video(
                 break
             frame_idx += 1
             elapsed_s = frame_idx / info.fps
+            if use_detector and detector is not None:
+                boxes, mask = boxes_from_detector(
+                    detector, frame, min_area=min_area, max_area=max_area
+                )
+            else:
+                freeze = [
+                    state.last_xyxy
+                    for state in pending.live.values()
+                    if state.last_xyxy and not state.had_gate_trip
+                ]
+                boxes, mask, prev_gray = blobs_from_frame(
+                    subtractor,
+                    frame,
+                    min_area=min_area,
+                    max_area=max_area,
+                    scale=scale,
+                    prev_gray=prev_gray,
+                    freeze_boxes=freeze,
+                )
 
-            result = model.track(
-                frame,
-                persist=True,
-                verbose=False,
-                classes=class_ids,
-                device=device,
-                imgsz=imgsz,
-                conf=conf,
-                max_det=500,
-                iou=0.7,
-                tracker=str(TRACKER_PATH),
-            )[0]
-            detections = _detections_from_result(sv, result)
-
-            if len(detections) > 0:
-                frames_with_tracks += 1
+            if use_detector or elapsed_s >= MOTION_WARMUP_S:
                 starts, ends = _record_crossings(
-                    detections,
-                    fitted,
-                    pending,
-                    trips,
-                    info.name,
-                    elapsed_s,
+                    boxes, fitted, pending, trips, info.name, elapsed_s
                 )
                 start_crossings += starts
                 end_crossings += ends
-            end_crossings += _expire_tracks(pending, fitted, trips, info.name, elapsed_s)
+                if boxes or pending.live:
+                    frames_with_tracks += 1
+                end_crossings += _expire_tracks(pending, fitted, trips, info.name, elapsed_s)
 
             if preview_cb and (frame_idx == 1 or frame_idx % preview_every == 0):
-                preview = frame.copy()
-                if len(detections) > 0:
-                    if detections.tracker_id is not None and detections.class_id is not None:
-                        labels = [
-                            f"#{tid} {_class_name(cls)}"
-                            for tid, cls in zip(detections.tracker_id, detections.class_id)
-                        ]
-                    else:
-                        labels = ["vehicle"] * len(detections)
-                    preview = annotator.annotate(preview, detections)
-                    preview = label_annotator.annotate(preview, detections, labels)
-                preview = _draw_route_overlay(preview, fitted)
+                preview = _draw_motion_preview(frame, mask, boxes, pending, fitted)
                 preview_cb(preview)
 
             if progress_cb and (frame_idx == 1 or frame_idx % 10 == 0):
@@ -247,7 +223,7 @@ def process_video(
         cap.release()
 
     end_crossings += _expire_tracks(
-        pending, fitted, trips, info.name, (frame_idx / info.fps) + COAST_S + 1.0, coast_s=0.0
+        pending, fitted, trips, info.name, (frame_idx / max(info.fps, 1e-6)) + MOTION_COAST_S + 1.0, coast_s=0.0
     )
     if progress_cb:
         progress_cb(info.frame_count or frame_idx, info.frame_count or frame_idx, f"Finished {info.name}")
@@ -256,29 +232,99 @@ def process_video(
         trips,
         device_label,
         fitted,
-        model_label=source.label,
+        model_label=model_label,
         start_crossings=start_crossings,
         end_crossings=end_crossings,
         frames_with_tracks=frames_with_tracks,
     )
 
 
+def _draw_motion_preview(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    boxes: list[tuple[float, float, float, float]],
+    pending: _Pending,
+    geometry: Geometry,
+) -> np.ndarray:
+    preview = frame.copy()
+    if mask is not None and mask.size:
+        tint = np.zeros_like(preview)
+        tint[:, :, 1] = 200
+        cover = (mask > 0).astype(np.uint8)
+        for channel in range(3):
+            preview[:, :, channel] = np.where(
+                cover,
+                (preview[:, :, channel] * 0.65 + tint[:, :, channel] * 0.35).astype(np.uint8),
+                preview[:, :, channel],
+            )
+    by_xy = {state.tid: state for state in pending.live.values()}
+    used = set()
+    for x1, y1, x2, y2 in boxes:
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        tid = None
+        best = 40.0
+        for state in by_xy.values():
+            if state.tid in used:
+                continue
+            dist = ((state.xy[0] - cx) ** 2 + (state.xy[1] - cy) ** 2) ** 0.5
+            if dist < best:
+                tid = state.tid
+                best = dist
+        if tid is not None:
+            used.add(tid)
+        w, h = int(max(x2 - x1, 1)), int(max(y2 - y1, 1))
+        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+        _halo_rect(preview, p1, p2, (220, 20, 255))
+        label = f"#{tid} {w}x{h}" if tid is not None else f"{w}x{h}"
+        _halo_text(preview, label, (p1[0], max(16, p1[1] - 6)), (220, 20, 255), 0.45)
+    for state in pending.live.values():
+        if state.tid in used or not state.last_xyxy:
+            continue
+        x1, y1, x2, y2 = state.last_xyxy
+        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+        _halo_rect(preview, p1, p2, (255, 200, 40))
+        _halo_text(preview, f"#{state.tid} hold", (p1[0], max(16, p1[1] - 6)), (255, 200, 40), 0.45)
+    return _draw_route_overlay(preview, geometry)
+
+
+def _halo_line(frame: np.ndarray, a: tuple[int, int], b: tuple[int, int], color: tuple[int, int, int], width: int = 3) -> None:
+    cv2.line(frame, a, b, (0, 0, 0), width + 3, cv2.LINE_AA)
+    cv2.line(frame, a, b, color, width, cv2.LINE_AA)
+
+
+def _halo_rect(frame: np.ndarray, p1: tuple[int, int], p2: tuple[int, int], color: tuple[int, int, int]) -> None:
+    cv2.rectangle(frame, p1, p2, (0, 0, 0), 5)
+    cv2.rectangle(frame, p1, p2, color, 2)
+
+
+def _halo_text(
+    frame: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    color: tuple[int, int, int],
+    scale: float,
+) -> None:
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+
+
 def _draw_route_overlay(frame: np.ndarray, geometry: Geometry) -> np.ndarray:
     if geometry.north is not None:
         p1 = (int(geometry.north.x1), int(geometry.north.y1))
         p2 = (int(geometry.north.x2), int(geometry.north.y2))
-        cv2.arrowedLine(frame, p1, p2, (253, 184, 61), 3, tipLength=0.18)
-        cv2.putText(frame, "N", p2, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (253, 184, 61), 2, cv2.LINE_AA)
+        cv2.arrowedLine(frame, p1, p2, (0, 0, 0), 5, tipLength=0.18)
+        cv2.arrowedLine(frame, p1, p2, (255, 200, 40), 3, tipLength=0.18)
+        _halo_text(frame, "N", p2, (255, 200, 40), 0.6)
     for item in geometry.starts:
         a = (int(item.line.x1), int(item.line.y1))
         b = (int(item.line.x2), int(item.line.y2))
-        cv2.line(frame, a, b, (140, 214, 61), 3)
-        cv2.putText(frame, item.name, a, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 214, 61), 1, cv2.LINE_AA)
+        _halo_line(frame, a, b, (60, 230, 0))
+        _halo_text(frame, item.name, a, (60, 230, 0), 0.55)
     for item in geometry.ends:
         a = (int(item.line.x1), int(item.line.y1))
         b = (int(item.line.x2), int(item.line.y2))
-        cv2.line(frame, a, b, (107, 107, 255), 3)
-        cv2.putText(frame, item.name, a, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (107, 107, 255), 1, cv2.LINE_AA)
+        _halo_line(frame, a, b, (40, 40, 255))
+        _halo_text(frame, item.name, a, (40, 40, 255), 0.55)
     return frame
 
 
@@ -297,7 +343,7 @@ def _gate_origin(item: NamedLine, geometry: Geometry) -> str:
 
 
 def _adopt_radius(geometry: Geometry) -> float:
-    return max(120.0, 0.08 * min(geometry.frame_width, geometry.frame_height))
+    return max(180.0, 0.15 * min(geometry.frame_width, geometry.frame_height))
 
 
 def _min_travel(geometry: Geometry) -> float:
@@ -337,36 +383,24 @@ def _nearest_unseen(
 
 def _resolve_state(
     pending: _Pending,
-    raw_tid: int,
     xy: tuple[float, float],
     wh: tuple[float, float],
-    cls: str,
     elapsed_s: float,
     seen: set[int],
     max_dist: float,
 ) -> tuple[_TrackState, bool]:
-    """Return (state, is_new). Reuses a nearby unseen track when ByteTrack switches IDs."""
-    if raw_tid >= 0 and raw_tid in pending.live and raw_tid not in seen:
-        return pending.live[raw_tid], False
-
     adopted = _nearest_unseen(pending, xy, wh, seen, max_dist)
     if adopted is not None:
-        pending.live.pop(adopted.tid, None)
-        if raw_tid >= 0 and raw_tid not in pending.live:
-            adopted.tid = raw_tid
-        pending.live[adopted.tid] = adopted
         return adopted, False
-
-    tid = raw_tid if raw_tid >= 0 and raw_tid not in seen else pending.next_synth
-    if tid == pending.next_synth:
-        pending.next_synth += 1
+    tid = pending.next_synth
+    pending.next_synth += 1
     state = _TrackState(
         tid=tid,
         xy=xy,
         first_xy=xy,
         first_time_s=elapsed_s,
         last_time_s=elapsed_s,
-        cls=cls,
+        last_motion_s=elapsed_s,
         bbox_wh=wh,
     )
     pending.live[tid] = state
@@ -377,6 +411,7 @@ def _apply_gate_hits(
     state: _TrackState,
     prev: tuple[float, float],
     xy: tuple[float, float],
+    xyxy: tuple[float, float, float, float],
     gates: list[tuple[str, object]],
     pad: float,
     trips: list[Trip],
@@ -384,16 +419,27 @@ def _apply_gate_hits(
     elapsed_s: float,
 ) -> tuple[int, int]:
     hits: list[tuple[float, str]] = []
+    seen_origins: set[str] = set()
     for origin, line in gates:
         t = path_cross_t(prev, xy, line, pad_px=pad)
-        if t is not None:
-            hits.append((t, origin))
+        if t is None and box_hits_line(xyxy, line, pad_px=pad):
+            t = 0.0 if prev == xy else 1.0
+        if t is None or origin in seen_origins:
+            continue
+        seen_origins.add(origin)
+        hits.append((t, origin))
     hits.sort()
     start_hits = 0
     end_hits = 0
+    if not hits:
+        state.last_side = None
+        return 0, 0
     for _, origin in hits:
         if state.start is None:
+            if origin == state.last_side:
+                continue
             state.start = (origin, elapsed_s)
+            state.last_side = origin
             start_hits += 1
         elif state.start[0] != origin:
             start_origin, start_time_s = state.start
@@ -405,14 +451,22 @@ def _apply_gate_hits(
                     start_time_s=start_time_s,
                     end_destination=ORIGIN_TO_BOUND.get(origin, origin),
                     end_time_s=elapsed_s,
-                    vehicle_class=state.cls,
+                    vehicle_class="vehicle",
                 )
             )
             state.start = None
             state.had_gate_trip = True
+            state.last_side = origin
             end_hits += 1
+            _release_track_hold(state)
             break
     return start_hits, end_hits
+
+
+def _release_track_hold(state: _TrackState) -> None:
+    """After a full trip, stop freezing MOG2 and drop the long red-light hold."""
+    state.holding = False
+    state.last_xyxy = None
 
 
 def _finalize_track(state: _TrackState, geometry: Geometry, trips: list[Trip], video_name: str) -> int:
@@ -429,7 +483,7 @@ def _finalize_track(state: _TrackState, geometry: Geometry, trips: list[Trip], v
                     start_time_s=start_time_s,
                     end_destination=ORIGIN_TO_BOUND.get(last_side, last_side),
                     end_time_s=state.last_time_s,
-                    vehicle_class=state.cls,
+                    vehicle_class="vehicle",
                 )
             )
             state.start = None
@@ -450,12 +504,34 @@ def _finalize_track(state: _TrackState, geometry: Geometry, trips: list[Trip], v
                 start_time_s=state.first_time_s,
                 end_destination=ORIGIN_TO_BOUND.get(last_side, last_side),
                 end_time_s=state.last_time_s,
-                vehicle_class=state.cls,
+                vehicle_class="vehicle",
             )
         )
         state.had_gate_trip = True
         return 1
     return 0
+
+
+def _hold_limit(state: _TrackState) -> float:
+    if state.had_gate_trip:
+        return MOTION_COAST_S
+    if state.sightings < 2:
+        return MOTION_COAST_S
+    if state.holding or state.speed <= MOTION_HOLD_SPEED_PX_S:
+        return MOTION_HOLD_S
+    return MOTION_COAST_S
+
+
+def _can_hold(state: _TrackState, now_s: float) -> bool:
+    if state.had_gate_trip:
+        return False
+    if state.last_xyxy is None:
+        return False
+    if now_s - state.last_motion_s > MOTION_HOLD_S:
+        return False
+    if state.sightings < 2 and (now_s - state.first_time_s) < 0.35:
+        return False
+    return state.holding or state.speed <= MOTION_HOLD_SPEED_PX_S
 
 
 def _expire_tracks(
@@ -465,12 +541,16 @@ def _expire_tracks(
     video_name: str,
     now_s: float,
     *,
-    coast_s: float = COAST_S,
+    coast_s: float | None = None,
 ) -> int:
     keep: dict[int, _TrackState] = {}
     inferred = 0
     for tid, state in pending.live.items():
-        if now_s - state.last_time_s > coast_s:
+        limit = 0.0 if coast_s is not None else _hold_limit(state)
+        if coast_s is not None:
+            limit = coast_s
+        age = now_s - state.last_motion_s
+        if age > limit:
             inferred += _finalize_track(state, geometry, trips, video_name)
         else:
             keep[tid] = state
@@ -479,7 +559,7 @@ def _expire_tracks(
 
 
 def _record_crossings(
-    detections,
+    boxes: list[tuple[float, float, float, float]],
     geometry: Geometry,
     pending: _Pending,
     trips: list[Trip],
@@ -487,35 +567,51 @@ def _record_crossings(
     elapsed_s: float,
 ) -> tuple[int, int]:
     gates = [(_gate_origin(item, geometry), item.line) for item in (*geometry.starts, *geometry.ends)]
-    pad = max(24.0, 0.02 * max(geometry.frame_width, geometry.frame_height))
+    pad = max(32.0, 0.03 * max(geometry.frame_width, geometry.frame_height))
     max_dist = _adopt_radius(geometry)
     start_hits = 0
     end_hits = 0
     seen: set[int] = set()
-    n = len(detections.xyxy)
-    raw_ids = [int(t) for t in detections.tracker_id] if detections.tracker_id is not None else [-1] * n
-    classes = (
-        [_class_name(int(c)) for c in detections.class_id]
-        if detections.class_id is not None
-        else ["vehicle"] * n
-    )
 
-    for i, xyxy in enumerate(detections.xyxy):
+    for xyxy in boxes:
         xy = bbox_center(xyxy)
         x1, y1, x2, y2 = (float(v) for v in xyxy)
         wh = (max(x2 - x1, 1.0), max(y2 - y1, 1.0))
-        state, is_new = _resolve_state(
-            pending, raw_ids[i], xy, wh, classes[i], elapsed_s, seen, max_dist
-        )
+        state, is_new = _resolve_state(pending, xy, wh, elapsed_s, seen, max_dist)
         seen.add(state.tid)
-        state.cls = classes[i]
+        dt = max(elapsed_s - state.last_time_s, 1e-3)
+        inst = ((xy[0] - state.xy[0]) ** 2 + (xy[1] - state.xy[1]) ** 2) ** 0.5 / dt
+        state.speed = inst if is_new else (0.45 * inst + 0.55 * state.speed)
         state.bbox_wh = wh
-        if not is_new:
-            added_s, added_e = _apply_gate_hits(
-                state, state.xy, xy, gates, pad, trips, video_name, elapsed_s
-            )
-            start_hits += added_s
-            end_hits += added_e
+        state.last_xyxy = (x1, y1, x2, y2)
+        state.sightings += 0 if is_new else 1
+        state.holding = False
+        added_s, added_e = _apply_gate_hits(
+            state, state.xy, xy, (x1, y1, x2, y2), gates, pad, trips, video_name, elapsed_s
+        )
+        start_hits += added_s
+        end_hits += added_e
+        if added_e > 0:
+            pending.live.pop(state.tid, None)
+            continue
         state.xy = xy
         state.last_time_s = elapsed_s
+        state.last_motion_s = elapsed_s
+
+    for state in list(pending.live.values()):
+        if state.tid in seen or not _can_hold(state, elapsed_s) or state.last_xyxy is None:
+            continue
+        state.holding = True
+        state.speed = min(state.speed, MOTION_HOLD_SPEED_PX_S)
+        x1, y1, x2, y2 = state.last_xyxy
+        added_s, added_e = _apply_gate_hits(
+            state, state.xy, state.xy, (x1, y1, x2, y2), gates, pad, trips, video_name, elapsed_s
+        )
+        start_hits += added_s
+        end_hits += added_e
+        if added_e > 0:
+            pending.live.pop(state.tid, None)
+            continue
+        state.last_time_s = elapsed_s
+        seen.add(state.tid)
     return start_hits, end_hits

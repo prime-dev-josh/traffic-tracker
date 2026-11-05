@@ -1,0 +1,6 @@
+# CUDA 12.8 wheels for NVIDIA GPUs. Default PyPI torch is CPU-only on Windows.
+# After requirements.txt:
+#   pip install -r requirements-cuda.txt
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128

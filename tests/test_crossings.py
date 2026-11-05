@@ -1,14 +1,8 @@
 import unittest
 
-from traffic_tracker.core.crossings import bbox_center, path_crosses_line, segments_intersect
+from traffic_tracker.core.crossings import bbox_center, box_hits_line, path_crosses_line, segments_intersect
 from traffic_tracker.core.geometry import Geometry, Line, NamedLine
-from traffic_tracker.core.processor import (
-    _Pending,
-    _class_name,
-    _expire_tracks,
-    _record_crossings,
-    _track_imgsz,
-)
+from traffic_tracker.core.processor import _Pending, _expire_tracks, _record_crossings
 from traffic_tracker.core.report import Trip
 
 
@@ -29,59 +23,72 @@ class CrossingGeometryTests(unittest.TestCase):
         gate = Line(20, 50, 80, 50)
         self.assertTrue(path_crosses_line((10, 10), (10, 90), gate, pad_px=24))
 
+    def test_box_sitting_on_gate_counts(self) -> None:
+        gate = Line(0, 50, 100, 50)
+        self.assertTrue(box_hits_line((40, 30, 60, 70), gate))
+        self.assertFalse(box_hits_line((40, 10, 60, 25), gate, pad_px=8))
+
 
 class RecordCrossingTests(unittest.TestCase):
     def _geom(self, starts, ends) -> Geometry:
         return Geometry(100, 100, north=Line(50, 55, 50, 10), starts=starts, ends=ends)
 
-    def _step(self, y: float):
-        return type("D", (), {"xyxy": [[40, y - 10, 60, y + 10]], "tracker_id": [7], "class_id": [2]})()
+    def _box(self, y: float) -> list[tuple[float, float, float, float]]:
+        return [(40, y - 10, 60, y + 10)]
 
     def test_start_then_end_completes_trip(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
         pending = _Pending()
         trips: list[Trip] = []
-        _record_crossings(self._step(10), geom, pending, trips, "a.mp4", 1.0)
-        starts_hit, ends_hit = _record_crossings(self._step(90), geom, pending, trips, "a.mp4", 2.0)
-        self.assertEqual(starts_hit, 1)
-        self.assertEqual(ends_hit, 1)
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0)
         self.assertEqual(len(trips), 1)
         self.assertEqual(trips[0].start_destination, "N")
         self.assertEqual(trips[0].end_destination, "SB")
+        self.assertEqual(trips[0].vehicle_class, "vehicle")
 
     def test_swapped_start_end_colors_still_counts_n_sb(self) -> None:
         """Green start drawn on the south, red end on the north — still N-SB."""
         geom = self._geom([NamedLine("N", Line(0, 70, 100, 70))], [NamedLine("SB", Line(0, 40, 100, 40))])
         pending = _Pending()
         trips: list[Trip] = []
-        _record_crossings(self._step(10), geom, pending, trips, "a.mp4", 1.0)
-        _record_crossings(self._step(90), geom, pending, trips, "a.mp4", 2.0)
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0)
         self.assertEqual(len(trips), 1)
         self.assertEqual(trips[0].start_destination, "N")
         self.assertEqual(trips[0].end_destination, "SB")
 
-    def _step_id(self, y: float, tid: int):
-        return type("D", (), {"xyxy": [[40, y - 10, 60, y + 10]], "tracker_id": [tid], "class_id": [2]})()
-
-    def test_id_switch_mid_intersection_still_counts(self) -> None:
-        """ByteTrack often issues a new ID on crowded nadir cars."""
+    def test_nearby_blob_continues_same_vehicle(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
         pending = _Pending()
         trips: list[Trip] = []
-        _record_crossings(self._step_id(10, 7), geom, pending, trips, "a.mp4", 1.0)
-        starts_hit, ends_hit = _record_crossings(self._step_id(90, 99), geom, pending, trips, "a.mp4", 2.0)
-        self.assertEqual(starts_hit, 1)
-        self.assertEqual(ends_hit, 1)
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0)
         self.assertEqual(len(trips), 1)
+
+    def test_box_on_gate_counts_without_prior_point(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        starts_hit, _ = _record_crossings([(30, 20, 70, 60)], geom, pending, trips, "a.mp4", 1.0)
+        self.assertGreaterEqual(starts_hit, 1)
+        _record_crossings([(30, 50, 70, 90)], geom, pending, trips, "a.mp4", 2.0)
+        self.assertGreaterEqual(len(trips), 1)
         self.assertEqual(trips[0].start_destination, "N")
         self.assertEqual(trips[0].end_destination, "SB")
 
     def test_path_sides_count_when_gates_are_missed(self) -> None:
-        geom = self._geom([NamedLine("N", Line(0, 2, 100, 2))], [NamedLine("SB", Line(0, 98, 100, 98))])
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+        )
         pending = _Pending()
         trips: list[Trip] = []
-        _record_crossings(self._step_id(22, 3), geom, pending, trips, "a.mp4", 1.0)
-        _record_crossings(self._step_id(82, 3), geom, pending, trips, "a.mp4", 2.0)
+        _record_crossings([(180, 100, 220, 140)], geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings([(180, 250, 220, 290)], geom, pending, trips, "a.mp4", 2.0)
         self.assertEqual(trips, [])
         inferred = _expire_tracks(pending, geom, trips, "a.mp4", 10.0, coast_s=0.0)
         self.assertEqual(inferred, 1)
@@ -89,19 +96,46 @@ class RecordCrossingTests(unittest.TestCase):
         self.assertEqual(trips[0].start_destination, "N")
         self.assertEqual(trips[0].end_destination, "SB")
 
+    def test_stopped_track_is_held_then_resumes(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(12), geom, pending, trips, "a.mp4", 1.2)
+        tid = next(iter(pending.live))
+        _record_crossings([], geom, pending, trips, "a.mp4", 20.0)
+        self.assertIn(tid, pending.live)
+        self.assertTrue(pending.live[tid].holding)
+        _expire_tracks(pending, geom, trips, "a.mp4", 20.0)
+        self.assertIn(tid, pending.live)
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 21.0)
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(trips[0].track_id, tid)
 
-class OverheadDetectionTests(unittest.TestCase):
-    def test_nadir_mislabels_map_to_car(self) -> None:
-        self.assertEqual(_class_name(2), "car")
-        self.assertEqual(_class_name(4), "car")  # airplane
-        self.assertEqual(_class_name(6), "car")  # train
-        self.assertEqual(_class_name(8), "car")  # boat
-        self.assertEqual(_class_name(3), "motorcycle")
+    def test_trip_completion_releases_hold(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(12), geom, pending, trips, "a.mp4", 1.2)
+        tid = next(iter(pending.live))
+        _record_crossings([], geom, pending, trips, "a.mp4", 20.0)
+        self.assertTrue(pending.live[tid].holding)
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 21.0)
+        self.assertEqual(len(trips), 1)
+        self.assertNotIn(tid, pending.live)
 
-    def test_drone_uses_larger_imgsz(self) -> None:
-        self.assertEqual(_track_imgsz(3840, 2160, overhead_drone=True), 1920)
-        self.assertEqual(_track_imgsz(1920, 1080, overhead_drone=False), 1280)
-        self.assertEqual(_track_imgsz(640, 480, overhead_drone=False), 640)
+    def test_fast_vanish_expires_on_coast(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(self._box(8), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(18), geom, pending, trips, "a.mp4", 1.05)
+        tid = next(iter(pending.live))
+        self.assertGreater(pending.live[tid].speed, 40.0)
+        _record_crossings([], geom, pending, trips, "a.mp4", 8.0)
+        _expire_tracks(pending, geom, trips, "a.mp4", 8.0)
+        self.assertNotIn(tid, pending.live)
 
 
 if __name__ == "__main__":

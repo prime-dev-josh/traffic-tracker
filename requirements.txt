@@ -1,5 +1,7 @@
 # Traffic Tracker — Python 3.11
 # Extras: requirements-onnx.txt, requirements-winml.txt, requirements-openvino.txt
+# PyPI torch is CPU-only on Windows. After this file, install CUDA wheels:
+#   pip install -r requirements-cuda.txt
 ultralytics>=8.3.0,<8.5
 supervision>=0.25.0
 PyQt6>=6.7.0

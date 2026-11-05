@@ -69,6 +69,41 @@ def path_cross_t(
     return _segment_t(prev, curr, (gated.x1, gated.y1), (gated.x2, gated.y2))
 
 
+def box_hits_line(xyxy, line: Line, *, pad_px: float = 24.0) -> bool:
+    """True when the bounding box sits on or straddles the (padded) gate."""
+    x1, y1, x2, y2 = (float(v) for v in xyxy)
+    left, right = min(x1, x2), max(x1, x2)
+    top, bottom = min(y1, y2), max(y1, y2)
+    gated = pad_line(line, pad_px)
+    g1, g2 = (gated.x1, gated.y1), (gated.x2, gated.y2)
+    edges = (
+        ((left, top), (right, top)),
+        ((right, top), (right, bottom)),
+        ((right, bottom), (left, bottom)),
+        ((left, bottom), (left, top)),
+    )
+    if any(segments_intersect(g1, g2, a, b) for a, b in edges):
+        return True
+    if left <= gated.x1 <= right and top <= gated.y1 <= bottom:
+        return True
+    if left <= gated.x2 <= right and top <= gated.y2 <= bottom:
+        return True
+    cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
+    return _point_near_segment((cx, cy), gated, pad_px)
+
+
+def _point_near_segment(point: tuple[float, float], line: Line, pad_px: float) -> bool:
+    px, py = point
+    ax, ay, bx, by = line.x1, line.y1, line.x2, line.y2
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-9:
+        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5 <= pad_px
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    qx, qy = ax + t * dx, ay + t * dy
+    return ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5 <= pad_px
+
+
 def path_crosses_line(
     prev: tuple[float, float],
     curr: tuple[float, float],

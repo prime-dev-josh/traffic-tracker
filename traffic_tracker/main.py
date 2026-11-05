@@ -40,11 +40,12 @@ def main() -> int:
 
     from traffic_tracker.config import APP_NAME
     from traffic_tracker.gui.main_window import MainWindow
-    from traffic_tracker.gui.style import STYLESHEET
+    from traffic_tracker.core.settings import load_settings
+    from traffic_tracker.gui.style import stylesheet_for
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setStyleSheet(STYLESHEET)
+    app.setStyleSheet(stylesheet_for(load_settings().theme))
     window = MainWindow()
     window.show()
     return app.exec()

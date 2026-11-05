@@ -8,10 +8,33 @@ from typing import Any
 import json
 import math
 
+from traffic_tracker.config import VEHICLE_REF_MAX_FACTOR, VEHICLE_REF_MIN_FACTOR
+
 ORIGINS = ("N", "S", "E", "W")
 BOUNDS = ("NB", "SB", "EB", "WB")
 ORIGIN_TO_BOUND = {"N": "NB", "S": "SB", "E": "EB", "W": "WB"}
 MAX_GATES = 4
+MAX_VEHICLE_REFS = 12
+
+
+def area_limits_from_areas(areas: list[float]) -> tuple[int, int] | None:
+    valid = [area for area in areas if area >= 1]
+    if not valid:
+        return None
+    return (
+        max(50, int(min(valid) * VEHICLE_REF_MIN_FACTOR)),
+        max(200, int(max(valid) * VEHICLE_REF_MAX_FACTOR)),
+    )
+
+
+def merge_area_limits(*pairs: tuple[int, int] | None) -> tuple[int, int] | None:
+    mins = [pair[0] for pair in pairs if pair]
+    maxs = [pair[1] for pair in pairs if pair]
+    if not mins:
+        return None
+    return min(mins), max(maxs)
+
+
 _NAME_HEADING = {"N": 0.0, "NB": 0.0, "E": 90.0, "EB": 90.0, "S": 180.0, "SB": 180.0, "W": 270.0, "WB": 270.0}
 
 
@@ -49,6 +72,35 @@ class Line:
 
     def midpoint(self) -> tuple[float, float]:
         return (self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0
+
+
+@dataclass
+class Box:
+    """Axis-aligned vehicle mask used as the processing size reference."""
+
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+    def normalized(self) -> "Box":
+        return Box(min(self.x1, self.x2), min(self.y1, self.y2), max(self.x1, self.x2), max(self.y1, self.y2))
+
+    def width(self) -> float:
+        return abs(self.x2 - self.x1)
+
+    def height(self) -> float:
+        return abs(self.y2 - self.y1)
+
+    def area(self) -> float:
+        return max(self.width() * self.height(), 0.0)
+
+    def scaled(self, sx: float, sy: float) -> "Box":
+        return Box(self.x1 * sx, self.y1 * sy, self.x2 * sx, self.y2 * sy)
+
+    @classmethod
+    def from_line(cls, line: Line) -> "Box":
+        return cls(line.x1, line.y1, line.x2, line.y2).normalized()
 
 
 @dataclass
@@ -108,6 +160,11 @@ class Transform:
         x2, y2 = self.apply_point(line.x2, line.y2, cx, cy)
         return Line(x1, y1, x2, y2)
 
+    def apply_box(self, box: Box, cx: float, cy: float) -> Box:
+        x1, y1 = self.apply_point(box.x1, box.y1, cx, cy)
+        x2, y2 = self.apply_point(box.x2, box.y2, cx, cy)
+        return Box(x1, y1, x2, y2).normalized()
+
     def apply_geometry(self, geom: "Geometry") -> "Geometry":
         cx = geom.frame_width / 2.0
         cy = geom.frame_height / 2.0
@@ -120,6 +177,7 @@ class Transform:
             north=north,
             starts=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.starts],
             ends=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.ends],
+            vehicle_refs=[self.apply_box(box, cx, cy) for box in geom.vehicle_refs],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -264,6 +322,7 @@ class Geometry:
     north: Line | None = None
     starts: list[NamedLine] = field(default_factory=list)
     ends: list[NamedLine] = field(default_factory=list)
+    vehicle_refs: list[Box] = field(default_factory=list)
 
     @property
     def routes(self) -> list[Route]:
@@ -285,6 +344,13 @@ class Geometry:
 
     def movement_names(self) -> list[str]:
         return [movement_name(origin, bound) for origin in self.origin_names() for bound in self.bound_names()]
+
+    def vehicle_area_limits(self, extra_areas: list[float] | None = None) -> tuple[int, int] | None:
+        """Min/max blob area from drawn masks plus optional training-box areas."""
+        areas = [box.area() for box in self.vehicle_refs if box.area() >= 1]
+        if extra_areas:
+            areas.extend(a for a in extra_areas if a >= 1)
+        return area_limits_from_areas(areas)
 
     def assign_names(self) -> None:
         if self.north is None:
@@ -328,6 +394,7 @@ class Geometry:
             north=north,
             starts=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.starts],
             ends=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.ends],
+            vehicle_refs=[box.scaled(sx, sy) for box in self.vehicle_refs],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -337,6 +404,7 @@ class Geometry:
             "north": asdict(self.north) if self.north else None,
             "starts": [{"name": item.name, "line": asdict(item.line)} for item in self.starts],
             "ends": [{"name": item.name, "line": asdict(item.line)} for item in self.ends],
+            "vehicle_refs": [asdict(box) for box in self.vehicle_refs],
         }
 
     @classmethod
@@ -344,12 +412,16 @@ class Geometry:
         north = Line(**data["north"]) if data.get("north") else None
         starts = [NamedLine(str(item["name"]), Line(**item["line"])) for item in data.get("starts", [])]
         ends = [NamedLine(str(item["name"]), Line(**item["line"])) for item in data.get("ends", [])]
+        refs = [Box(**item).normalized() for item in data.get("vehicle_refs") or []]
+        if not refs and data.get("vehicle_ref"):
+            refs = [Box(**data["vehicle_ref"]).normalized()]
         geom = cls(
             frame_width=int(data.get("frame_width", 1)),
             frame_height=int(data.get("frame_height", 1)),
             north=north,
             starts=starts,
             ends=ends,
+            vehicle_refs=refs,
         )
         # Legacy pair files: treat each pair as unnamed start/end segments.
         if not starts and data.get("routes"):
