@@ -15,6 +15,11 @@ BOUNDS = ("NB", "SB", "EB", "WB")
 ORIGIN_TO_BOUND = {"N": "NB", "S": "SB", "E": "EB", "W": "WB"}
 MAX_GATES = 4
 MAX_VEHICLE_REFS = 12
+MAX_OCCLUSIONS = 12
+MAX_ROADWAYS = 8
+# Centers this close to a roadway edge still count as inside, so box jitter
+# on the boundary does not create and destroy tracks.
+ROADWAY_MARGIN_PX = 12.0
 
 
 def area_limits_from_areas(areas: list[float]) -> tuple[int, int] | None:
@@ -104,6 +109,127 @@ class Box:
 
 
 @dataclass
+class Polygon:
+    """Allowed roadway region. An empty list on Geometry means the full frame."""
+
+    points: list[tuple[float, float]] = field(default_factory=list)
+
+    def scaled(self, sx: float, sy: float) -> "Polygon":
+        return Polygon([(x * sx, y * sy) for x, y in self.points])
+
+
+def _distinct_vertices(points: list[tuple[float, float]], tol: float = 1.5) -> list[tuple[float, float]]:
+    cleaned: list[tuple[float, float]] = []
+    for x, y in points:
+        if cleaned and math.hypot(x - cleaned[-1][0], y - cleaned[-1][1]) <= tol:
+            continue
+        cleaned.append((float(x), float(y)))
+    if len(cleaned) >= 2 and math.hypot(cleaned[0][0] - cleaned[-1][0], cleaned[0][1] - cleaned[-1][1]) <= tol:
+        cleaned.pop()
+    return cleaned
+
+
+def polygon_area(points: list[tuple[float, float]]) -> float:
+    verts = _distinct_vertices(points)
+    if len(verts) < 3:
+        return 0.0
+    area = 0.0
+    for index, (x, y) in enumerate(verts):
+        nx, ny = verts[(index + 1) % len(verts)]
+        area += x * ny - nx * y
+    return abs(area) * 0.5
+
+
+def polygon_is_valid(points: list[tuple[float, float]]) -> bool:
+    """At least three distinct vertices and a non-degenerate area."""
+    return len(_distinct_vertices(points)) >= 3 and polygon_area(points) >= 1.0
+
+
+def point_in_polygon(x: float, y: float, points: list[tuple[float, float]]) -> bool:
+    """Ray cast. Points on an edge count as inside."""
+    verts = _distinct_vertices(points, tol=0.0) if len(points) >= 3 else list(points)
+    if len(verts) < 3:
+        return False
+    inside = False
+    j = len(verts) - 1
+    for i, (xi, yi) in enumerate(verts):
+        xj, yj = verts[j]
+        if _point_on_segment(x, y, xi, yi, xj, yj):
+            return True
+        if (yi > y) != (yj > y):
+            denom = (yj - yi) or 1e-12
+            x_cross = (xj - xi) * (y - yi) / denom + xi
+            if x < x_cross:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _point_on_segment(px: float, py: float, ax: float, ay: float, bx: float, by: float, tol: float = 1.5) -> bool:
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-9:
+        return math.hypot(px - ax, py - ay) <= tol
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+    qx, qy = ax + t * dx, ay + t * dy
+    return math.hypot(px - qx, py - qy) <= tol
+
+
+def distance_to_polygon(x: float, y: float, points: list[tuple[float, float]]) -> float:
+    """Zero when the point is inside; otherwise the distance to the nearest edge."""
+    if point_in_polygon(x, y, points):
+        return 0.0
+    verts = points
+    if len(verts) < 2:
+        return float("inf")
+    best = float("inf")
+    for index, (ax, ay) in enumerate(verts):
+        bx, by = verts[(index + 1) % len(verts)]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-9:
+            best = min(best, math.hypot(x - ax, y - ay))
+            continue
+        t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / length2))
+        best = min(best, math.hypot(x - (ax + t * dx), y - (ay + t * dy)))
+    return best
+
+
+def point_in_roadway(x: float, y: float, geometry: "Geometry", margin: float = ROADWAY_MARGIN_PX) -> bool:
+    """True when no roadway is drawn, or the point lies in the union (plus margin)."""
+    if not geometry.roadways:
+        return True
+    for poly in geometry.roadways:
+        if point_in_polygon(x, y, poly.points):
+            return True
+        if margin > 0.0 and distance_to_polygon(x, y, poly.points) <= margin:
+            return True
+    return False
+
+
+def roadway_approach_warnings(geometry: "Geometry", probe_px: float = 48.0) -> list[str]:
+    """Gates need observed roadway on both sides so a crossing can be confirmed."""
+    if not geometry.roadways:
+        return []
+    warnings: list[str] = []
+    labeled = [("Entry", item) for item in geometry.starts] + [("Exit", item) for item in geometry.ends]
+    for kind, item in labeled:
+        dx = item.line.x2 - item.line.x1
+        dy = item.line.y2 - item.line.y1
+        length = math.hypot(dx, dy) or 1.0
+        nx, ny = -dy / length, dx / length
+        mx, my = item.line.midpoint()
+        ahead = point_in_roadway(mx + nx * probe_px, my + ny * probe_px, geometry, margin=0.0)
+        behind = point_in_roadway(mx - nx * probe_px, my - ny * probe_px, geometry, margin=0.0)
+        if ahead and behind:
+            continue
+        warnings.append(
+            f"{kind} {item.name} is clipped by the roadway. Leave roadway on both sides of the gate."
+        )
+    return warnings
+
+
+@dataclass
 class NamedLine:
     name: str
     line: Line
@@ -165,6 +291,9 @@ class Transform:
         x2, y2 = self.apply_point(box.x2, box.y2, cx, cy)
         return Box(x1, y1, x2, y2).normalized()
 
+    def apply_polygon(self, poly: Polygon, cx: float, cy: float) -> Polygon:
+        return Polygon([self.apply_point(x, y, cx, cy) for x, y in poly.points])
+
     def apply_geometry(self, geom: "Geometry") -> "Geometry":
         cx = geom.frame_width / 2.0
         cy = geom.frame_height / 2.0
@@ -178,6 +307,8 @@ class Transform:
             starts=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.starts],
             ends=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.ends],
             vehicle_refs=[self.apply_box(box, cx, cy) for box in geom.vehicle_refs],
+            occlusions=[self.apply_box(box, cx, cy) for box in geom.occlusions],
+            roadways=[self.apply_polygon(poly, cx, cy) for poly in geom.roadways],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -323,6 +454,8 @@ class Geometry:
     starts: list[NamedLine] = field(default_factory=list)
     ends: list[NamedLine] = field(default_factory=list)
     vehicle_refs: list[Box] = field(default_factory=list)
+    occlusions: list[Box] = field(default_factory=list)
+    roadways: list[Polygon] = field(default_factory=list)
 
     @property
     def routes(self) -> list[Route]:
@@ -395,6 +528,8 @@ class Geometry:
             starts=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.starts],
             ends=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.ends],
             vehicle_refs=[box.scaled(sx, sy) for box in self.vehicle_refs],
+            occlusions=[box.scaled(sx, sy) for box in self.occlusions],
+            roadways=[poly.scaled(sx, sy) for poly in self.roadways],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -405,6 +540,8 @@ class Geometry:
             "starts": [{"name": item.name, "line": asdict(item.line)} for item in self.starts],
             "ends": [{"name": item.name, "line": asdict(item.line)} for item in self.ends],
             "vehicle_refs": [asdict(box) for box in self.vehicle_refs],
+            "occlusions": [asdict(box) for box in self.occlusions],
+            "roadways": [{"points": [[x, y] for x, y in poly.points]} for poly in self.roadways],
         }
 
     @classmethod
@@ -415,6 +552,13 @@ class Geometry:
         refs = [Box(**item).normalized() for item in data.get("vehicle_refs") or []]
         if not refs and data.get("vehicle_ref"):
             refs = [Box(**data["vehicle_ref"]).normalized()]
+        occlusions = [Box(**item).normalized() for item in data.get("occlusions") or []]
+        roadways: list[Polygon] = []
+        for item in data.get("roadways") or []:
+            raw_points = item.get("points") if isinstance(item, dict) else item
+            points = [(float(pt[0]), float(pt[1])) for pt in (raw_points or []) if len(pt) >= 2]
+            if polygon_is_valid(points):
+                roadways.append(Polygon(_distinct_vertices(points)))
         geom = cls(
             frame_width=int(data.get("frame_width", 1)),
             frame_height=int(data.get("frame_height", 1)),
@@ -422,6 +566,8 @@ class Geometry:
             starts=starts,
             ends=ends,
             vehicle_refs=refs,
+            occlusions=occlusions,
+            roadways=roadways,
         )
         # Legacy pair files: treat each pair as unnamed start/end segments.
         if not starts and data.get("routes"):

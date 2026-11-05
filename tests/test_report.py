@@ -59,7 +59,9 @@ class ReportTests(unittest.TestCase):
             Trip("a.mp4", 3, "S", 50, "NB", 60, "truck"),
         ]
         overview = dict(build_overview_rows(trips))
-        self.assertEqual(overview["Motor Vehicle Count"], 3)
+        self.assertEqual(overview["Number of all vehicles"], 3)
+        self.assertEqual(overview["Car count"], 2)
+        self.assertEqual(overview["Truck count"], 1)
         sheet = build_overview_table(
             trips,
             video_name="a.mp4",
@@ -68,13 +70,23 @@ class ReportTests(unittest.TestCase):
             device_label="motion mask (CPU)",
         )
         self.assertEqual(list(sheet.columns), ["Field", "Value"])
-        self.assertIn("Motor Vehicle Count", list(sheet["Field"]))
-        self.assertEqual(int(sheet.loc[sheet["Field"] == "Motor Vehicle Count", "Value"].iloc[0]), 3)
-        self.assertNotIn("Car count", overview)
+        self.assertIn("Number of all vehicles", list(sheet["Field"]))
+        self.assertEqual(int(sheet.loc[sheet["Field"] == "Number of all vehicles", "Value"].iloc[0]), 3)
+        self.assertIn("Car count", overview)
         gates = build_gate_statistics_table(trips, geom)
-        self.assertEqual(list(gates["Category"]), ["Motor Vehicle Count"])
-        self.assertEqual(int(gates.loc[0, "N (Entry)"]), 2)
-        self.assertEqual(int(gates.loc[0, "NB (Exit)"]), 2)
+        self.assertEqual(list(gates["Category"]), [
+            "Car count",
+            "Van count",
+            "Truck count",
+            "Motorcycle count",
+            "Bus count",
+            "Number of all vehicles",
+        ])
+        total_row = gates.loc[gates["Category"] == "Number of all vehicles"].iloc[0]
+        self.assertEqual(int(total_row["N (Entry)"]), 2)
+        self.assertEqual(int(total_row["NB (Exit)"]), 2)
+        car_row = gates.loc[gates["Category"] == "Car count"].iloc[0]
+        self.assertEqual(int(car_row["N (Entry)"]), 2)
 
     def test_tmc_summary_groups_by_entry(self) -> None:
         geom = Geometry(
@@ -116,11 +128,43 @@ class ReportTests(unittest.TestCase):
             )
             wb = load_workbook(path)
             self.assertEqual(wb.sheetnames, ["Overview", "Gate Statistics", "TMC Summary"])
-            self.assertIn("Motor Vehicle Count", [wb["Overview"]["B8"].value, wb["Overview"]["B9"].value])
-            self.assertEqual(wb["Gate Statistics"]["B5"].value, "Motor Vehicle Count")
+            overview_labels = [wb["Overview"].cell(row, 2).value for row in range(8, 16)]
+            self.assertIn("Car count", overview_labels)
+            self.assertIn("Number of all vehicles", overview_labels)
+            self.assertEqual(wb["Gate Statistics"]["B5"].value, "Car count")
+            self.assertEqual(wb["Gate Statistics"]["B10"].value, "Number of all vehicles")
             self.assertEqual(wb["Gate Statistics"]["B2"].value, "Survey report - Gate Statistics")
             self.assertEqual(wb["TMC Summary"]["A1"].value, "TMC Summary")
             self.assertEqual(wb["TMC Summary"]["C3"].value, "ENTRY N")
+
+    def test_export_embeds_path_image(self) -> None:
+        import numpy as np
+
+        geom = Geometry(
+            100,
+            100,
+            north=Line(50, 90, 50, 10),
+            starts=[NamedLine("N", Line(10, 10, 20, 10))],
+            ends=[NamedLine("SB", Line(80, 90, 90, 90))],
+        )
+        trips = [Trip("site.mp4", 1, "N", 10, "SB", 20, "car", path=[(10.0, 10.0), (80.0, 80.0)])]
+        image = np.full((60, 90, 3), 40, dtype=np.uint8)
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "out.xlsx"
+            export_tmc_workbook(
+                path,
+                trips,
+                geom,
+                video_name="site.mp4",
+                duration_s=900,
+                clock_start=None,
+                device_label="CPU",
+                path_image=image,
+            )
+            png = path.with_name("out_paths.png")
+            self.assertTrue(png.exists())
+            wb = load_workbook(path)
+            self.assertTrue(wb["Gate Statistics"]._images)
 
     def test_geometry_roundtrip(self) -> None:
         geom = Geometry(
@@ -130,12 +174,14 @@ class ReportTests(unittest.TestCase):
             starts=[NamedLine("N", Line(10, 20, 30, 40))],
             ends=[NamedLine("SB", Line(50, 60, 70, 80))],
             vehicle_refs=[Box(100, 200, 140, 240)],
+            occlusions=[Box(400, 100, 430, 500)],
         )
         data = geom.to_dict()
         loaded = Geometry.from_dict(data)
         self.assertEqual(loaded.starts[0].name, "N")
         self.assertEqual(loaded.ends[0].name, "SB")
         self.assertEqual(loaded.vehicle_refs[0].area(), 1600)
+        self.assertEqual(loaded.occlusions[0].width(), 30)
         scaled = loaded.scaled_to(960, 540)
         self.assertEqual(scaled.starts[0].line.x1, 5)
 

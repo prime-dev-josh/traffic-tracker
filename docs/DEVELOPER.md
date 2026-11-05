@@ -8,15 +8,15 @@ Traffic Tracker turns a hovering-drone video of an intersection into a turning-m
 
 The home dashboard opens Process, Training, or Settings. In Process the operator sets **North**, draws the **entry/exit tripwires** that exist, and optionally boxes **typical vehicles**. Training boxes the same way on sample frames and writes a size prior plus a YOLO-ready dataset. The processor looks for moving blobs in that size band, follows each blob’s center, and records a trip when the path visits two different geographic sides of the intersection. The workbook matches the Las Olas sheet set: Overview, Gate Statistics, TMC Summary.
 
-Counting does **not** classify cars vs trucks vs buses. Every completed trip is **Motor Vehicle Count**.
+Trained detector classifies cars, vans, trucks, motorcycles, and buses. Motion mask still writes every trip as `vehicle` and only fills **Number of all vehicles**. Each track stores a centroid path that is drawn on a darkened still and embedded under Gate Statistics.
 
 ## Design rules
 
 - **Motion is the default count path.** `detector_mode=trained` runs Ultralytics YOLO detect (not ByteTrack) at `TRAIN_IMGSZ` 1280 and feeds the same trip logic. Prefer site `training/weights/best.pt`; otherwise a user-chosen `.pt` or `yolo11n.pt`.
-- **No vehicle classes.** Size is the filter; the export row is Motor Vehicle Count.
+- **Classes come from the trained detector only.** Motion trips stay `vehicle`. Export rows are Car / Van / Truck / Motorcycle / Bus count plus Number of all vehicles.
 - **North is whatever the operator drew**, not image-up.
 - **Gates are optional per side.** One-way intersections are valid (`is_ready` = North + ≥1 start + ≥1 end).
-- **A trip is first side → second different side**, from path intersection or from first/last point sides if a gate was missed.
+- **A trip is first side → second different side**, confirmed only between real observations. Predictions and held boxes do not count. Motion mode may still infer a trip from the first and last observed positions when a gate was missed.
 - **Do not copy client logos** into the export.
 - Python **3.11**. GUI is **PyQt6**.
 
@@ -122,7 +122,7 @@ Preview tints the mask green and labels each box `#{id} width×height`.
 
 ## Tracks and trips
 
-`processor.py` does **not** use ByteTrack. Each frame’s boxes are associated by nearest unused centroid within `_adopt_radius` (about 8% of the short frame side, minimum 120 px) and a 4× area similarity check.
+`processor.py` does **not** use ByteTrack. Each frame’s boxes are matched to live tracks with greedy IoU first, then nearest unused centroid within a speed-capped radius (trained) or `_adopt_radius` (motion), plus a 4× area similarity check. Path traces skip inactive tracks and split on teleport jumps. User-drawn **drop zones** (`geometry.occlusions`) mark dark patches that hide cars: an active track coasts along its velocity through the box, and reconnect distance is the zone size plus predicted travel instead of a flat +48 px.
 
 A track stores first/last point, last box size, and an optional first-gate origin.
 
@@ -135,14 +135,14 @@ Once a track has two sightings and is moving slowly (or already held), it stays 
 
 If the track dies with only one gate, the last point’s side can finish the trip. If it never hit a gate but first and last sides differ and travel exceeds `_min_travel`, that path still becomes a trip.
 
-`Trip.vehicle_class` is unused in the workbook. Every trip is Motor Vehicle Count.
+`Trip.vehicle_class` is `car` / `van` / `truck` / `motorcycle` / `bus` from the trained detector, or `vehicle` from motion. `Trip.path` is the centroid polyline used for the export overlay.
 
 ## Export
 
-`export_tmc_workbook` writes three sheets, no images:
+`export_tmc_workbook` writes three sheets. If `path_image` is set, Gate Statistics also embeds that PNG and writes `{stem}_paths.png` beside the workbook.
 
-- **Overview** — **Motor Vehicle Count** (all trips).
-- **Gate Statistics** — one **Motor Vehicle Count** row per entry/exit.
+- **Overview** — Car / Van / Truck / Motorcycle / Bus count, then **Number of all vehicles**.
+- **Gate Statistics** — the same class rows per entry/exit, plus the darkened path-trace still under the table.
 - **TMC Summary** — 15-minute bins (`INTERVAL_SECONDS` = 900) grouped by entry, columns `{origin}-{bound}`.
 
 Clock time is optional. If the operator sets a start datetime, bin labels are wall-clock; otherwise they are elapsed `MM:SS`.
@@ -153,7 +153,7 @@ Clock time is optional. If the operator sets a start datetime, bin labels are wa
 
 0. **Home** — Process / Training / Settings cards.
 1. **Setup** — add videos/folder, OneDrive warning, clock, export folder, load/save project.
-2. **Routes** — North, add start/end (Auto or explicit name), add one or more vehicle masks, save/load geometry JSON.
+2. **Routes** — North, add start/end (Auto or explicit name), add one or more vehicle masks, optional drop zones over dark patches, save/load geometry JSON.
 3. **Align** — per-clip nudge, wheel zoom, rotate, match points, optional redraw, confirm.
 4. **Process** — log, progress, live preview.
 5. **Report** — tabs matching the workbook (Overview / Gate Statistics / TMC Summary), plus Open export folder.
@@ -175,7 +175,7 @@ Route masks live on the drawing step. Training boxes live in `training/sessions/
 - Minimum to train: `TRAIN_MIN_FRAMES` (20) and `TRAIN_MIN_BOXES` (40).
 - North/gates are not required.
 
-`traffic_tracker/core/trainer.py` fine-tunes `yolo11n.pt` for 60 epochs at imgsz 1280 on a `TrainWorker` thread. Site boxing writes `training/weights/best.pt`. **Train on VisDrone** (`python -m traffic_tracker.train_visdrone`) downloads VisDrone2019-DET, writes `training/weights/visdrone.pt`, and copies it to `best.pt`. Detector keeps cars, vans, trucks, buses, and motorcycles (`DETECTOR_CONF` 0.30, `DETECTOR_IOU` 0.45) and drops people, bicycles, boats, and tricycles. Trained mode also skips parked boxes (no travel) and does not infer first→last trips without a gate start. Do not run a live train in unit tests. The boxed Training UI stays until VisDrone is proven better.
+`traffic_tracker/core/trainer.py` fine-tunes `yolo11n.pt` for 60 epochs at imgsz 1280 on a `TrainWorker` thread. **Train detector** starts from `visdrone.pt` when that file exists, writes `training/weights/site.pt`, and copies it to `best.pt` (`TRAIN_SITE_EPOCHS` 40). VisDrone weights stay selectable in Settings. **Train on VisDrone** (`python -m traffic_tracker.train_visdrone`) downloads VisDrone2019-DET, writes `training/weights/visdrone.pt`, and copies it to `best.pt`. Detector keeps cars, vans, trucks, buses, and motorcycles. Settings stores a precision preset (`strict` / `balanced` / `sensitive` / `custom`) and passes confidence, NMS IoU, parked radius, link speed, and path-jump into `process_video`. Balanced defaults are confidence 0.35 and NMS IoU 0.40. Frame-to-frame association prefers `box_iou` ≥ `DETECTOR_MATCH_IOU_MIN`, then speed-capped centroid linking. It drops people, bicycles, boats/watercraft, and tricycles. Trained mode only activates a track after it walks out of a settle radius (`DETECTOR_STATIC_RADIUS_*`) with small steps (`DETECTOR_LINK_*`). The settle point creeps with hover drift so parked cars and mislabeled boats do not appear in preview, traces, or trips. A hop to another stall starts a new track instead of a lot-spanning line. It does not infer first→last trips without a gate start. Do not run a live train in unit tests. The boxed Training UI stays until VisDrone is proven better.
 
 ## Project file
 

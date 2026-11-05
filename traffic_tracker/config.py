@@ -45,11 +45,13 @@ TRAINING_DIR_NAME = "training"
 SIZE_PRIOR_NAME = "size_prior.json"
 TRAINED_WEIGHTS_REL = "weights/best.pt"
 VISDRONE_WEIGHTS_REL = "weights/visdrone.pt"
+SITE_WEIGHTS_REL = "weights/site.pt"
 TRAIN_DATASET_REL = "dataset"
 TRAIN_RUNS_REL = "runs"
 TRAIN_MIN_FRAMES = 20
 TRAIN_MIN_BOXES = 40
 TRAIN_EPOCHS = 60
+TRAIN_SITE_EPOCHS = 40
 TRAIN_IMGSZ = 1280
 TRAIN_BATCH = 4
 TRAIN_PATIENCE = 15
@@ -57,8 +59,55 @@ TRAIN_VAL_FRACTION = 0.2
 TRAIN_SPLIT_SEED = 42
 SETTINGS_FILE_NAME = "app_settings.json"
 
-# Trained detector inference. Low conf overcounts ghosts; raise if still high.
-DETECTOR_CONF = 0.30
+# Trained detector inference. Balanced preset is the default.
+DETECTOR_CONF = 0.35
 DETECTOR_CONF_MIN = 0.15
 DETECTOR_CONF_MAX = 0.60
-DETECTOR_IOU = 0.45
+DETECTOR_IOU = 0.40
+DETECTOR_IOU_MIN = 0.20
+DETECTOR_IOU_MAX = 0.70
+DETECTOR_MATCH_IOU_MIN = 0.10
+# Parked cars / boats stay inside this radius; the settle point creeps with hover drift.
+DETECTOR_STATIC_RADIUS_MIN = 56.0
+DETECTOR_STATIC_RADIUS_FRAC = 0.07
+DETECTOR_PARKED_RADIUS = 56.0
+DETECTOR_PARKED_RADIUS_MIN = 24.0
+DETECTOR_PARKED_RADIUS_MAX = 120.0
+DETECTOR_STATIC_SETTLE_S = 1.5
+DETECTOR_STATIC_EXPIRE_S = 2.0
+# Trained-mode association. A wide radius stitches parked stalls into one track.
+DETECTOR_LINK_SPEED_PX_S = 180.0
+DETECTOR_LINK_SPEED_MIN = 60.0
+DETECTOR_LINK_SPEED_MAX = 300.0
+DETECTOR_LINK_MIN_PX = 36.0
+DETECTOR_LINK_CAP_MIN = 96.0
+DETECTOR_LINK_CAP_FRAC = 0.10
+DETECTOR_PATH_JUMP = 90.0
+DETECTOR_PATH_JUMP_MIN = 40.0
+DETECTOR_PATH_JUMP_MAX = 200.0
+DETECTOR_PATH_JUMP_FRAC = 0.08
+
+# Slider bundles. Custom means the user moved a slider off a preset.
+PRECISION_PRESETS = {
+    "strict": {
+        "detector_conf": 0.45,
+        "detector_iou": 0.50,
+        "parked_radius": 96.0,
+        "link_speed": 100.0,
+        "path_jump": 60.0,
+    },
+    "balanced": {
+        "detector_conf": DETECTOR_CONF,
+        "detector_iou": DETECTOR_IOU,
+        "parked_radius": DETECTOR_PARKED_RADIUS,
+        "link_speed": DETECTOR_LINK_SPEED_PX_S,
+        "path_jump": DETECTOR_PATH_JUMP,
+    },
+    "sensitive": {
+        "detector_conf": 0.25,
+        "detector_iou": 0.30,
+        "parked_radius": 32.0,
+        "link_speed": 260.0,
+        "path_jump": 140.0,
+    },
+}

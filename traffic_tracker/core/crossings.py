@@ -10,6 +10,33 @@ def bbox_center(xyxy) -> tuple[float, float]:
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
 
+def bbox_corners(xyxy) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Top-left, top-right, bottom-right, bottom-left of an axis-aligned box."""
+    x1, y1, x2, y2 = (float(v) for v in xyxy)
+    return ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+
+
+def box_iou(a, b) -> float:
+    """Intersection-over-union for axis-aligned boxes (x1, y1, x2, y2)."""
+    ax1, ay1, ax2, ay2 = (float(v) for v in a)
+    bx1, by1, bx2, by2 = (float(v) for v in b)
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
 def _orient(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> float:
     return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
 
@@ -102,6 +129,40 @@ def _point_near_segment(point: tuple[float, float], line: Line, pad_px: float) -
     t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
     qx, qy = ax + t * dx, ay + t * dy
     return ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5 <= pad_px
+
+
+def signed_offset(point: tuple[float, float], line: Line) -> float:
+    """Signed perpendicular distance from a point to the infinite gate line."""
+    dx = line.x2 - line.x1
+    dy = line.y2 - line.y1
+    length = (dx * dx + dy * dy) ** 0.5 or 1.0
+    px, py = point
+    return ((px - line.x1) * dy - (py - line.y1) * dx) / length
+
+
+def confirmed_cross_t(
+    prev: tuple[float, float],
+    curr: tuple[float, float],
+    line: Line,
+    *,
+    pad_px: float = 24.0,
+    clearance_px: float = 8.0,
+) -> float | None:
+    """Crossing only when two observations change sides of the finite gate.
+
+    A stationary box on the line is not a crossing. A slow step that actually
+    changes sides is. Hover jitter of a couple of pixels is ignored.
+    """
+    if prev == curr:
+        return None
+    step = ((curr[0] - prev[0]) ** 2 + (curr[1] - prev[1]) ** 2) ** 0.5
+    before = signed_offset(prev, line)
+    after = signed_offset(curr, line)
+    if before * after > 0.0:
+        return None
+    if step < 2.0 and abs(after - before) < clearance_px:
+        return None
+    return path_cross_t(prev, curr, line, pad_px=pad_px)
 
 
 def path_crosses_line(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -14,7 +14,14 @@ from traffic_tracker.config import APP_NAME, INTERVAL_SECONDS
 from traffic_tracker.core.geometry import Geometry, movement_name
 
 
-VEHICLE_LABEL = "Motor Vehicle Count"
+VEHICLE_LABEL = "Number of all vehicles"
+REPORT_CLASS_ROWS = (
+    ("car", "Car count"),
+    ("van", "Van count"),
+    ("truck", "Truck count"),
+    ("motorcycle", "Motorcycle count"),
+    ("bus", "Bus count"),
+)
 
 
 @dataclass
@@ -26,6 +33,8 @@ class Trip:
     end_destination: str
     end_time_s: float
     vehicle_class: str = "vehicle"
+    path: list[tuple[float, float]] = field(default_factory=list)
+    evidence: str = "observed"
 
     @property
     def route_name(self) -> str:
@@ -151,11 +160,15 @@ def build_tmc_table(
     return pd.DataFrame(rows, columns=columns)
 
 
+def _class_count(trips: list[Trip], cls: str) -> int:
+    return sum(1 for trip in trips if trip.vehicle_class == cls)
+
+
 def build_overview_rows(trips: list[Trip]) -> list[tuple[str, int | str]]:
-    return [
-        ("Overall statistics for all vehicles seen", ""),
-        (VEHICLE_LABEL, len(trips)),
-    ]
+    rows: list[tuple[str, int | str]] = [("Overall statistics for all vehicles seen", "")]
+    rows.extend((label, _class_count(trips, cls)) for cls, label in REPORT_CLASS_ROWS)
+    rows.append((VEHICLE_LABEL, len(trips)))
+    return rows
 
 
 def build_overview_table(
@@ -182,14 +195,19 @@ def build_overview_table(
 def build_gate_statistics_table(trips: list[Trip], geometry: Geometry) -> pd.DataFrame:
     origins = geometry.origin_names()
     bounds = geometry.bound_names()
-    data: dict[str, list[int]] = {}
+    categories = [label for _cls, label in REPORT_CLASS_ROWS] + [VEHICLE_LABEL]
+    data: dict[str, list[int]] = {"Category": categories}
     for origin in origins:
-        data[f"{origin} (Entry)"] = [sum(1 for trip in trips if trip.start_destination == origin)]
+        data[f"{origin} (Entry)"] = [
+            sum(1 for trip in trips if trip.start_destination == origin and trip.vehicle_class == cls)
+            for cls, _label in REPORT_CLASS_ROWS
+        ] + [sum(1 for trip in trips if trip.start_destination == origin)]
     for bound in bounds:
-        data[f"{bound} (Exit)"] = [sum(1 for trip in trips if trip.end_destination == bound)]
-    table = pd.DataFrame(data, index=[VEHICLE_LABEL])
-    table.insert(0, "Category", list(table.index))
-    return table.reset_index(drop=True)
+        data[f"{bound} (Exit)"] = [
+            sum(1 for trip in trips if trip.end_destination == bound and trip.vehicle_class == cls)
+            for cls, _label in REPORT_CLASS_ROWS
+        ] + [sum(1 for trip in trips if trip.end_destination == bound)]
+    return pd.DataFrame(data, columns=["Category", *[col for col in data if col != "Category"]])
 
 
 def build_tmc_summary_table(
@@ -289,7 +307,7 @@ def _write_overview(
     ws.column_dimensions["D"].width = 14
 
 
-def _write_gate_statistics(ws, trips: list[Trip], geometry: Geometry) -> None:
+def _write_gate_statistics(ws, trips: list[Trip], geometry: Geometry) -> int:
     title_font = Font(name="Calibri", bold=True, size=14, color="1F4E79")
     header_font = Font(name="Calibri", bold=True, color="FFFFFF")
     label_font = Font(name="Calibri", size=11)
@@ -331,9 +349,11 @@ def _write_gate_statistics(ws, trips: list[Trip], geometry: Geometry) -> None:
             elif excel_row % 2 == 0:
                 cell.fill = alt_fill
 
+    last_data_row = header_row + len(table)
     for offset, header in enumerate(headers):
         width = 22 if header else 28
         ws.column_dimensions[get_column_letter(start_col + offset)].width = width
+    return last_data_row
 
 
 def _write_tmc_summary(
@@ -435,6 +455,31 @@ def _write_tmc_summary(
     ws.freeze_panes = "A5"
 
 
+def _embed_path_image(ws, image, last_row: int, dest: Path) -> Path | None:
+    if image is None:
+        return None
+    import cv2
+    from openpyxl.drawing.image import Image as ExcelImage
+
+    frame = image
+    height, width = frame.shape[:2]
+    max_side = 1400
+    if max(height, width) > max_side:
+        scale = max_side / max(height, width)
+        frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+    png_path = dest.with_name(f"{dest.stem}_paths.png")
+    cv2.imwrite(str(png_path), frame)
+    picture = ExcelImage(str(png_path))
+    max_w = 720
+    if picture.width and picture.width > max_w:
+        ratio = max_w / picture.width
+        picture.width = max_w
+        if picture.height:
+            picture.height = int(picture.height * ratio)
+    ws.add_image(picture, f"B{last_row + 2}")
+    return png_path
+
+
 def export_tmc_workbook(
     path: str | Path,
     trips: list[Trip],
@@ -446,6 +491,7 @@ def export_tmc_workbook(
     device_label: str,
     trip_count: int | None = None,
     table: pd.DataFrame | None = None,
+    path_image=None,
 ) -> Path:
     del table, trip_count
     path = Path(path)
@@ -466,7 +512,8 @@ def export_tmc_workbook(
     )
 
     gates = wb.create_sheet("Gate Statistics")
-    _write_gate_statistics(gates, trips, geometry)
+    last_row = _write_gate_statistics(gates, trips, geometry)
+    _embed_path_image(gates, path_image, last_row, path)
 
     tmc = wb.create_sheet("TMC Summary")
     _write_tmc_summary(tmc, trips, geometry, duration_s, clock_start)

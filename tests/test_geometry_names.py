@@ -99,6 +99,15 @@ class NamingTests(unittest.TestCase):
         loaded = Geometry.from_dict(geom.to_dict())
         self.assertEqual(loaded.vehicle_refs[0].area(), 1200)
 
+    def test_occlusion_boxes_roundtrip_and_scale(self) -> None:
+        geom = Geometry(200, 200, occlusions=[Box(90, 10, 110, 180)])
+        loaded = Geometry.from_dict(geom.to_dict())
+        self.assertEqual(len(loaded.occlusions), 1)
+        self.assertEqual(loaded.occlusions[0].width(), 20)
+        scaled = loaded.scaled_to(100, 100)
+        self.assertAlmostEqual(scaled.occlusions[0].width(), 10)
+        self.assertAlmostEqual(scaled.occlusions[0].height(), 85)
+
     def test_multiple_masks_span_size_band(self) -> None:
         geom = Geometry(200, 200, vehicle_refs=[Box(0, 0, 20, 20), Box(0, 0, 80, 80)])
         lo, hi = geom.vehicle_area_limits()

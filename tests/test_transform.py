@@ -15,6 +15,7 @@ def _geom(width: int = 200, height: int = 100) -> Geometry:
         starts=[NamedLine("N", Line(10, 20, 30, 40))],
         ends=[NamedLine("SB", Line(50, 60, 70, 80))],
         vehicle_refs=[Box(40, 30, 70, 50)],
+        occlusions=[Box(80, 10, 90, 80)],
     )
 
 
@@ -30,6 +31,8 @@ class TransformTests(unittest.TestCase):
         self.assertAlmostEqual(geom.starts[0].line.y1, 17)
         self.assertAlmostEqual(geom.vehicle_refs[0].x1, 45)
         self.assertAlmostEqual(geom.vehicle_refs[0].y1, 27)
+        self.assertAlmostEqual(geom.occlusions[0].x1, 85)
+        self.assertAlmostEqual(geom.occlusions[0].y1, 7)
 
     def test_scale_about_center(self) -> None:
         # Center is (100, 50). Point (10, 20): (10-100)*2 + 100 = -80; (20-50)*2+50 = -10

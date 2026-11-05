@@ -4,7 +4,7 @@ Desktop app for turning-movement counts from **overhead drone** intersection vid
 
 Home opens **Process Traffic Footage**, **Training**, or **Settings**. Process is the existing count wizard: set North, draw the entry and exit lines that exist, optionally mask typical vehicles, then export **Overview**, **Gate Statistics**, and a 15-minute **TMC Summary**.
 
-There is no car classifier. Processing is an OpenCV motion mask. A moving blob that sits in the vehicle-size band and crosses two geographic sides of the intersection becomes one trip. Every vehicle counts the same.
+Motion mask counts every moving blob in the vehicle-size band. Trained detector keeps cars, vans, trucks, motorcycles, and buses and writes those class rows in the export. A trip is a path that crosses two geographic sides of the intersection. Path traces are drawn on a darkened still and embedded under Gate Statistics.
 
 ## Recent changes
 
@@ -14,7 +14,8 @@ There is no car classifier. Processing is an OpenCV motion mask. A moving blob t
 - **Motion mask instead of YOLO.** Nadir drone cars were missed or labeled boat/airplane. Counts now come from MOG2 foreground blobs.
 - **Size, not class.** Drawn route masks plus Training boxes decide the size band. Pedestrians and flicker fall below the min; lighting washes fall above the max.
 - **Vehicle reference masks** on the drawing step. Drag one or more boxes around typical vehicles. Processing keeps blobs from 35% of the smallest sample to 350% of the largest.
-- **Export is unclassified.** Overview and Gate Statistics show **Motor Vehicle Count** only. TMC Summary is still by movement (`N-SB`, …).
+- **Classified Gate Statistics.** Overview and Gate Statistics list **Car / Van / Truck / Motorcycle / Bus count** plus **Number of all vehicles**. Motion-mask trips stay in the total row. TMC Summary is still by movement (`N-SB`, …).
+- **Path traces in the workbook.** Each track keeps a centroid polyline. The Gate Statistics sheet embeds a darkened still with neon class-colored traces and gate labels. A `{video}_paths.png` is written next to the xlsx.
 - **Gates, not required 8 lines.** Set North, then only the start/end lines that exist (one-way is fine). Names are `{origin}-{bound}` such as `N-SB`.
 - **Path crossings.** A trip is a centroid path that hits two different sides. ByteTrack IDs are not used.
 - **Las Olas-style workbook** (Overview / Gate Statistics / TMC Summary). No copied logos or branding.
@@ -63,7 +64,9 @@ The app starts on a dashboard. Open one of the three cards.
 3. On a random frame of the **first** clip:
    - Drag an arrow toward **geographic North** (the top of the photo does not have to be North).
    - Draw **start (entry)** and **end (exit)** lines that exist. One-way streets can omit a side.
+   - **Add roadway**: click around the intersection and the approaches, then Finish roadway. Leave the marina, parking lots, buildings, and sidewalks outside. No roadway means the full frame is used. Keep pavement on both sides of each gate.
    - **Add vehicle mask**: drag a box around a typical vehicle. Repeat for other sizes. That size band is the processing filter.
+   - **Add drop zone**: drag a box over a dark patch where cars briefly disappear. Detections inside the box still count. The zone only helps reconnect a track across a short gap.
 4. **Align** later clips: drag/scale/rotate the overlay (or match 2–4 landmarks). Confirm each clip. Unconfirmed clips are skipped.
 5. Process confirmed clips. Each writes `{video_name}_tmc.xlsx`.
 
@@ -84,13 +87,13 @@ Boxing vehicles does two things:
 
 Open a clip, box **every** vehicle you can see (including stopped queue cars), then **Next frame**. Repeat. **Save session** writes the labels. Aim for **150+ frames / 400+ boxes** across clips and times of day. The hard minimum to train is 20 frames and 40 boxes.
 
-**Train detector** flattens those sessions into `training/dataset/`, fine-tunes `yolo11n.pt` at image size 1280, and copies `best.pt` to `training/weights/best.pt`. Process then switches to **Trained detector**. CPU training is allowed but slow; a GPU is much faster.
+**Train detector** flattens those sessions into `training/dataset/` and fine-tunes **on top of** `training/weights/visdrone.pt` for 40 epochs at image size 1280. It writes `training/weights/site.pt` and copies that to `best.pt`. `visdrone.pt` is left in place. Process then switches to **Trained detector** with the site weights. CPU training is allowed but slow; a GPU is much faster.
 
 Stock COCO weights miss nadir drone cars. Use a fine-tuned `best.pt`, not `yolo11n.pt` alone.
 
 **Train on VisDrone** (or `python -m traffic_tracker.train_visdrone`) fine-tunes the same YOLO11n on VisDrone2019-DET (~2 GB download). Weights go to `training/weights/visdrone.pt` and are copied to `training/weights/best.pt`. Boxed sessions stay so we can compare. If VisDrone counts better, the site Training feature can be removed later.
 
-Trained detector keeps **cars, vans, trucks, motorcycles, and buses** at confidence **0.30** (Settings slider 0.15–0.60) and IoU **0.45**. People, bicycles, boats, tricycles, and parked vehicles are ignored. Motion mask still counts every moving blob in the size band.
+Trained detector keeps **moving cars, vans, trucks, motorcycles, and buses**. Settings has a **Strict / Balanced / Sensitive** preset plus sliders for confidence (default 0.35), NMS IoU (default 0.40), parked radius, track link speed, and trace jump split. Weights can be **VisDrone**, a **site fine-tune** started from those weights (`training/weights/site.pt`), or a custom `.pt`. People, bicycles, boats, tricycles, and parked boxes stay out of the preview, traces, and counts. Motion mask still counts every moving blob in the size band.
 
 ### Settings
 

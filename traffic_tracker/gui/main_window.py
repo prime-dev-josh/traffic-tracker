@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtGui import QCloseEvent, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -24,6 +25,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QStackedWidget,
     QTabWidget,
@@ -38,19 +40,33 @@ from traffic_tracker.config import (
     APP_VERSION,
     DETECTOR_CONF_MAX,
     DETECTOR_CONF_MIN,
+    DETECTOR_IOU_MAX,
+    DETECTOR_IOU_MIN,
+    DETECTOR_LINK_SPEED_MAX,
+    DETECTOR_LINK_SPEED_MIN,
+    DETECTOR_PARKED_RADIUS_MAX,
+    DETECTOR_PARKED_RADIUS_MIN,
+    DETECTOR_PATH_JUMP_MAX,
+    DETECTOR_PATH_JUMP_MIN,
     TRAIN_MIN_BOXES,
     TRAIN_MIN_FRAMES,
+    TRAIN_SITE_EPOCHS,
 )
 from traffic_tracker.core.geometry import (
     BOUNDS,
     MAX_GATES,
     ORIGINS,
+    MAX_OCCLUSIONS,
+    MAX_ROADWAYS,
     MAX_VEHICLE_REFS,
     Box,
     Geometry,
     Line,
     NamedLine,
+    Polygon,
     Transform,
+    polygon_is_valid,
+    roadway_approach_warnings,
     transform_from_matches,
 )
 
@@ -69,8 +85,18 @@ from traffic_tracker.core.report import (
     build_overview_table,
     build_tmc_summary_table,
 )
-from traffic_tracker.core.settings import AppSettings, clamp_detector_conf, load_settings, save_settings
-from traffic_tracker.core.detector import reset_detector_cache, resolve_detector_weights
+from traffic_tracker.core.settings import (
+    AppSettings,
+    apply_precision_preset,
+    clamp_detector_conf,
+    clamp_detector_iou,
+    clamp_link_speed,
+    clamp_parked_radius,
+    clamp_path_jump,
+    load_settings,
+    save_settings,
+)
+from traffic_tracker.core.detector import reset_detector_cache, weights_for_source
 from traffic_tracker.core.device import device_report
 from traffic_tracker.core.training import (
     LabeledFrame,
@@ -83,9 +109,11 @@ from traffic_tracker.core.training import (
     load_session,
     prior_areas,
     save_session,
+    site_weights_path,
     trained_weights_path,
     training_inventory,
     training_root,
+    visdrone_weights_path,
 )
 from traffic_tracker.gui.style import stylesheet_for
 from traffic_tracker.core.video import (
@@ -125,11 +153,13 @@ class MainWindow(QMainWindow):
         self.project = BundleProject()
         self.geometry = Geometry(frame_width=1, frame_height=1)
         self.settings = load_settings()
+        self._filling_preset = False
         self.export_dir = Path(self.settings.export_dir) if self.settings.export_dir else Path.cwd() / "outputs"
         self.worker: ProcessWorker | None = None
         self.train_worker: TrainWorker | None = None
         self.results: list[ProcessResult] = []
         self._draw_step = "idle"
+        self._roadway_edit: int | None = None
         self._draw_gate_name: str | None = None
         self._redraw_index: int | None = None
         self._redraw_target = None
@@ -205,6 +235,25 @@ class MainWindow(QMainWindow):
         frame.setObjectName("card")
         return frame
 
+    def _wide_button(
+        self,
+        text: str,
+        *,
+        primary: bool = False,
+        danger: bool = False,
+        tooltip: str = "",
+    ) -> QPushButton:
+        button = QPushButton(text)
+        if primary:
+            button.setObjectName("primary")
+        if danger:
+            button.setObjectName("danger")
+        if tooltip:
+            button.setToolTip(tooltip)
+        button.setMinimumHeight(36)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return button
+
     def _build_home_page(self) -> QWidget:
         self.home_stage = HomeStage(
             [
@@ -239,10 +288,11 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(self._step_title("Training"))
         hint = QLabel(
-            "Box every vehicle you can see, including cars stopped at a light. "
+            "Box every vehicle you can see, including parked and queued cars. "
+            "Do not box people, bikes, or boats. "
             "Aim for 150+ frames and 400+ boxes across clips. "
-            f"{TRAIN_MIN_FRAMES} frames and {TRAIN_MIN_BOXES} boxes is the minimum to Train detector. "
-            "North and gates are not required here."
+            f"{TRAIN_MIN_FRAMES} frames and {TRAIN_MIN_BOXES} boxes is the minimum. "
+            "Train detector fine-tunes those boxes on top of the VisDrone weights."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -370,9 +420,9 @@ class MainWindow(QMainWindow):
 
         form.addWidget(self._section("Detection mode"))
         mode_hint = QLabel(
-            "Motion mask is the default. Trained detector uses a YOLO .pt file — "
-            "site weights at training/weights/best.pt if present, otherwise a weights file you choose "
-            "(or yolo11n.pt). You can also change this on the Align step before Process."
+            "Motion mask is the default. Trained detector uses VisDrone weights, "
+            "a site fine-tune started from those weights, or a .pt file you choose. "
+            "You can also change Motion vs Trained on the Align step before Process."
         )
         mode_hint.setObjectName("hint")
         mode_hint.setWordWrap(True)
@@ -391,30 +441,97 @@ class MainWindow(QMainWindow):
         weights_row.addWidget(self.detector_status, 1)
         weights_row.addWidget(choose_weights)
         form.addLayout(weights_row)
-
-        conf_hint = QLabel(
-            "Trained detector keeps cars, vans, trucks, motorcycles, and buses. "
-            "People, bicycles, boats, and parked vehicles are ignored. "
-            "Higher confidence drops extra boxes; lower finds smaller cars."
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Weights"))
+        self.detector_source_combo = QComboBox()
+        self.detector_source_combo.addItem("Site fine-tune", "site")
+        self.detector_source_combo.addItem("VisDrone", "visdrone")
+        self.detector_source_combo.addItem("Custom file", "custom")
+        self.detector_source_combo.setCurrentIndex(
+            max(0, self.detector_source_combo.findData(self.settings.detector_source))
         )
-        conf_hint.setObjectName("hint")
-        conf_hint.setWordWrap(True)
-        form.addWidget(conf_hint)
-        conf_row = QHBoxLayout()
-        self.detector_conf_label = QLabel(self._detector_conf_text(self.settings.detector_conf))
-        self.detector_conf_slider = QSlider(Qt.Orientation.Horizontal)
-        self.detector_conf_slider.setRange(int(DETECTOR_CONF_MIN * 100), int(DETECTOR_CONF_MAX * 100))
-        self.detector_conf_slider.setValue(int(round(self.settings.detector_conf * 100)))
-        self.detector_conf_slider.valueChanged.connect(self._detector_conf_changed)
-        conf_row.addWidget(self.detector_conf_label)
-        conf_row.addWidget(self.detector_conf_slider, 1)
-        form.addLayout(conf_row)
+        self.detector_source_combo.currentIndexChanged.connect(self._detector_source_changed)
+        source_row.addWidget(self.detector_source_combo, 1)
+        form.addLayout(source_row)
+
+        form.addWidget(self._section("Precision"))
+        preset_hint = QLabel(
+            "Strict drops weak boxes and short hops. Sensitive keeps queued cars and longer traces. "
+            "Moving a slider switches the preset to Custom. These apply to Trained detector."
+        )
+        preset_hint.setObjectName("hint")
+        preset_hint.setWordWrap(True)
+        form.addWidget(preset_hint)
+        self.precision_combo = QComboBox()
+        self.precision_combo.addItem("Strict", "strict")
+        self.precision_combo.addItem("Balanced", "balanced")
+        self.precision_combo.addItem("Sensitive", "sensitive")
+        self.precision_combo.addItem("Custom", "custom")
+        self.precision_combo.setCurrentIndex(max(0, self.precision_combo.findData(self.settings.precision_preset)))
+        self.precision_combo.currentIndexChanged.connect(self._precision_preset_changed)
+        form.addWidget(self.precision_combo)
+
+        self.detector_conf_label, self.detector_conf_slider = self._add_setting_slider(
+            form,
+            "Detector confidence: {value:.2f}",
+            int(DETECTOR_CONF_MIN * 100),
+            int(DETECTOR_CONF_MAX * 100),
+            int(round(self.settings.detector_conf * 100)),
+            100.0,
+            "How sure the model must be before it draws a box. "
+            "Raise to hide ghosts, poles, and boats labeled as cars. "
+            "Lower if small moving cars disappear.",
+        )
+        self.detector_iou_label, self.detector_iou_slider = self._add_setting_slider(
+            form,
+            "Overlap (NMS IoU): {value:.2f}",
+            int(DETECTOR_IOU_MIN * 100),
+            int(DETECTOR_IOU_MAX * 100),
+            int(round(self.settings.detector_iou * 100)),
+            100.0,
+            "How much two boxes can overlap before one is removed. "
+            "Raise to keep queued cars as separate boxes. "
+            "Lower if one vehicle is boxed twice.",
+        )
+        self.parked_radius_label, self.parked_radius_slider = self._add_setting_slider(
+            form,
+            "Parked ignore radius: {value:.0f} px",
+            int(DETECTOR_PARKED_RADIUS_MIN),
+            int(DETECTOR_PARKED_RADIUS_MAX),
+            int(round(self.settings.parked_radius)),
+            1.0,
+            "How far a still car can drift (hover) and still stay parked. "
+            "Raise if parked cars start traces. "
+            "Lower if a car that just pulled out is ignored.",
+        )
+        self.link_speed_label, self.link_speed_slider = self._add_setting_slider(
+            form,
+            "Track link speed: {value:.0f} px/s",
+            int(DETECTOR_LINK_SPEED_MIN),
+            int(DETECTOR_LINK_SPEED_MAX),
+            int(round(self.settings.link_speed)),
+            1.0,
+            "How fast a car can move and still keep the same ID. "
+            "Raise to stitch through missed frames. "
+            "Lower if two nearby cars share an ID.",
+        )
+        self.path_jump_label, self.path_jump_slider = self._add_setting_slider(
+            form,
+            "Trace jump split: {value:.0f} px",
+            int(DETECTOR_PATH_JUMP_MIN),
+            int(DETECTOR_PATH_JUMP_MAX),
+            int(round(self.settings.path_jump)),
+            1.0,
+            "If the path hops farther than this, the line is cut. "
+            "Raise to keep one stroke through a gap. "
+            "Lower to stop lot-spanning teleport lines.",
+        )
 
         form.addWidget(self._section("Training data"))
         train_hint = QLabel(
-            "Boxed frames live under training/sessions. Use Training → Train detector to "
-            "fine-tune site weights (training/weights/best.pt). Export a zip to share or back up. "
-            "Import a zip or folder to merge sessions into this machine."
+            "Boxed frames live under training/sessions. Train detector fine-tunes "
+            f"on top of VisDrone for {TRAIN_SITE_EPOCHS} epochs and writes training/weights/site.pt. "
+            "VisDrone weights stay at training/weights/visdrone.pt. Export a zip to share or back up."
         )
         train_hint.setObjectName("hint")
         train_hint.setWordWrap(True)
@@ -444,6 +561,35 @@ class MainWindow(QMainWindow):
         scroll.setWidget(body)
         outer.addWidget(scroll)
         return page
+
+    def _add_setting_slider(
+        self,
+        form: QVBoxLayout,
+        template: str,
+        low: int,
+        high: int,
+        value: int,
+        scale: float,
+        hint: str = "",
+    ) -> tuple[QLabel, QSlider]:
+        row = QHBoxLayout()
+        label = QLabel(template.format(value=value / scale))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(low, high)
+        slider.setValue(value)
+        slider.valueChanged.connect(lambda raw, lab=label, text=template, div=scale: self._detection_slider_changed(lab, text, raw, div))
+        row.addWidget(label)
+        row.addWidget(slider, 1)
+        form.addLayout(row)
+        if hint:
+            slider.setToolTip(hint)
+            label.setToolTip(hint)
+            note = QLabel(hint)
+            note.setObjectName("hint")
+            note.setWordWrap(True)
+            note.setContentsMargins(0, 0, 0, 10)
+            form.addWidget(note)
+        return label, slider
 
     def _section(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -548,8 +694,9 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(self._step_title("2. Draw on the reference frame"))
         self.route_hint = QLabel(
-            "1) Set North  2) Draw entry and exit lines across the lanes  "
-            "3) Box a typical vehicle. Use the buttons on each row to rename, redraw, or delete."
+            "Set North, then add the entry and exit lines that exist. "
+            "Outline the roadway so boats and parking lots are ignored. "
+            "Box a typical vehicle for size. Optionally box dark patches where cars briefly disappear."
         )
         self.route_hint.setObjectName("hint")
         self.route_hint.setWordWrap(True)
@@ -566,45 +713,61 @@ class MainWindow(QMainWindow):
         scroll.setWidget(host)
         left_layout.addWidget(scroll, 1)
 
-        add_row = QHBoxLayout()
-        set_north = QPushButton("Set North")
-        set_north.setObjectName("primary")
+        actions = QGridLayout()
+        actions.setContentsMargins(0, 8, 0, 0)
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
+        set_north = self._wide_button("Set North", primary=True)
         set_north.clicked.connect(self._start_set_north)
-        add_entry = QPushButton("Add entry")
+        add_entry = self._wide_button("Add entry")
         add_entry.clicked.connect(lambda: self._start_draw_lines("start"))
-        add_exit = QPushButton("Add exit")
+        add_exit = self._wide_button("Add exit")
         add_exit.clicked.connect(lambda: self._start_draw_lines("end"))
-        add_mask = QPushButton("Add vehicle")
-        add_mask.setToolTip("Drag a box around one typical vehicle. Add several sizes if needed.")
+        add_mask = self._wide_button(
+            "Add vehicle",
+            tooltip="Drag a box around one typical vehicle. Add several sizes if needed.",
+        )
         add_mask.clicked.connect(self._start_mask_vehicle)
-        add_row.addWidget(set_north)
-        add_row.addWidget(add_entry)
-        add_row.addWidget(add_exit)
-        add_row.addWidget(add_mask)
-        left_layout.addLayout(add_row)
-
-        extra = QHBoxLayout()
-        save_geom = QPushButton("Save")
-        load_geom = QPushButton("Load")
-        clear_geom = QPushButton("Clear all")
-        clear_geom.setObjectName("danger")
+        add_shadow = self._wide_button(
+            "Add drop zone",
+            tooltip="Drag a box over a dark patch, joint, or pole shadow that hides cars.",
+        )
+        add_shadow.clicked.connect(self._start_mask_occlusion)
+        add_road = self._wide_button(
+            "Add roadway",
+            tooltip="Click around the intersection and approaches. Exclude marina, parking, buildings, and sidewalks.",
+        )
+        add_road.clicked.connect(self._start_roadway)
+        self.finish_road_btn = self._wide_button("Finish roadway", primary=True)
+        self.finish_road_btn.clicked.connect(self._finish_roadway)
+        self.finish_road_btn.setVisible(False)
+        self.cancel_road_btn = self._wide_button("Cancel roadway")
+        self.cancel_road_btn.clicked.connect(self._cancel_roadway)
+        self.cancel_road_btn.setVisible(False)
+        save_geom = self._wide_button("Save")
         save_geom.clicked.connect(self._save_geometry)
+        load_geom = self._wide_button("Load")
         load_geom.clicked.connect(self._load_geometry)
+        clear_geom = self._wide_button("Clear all", danger=True)
         clear_geom.clicked.connect(self._clear_geometry_lines)
-        extra.addWidget(save_geom)
-        extra.addWidget(load_geom)
-        extra.addWidget(clear_geom)
-        left_layout.addLayout(extra)
-
-        nav = QHBoxLayout()
-        back = QPushButton("Back")
-        nxt = QPushButton("Next: align clips")
-        nxt.setObjectName("primary")
+        back = self._wide_button("Back")
         back.clicked.connect(lambda: self.stack.setCurrentIndex(PAGE_SETUP))
+        nxt = self._wide_button("Next: align clips", primary=True)
         nxt.clicked.connect(self._go_align)
-        nav.addWidget(back)
-        nav.addWidget(nxt)
-        left_layout.addLayout(nav)
+        actions.addWidget(set_north, 0, 0, 1, 2)
+        actions.addWidget(add_entry, 1, 0)
+        actions.addWidget(add_exit, 1, 1)
+        actions.addWidget(add_mask, 2, 0)
+        actions.addWidget(add_shadow, 2, 1)
+        actions.addWidget(add_road, 3, 0)
+        actions.addWidget(self.finish_road_btn, 3, 1)
+        actions.addWidget(self.cancel_road_btn, 4, 0, 1, 2)
+        actions.addWidget(save_geom, 5, 0)
+        actions.addWidget(load_geom, 5, 1)
+        actions.addWidget(clear_geom, 6, 0, 1, 2)
+        actions.addWidget(back, 7, 0)
+        actions.addWidget(nxt, 7, 1)
+        left_layout.addLayout(actions)
 
         right = self._card()
         right_layout = QVBoxLayout(right)
@@ -617,12 +780,13 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(canvas_header)
         self.canvas = FrameCanvas()
         self.canvas.on_line_drawn = self._on_line_drawn
-        self.canvas.on_box_drawn = self._on_vehicle_mask_drawn
+        self.canvas.on_box_drawn = self._on_setup_box_drawn
+        self.canvas.on_polygon_finished = self._on_roadway_finished
         right_layout.addWidget(self.canvas, 1)
         row.addWidget(left, 0)
         row.addWidget(right, 1)
-        left.setMinimumWidth(400)
-        left.setMaximumWidth(440)
+        left.setMinimumWidth(420)
+        left.setMaximumWidth(480)
         self._refresh_route_list()
         return page
 
@@ -793,8 +957,19 @@ class MainWindow(QMainWindow):
         self.overview_table = QTableWidget()
         self.table = QTableWidget()
         self.tmc_table = QTableWidget()
+        gates_page = QWidget()
+        gates_layout = QVBoxLayout(gates_page)
+        gates_layout.setContentsMargins(0, 0, 0, 0)
+        gates_layout.addWidget(self.table)
+        self.gate_trace = QLabel("Path traces appear here after processing.")
+        self.gate_trace.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.gate_trace.setMinimumHeight(220)
+        trace_scroll = QScrollArea()
+        trace_scroll.setWidgetResizable(True)
+        trace_scroll.setWidget(self.gate_trace)
+        gates_layout.addWidget(trace_scroll, 1)
         self.report_tabs.addTab(self.overview_table, "Overview")
-        self.report_tabs.addTab(self.table, "Gate Statistics")
+        self.report_tabs.addTab(gates_page, "Gate Statistics")
         self.report_tabs.addTab(self.tmc_table, "TMC Summary")
         layout.addWidget(self.report_tabs, 1)
         nav = QHBoxLayout()
@@ -1043,6 +1218,45 @@ class MainWindow(QMainWindow):
             band.setObjectName("hint")
             band.setWordWrap(True)
             self.route_items.addWidget(band)
+
+        self.route_items.addWidget(self._section_label("ROADWAY"))
+        if not self.geometry.roadways:
+            empty = QLabel(
+                "Optional. Click Add roadway and outline the intersection plus approaches. "
+                "Leave the marina, parking lots, buildings, and sidewalks outside. "
+                "With none drawn, the full frame is used."
+            )
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self.route_items.addWidget(empty)
+        for index, poly in enumerate(self.geometry.roadways):
+            self.route_items.addWidget(
+                self._item_row(
+                    f"Roadway {index + 1}  {len(poly.points)} pts",
+                    on_redraw=lambda i=index: self._start_roadway(replace=i),
+                    on_delete=lambda i=index: self._delete_roadway(i),
+                )
+            )
+        for warning in roadway_approach_warnings(self.geometry):
+            note = QLabel(warning)
+            note.setObjectName("hint")
+            note.setWordWrap(True)
+            self.route_items.addWidget(note)
+
+        self.route_items.addWidget(self._section_label("DROP ZONES"))
+        if not self.geometry.occlusions:
+            empty = QLabel("Optional. Click Add drop zone and box a dark patch or joint that hides cars.")
+            empty.setObjectName("hint")
+            empty.setWordWrap(True)
+            self.route_items.addWidget(empty)
+        for index, box in enumerate(self.geometry.occlusions, start=1):
+            self.route_items.addWidget(
+                self._item_row(
+                    f"Drop zone {index}  {int(box.width())}×{int(box.height())}",
+                    on_redraw=lambda mask=box: self._redraw_occlusion_item(mask),
+                    on_delete=lambda mask=box: self._delete_occlusion_item(mask),
+                )
+            )
         if self.geometry.is_ready():
             ready = QLabel("Movements: " + ", ".join(self.geometry.movement_names()))
             ready.setObjectName("hint")
@@ -1094,6 +1308,100 @@ class MainWindow(QMainWindow):
         self.canvas.set_drawing_enabled(True, box=True)
         self.route_hint.setText("On the photo: drag a box around one typical vehicle, then release.")
 
+    def _set_roadway_actions(self, drawing: bool) -> None:
+        self.finish_road_btn.setVisible(drawing)
+        self.cancel_road_btn.setVisible(drawing)
+
+    def _start_roadway(self, *_args, replace=None) -> None:
+        if replace is None and len(self.geometry.roadways) >= MAX_ROADWAYS:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_ROADWAYS} roadway areas. Delete one to add another.")
+            return
+        if replace is not None and not (0 <= int(replace) < len(self.geometry.roadways)):
+            return
+        self._draw_step = "roadway"
+        self._roadway_edit = None if replace is None else int(replace)
+        self._redraw_target = None
+        self.canvas.begin_polygon()
+        self._set_roadway_actions(True)
+        self.route_hint.setText(
+            "Click around the intersection and its approaches. Include pavement on both sides of each gate. "
+            "Exclude the marina, parking lots, buildings, and sidewalks. "
+            "Finish roadway, double-click, or click the first point to close. Cancel roadway discards this shape. "
+            "If you draw none, the full frame is used."
+        )
+
+    def _finish_roadway(self, *_args) -> None:
+        if self._draw_step != "roadway":
+            return
+        points = [(float(point.x()), float(point.y())) for point in self.canvas._poly_points]
+        self.canvas.cancel_polygon()
+        self._on_roadway_finished(points)
+
+    def _cancel_roadway(self, *_args) -> None:
+        self.canvas.cancel_polygon()
+        self._draw_step = "idle"
+        self._roadway_edit = None
+        self._set_roadway_actions(False)
+        self.route_hint.setText("Roadway cancelled. Add roadway when you want to exclude boats and parking.")
+
+    def _on_roadway_finished(self, points: list[tuple[float, float]]) -> None:
+        self._set_roadway_actions(False)
+        if self._draw_step != "roadway" and self._roadway_edit is None and not points:
+            return
+        if not polygon_is_valid(points):
+            self._draw_step = "idle"
+            self._roadway_edit = None
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "A roadway needs at least three separated points that enclose an area.",
+            )
+            self.route_hint.setText("That roadway was not saved. Click Add roadway to try again.")
+            return
+        poly = Polygon([(float(x), float(y)) for x, y in points])
+        if self._roadway_edit is not None and 0 <= self._roadway_edit < len(self.geometry.roadways):
+            self.geometry.roadways[self._roadway_edit] = poly
+        elif len(self.geometry.roadways) >= MAX_ROADWAYS:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_ROADWAYS} roadway areas.")
+            self._draw_step = "idle"
+            return
+        else:
+            self.geometry.roadways.append(poly)
+        self._draw_step = "idle"
+        self._roadway_edit = None
+        self._refresh_route_list()
+        warnings = roadway_approach_warnings(self.geometry)
+        if warnings:
+            self.route_hint.setText("Saved roadway. " + " ".join(warnings))
+        else:
+            self.route_hint.setText(
+                "Saved roadway. Vehicles outside it are ignored. Drop zones only recover brief gaps inside the road."
+            )
+
+    def _delete_roadway(self, index: int) -> None:
+        if not (0 <= index < len(self.geometry.roadways)):
+            return
+        del self.geometry.roadways[index]
+        if self._draw_step == "roadway":
+            self._cancel_roadway()
+        self._refresh_route_list()
+
+    def _start_mask_occlusion(self, *_args, replace=None) -> None:
+        if replace is None and len(self.geometry.occlusions) >= MAX_OCCLUSIONS:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_OCCLUSIONS} drop zones. Delete one to add another.")
+            return
+        live = self._live_occlusion(replace) if replace is not None else None
+        if replace is not None and live is None:
+            return
+        self._draw_step = "occlusion"
+        self._redraw_target = live
+        self._redraw_index = None
+        self.canvas.set_drawing_enabled(True, box=True)
+        self.route_hint.setText(
+            "On the photo: drag a box over the dark patch, joint, or pole shadow. "
+            "Cover the full strip that hides cars, not the whole street."
+        )
+
     def _live_gate(self, item) -> tuple[str, NamedLine] | None:
         if not isinstance(item, NamedLine) or not item.name:
             return None
@@ -1113,6 +1421,14 @@ class MainWindow(QMainWindow):
                 return item
         return None
 
+    def _live_occlusion(self, box) -> Box | None:
+        if not isinstance(box, Box):
+            return None
+        for item in self.geometry.occlusions:
+            if item is box or item == box:
+                return item
+        return None
+
     def _redraw_gate_item(self, item) -> None:
         live = self._live_gate(item)
         if live is None:
@@ -1124,6 +1440,12 @@ class MainWindow(QMainWindow):
         if live is None:
             return
         self._start_mask_vehicle(replace=live)
+
+    def _redraw_occlusion_item(self, box: Box) -> None:
+        live = self._live_occlusion(box)
+        if live is None:
+            return
+        self._start_mask_occlusion(replace=live)
 
     def _delete_gate_item(self, item) -> None:
         live = self._live_gate(item)
@@ -1145,6 +1467,17 @@ class MainWindow(QMainWindow):
         if live is None:
             return
         self.geometry.vehicle_refs = [item for item in self.geometry.vehicle_refs if item is not live]
+        if self._redraw_target is live:
+            self._redraw_target = None
+            self._draw_step = "idle"
+            self.canvas.set_drawing_enabled(False)
+        self._refresh_route_list()
+
+    def _delete_occlusion_item(self, box: Box) -> None:
+        live = self._live_occlusion(box)
+        if live is None:
+            return
+        self.geometry.occlusions = [item for item in self.geometry.occlusions if item is not live]
         if self._redraw_target is live:
             self._redraw_target = None
             self._draw_step = "idle"
@@ -1173,6 +1506,39 @@ class MainWindow(QMainWindow):
         self.geometry.north = None
         self._refresh_route_list()
         self.route_hint.setText("North cleared. Set it again before adding entry or exit lines.")
+
+    def _on_setup_box_drawn(self, box: Box) -> None:
+        if self._draw_step == "occlusion":
+            self._on_occlusion_drawn(box)
+            return
+        self._on_vehicle_mask_drawn(box)
+
+    def _on_occlusion_drawn(self, box: Box) -> None:
+        if self._draw_step != "occlusion":
+            return
+        if box.area() < 20:
+            QMessageBox.information(self, APP_NAME, "That box is too small. Drag over the whole dark patch or joint.")
+            return
+        if self._redraw_target is not None:
+            index = next(
+                (i for i, item in enumerate(self.geometry.occlusions) if item is self._redraw_target),
+                None,
+            )
+            if index is None:
+                return
+            self.geometry.occlusions[index] = box
+        elif len(self.geometry.occlusions) >= MAX_OCCLUSIONS:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_OCCLUSIONS} drop zones.")
+            return
+        else:
+            self.geometry.occlusions.append(box)
+        self._draw_step = "idle"
+        self._redraw_index = None
+        self._redraw_target = None
+        self.canvas.set_drawing_enabled(False)
+        self.canvas.clear_draft()
+        self._refresh_route_list()
+        self.route_hint.setText("Saved drop zone. A car that is lost there keeps its ID and trace through the gap.")
 
     def _on_vehicle_mask_drawn(self, box: Box) -> None:
         if self._draw_step != "vehicle":
@@ -1207,7 +1573,7 @@ class MainWindow(QMainWindow):
         go = QMessageBox.question(
             self,
             APP_NAME,
-            "Clear North, all entry/exit lines, and vehicle masks?",
+            "Clear North, all entry/exit lines, the roadway, vehicle masks, and drop zones?",
         )
         if go != QMessageBox.StandardButton.Yes:
             return
@@ -1215,6 +1581,9 @@ class MainWindow(QMainWindow):
         self.geometry.starts = []
         self.geometry.ends = []
         self.geometry.vehicle_refs = []
+        self.geometry.occlusions = []
+        self.geometry.roadways = []
+        self._set_roadway_actions(False)
         self._draw_step = "idle"
         self._redraw_index = None
         self._redraw_target = None
@@ -1667,11 +2036,12 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.cancel_btn.setEnabled(True)
         mode = self.settings.detector_mode
-        weights = resolve_detector_weights(self.settings.detector_weights)
+        weights = weights_for_source(self.settings.detector_source, self.settings.detector_weights)
         if mode == "trained":
             self._append_log(
                 f"Detection: trained detector  •  {weights}  •  "
-                f"conf {self.settings.detector_conf:.2f}  •  cars/vans/trucks/motorcycles/buses"
+                f"conf {self.settings.detector_conf:.2f}  •  NMS {self.settings.detector_iou:.2f}  •  "
+                f"parked {self.settings.parked_radius:.0f}px  •  link {self.settings.link_speed:.0f}px/s"
             )
         else:
             self._append_log("Detection: motion mask (all vehicles the same)")
@@ -1684,6 +2054,10 @@ class MainWindow(QMainWindow):
             )
         else:
             self._append_log("Box size: default frame band (no vehicle masks or Training boxes)")
+        if self.geometry.roadways:
+            self._append_log(f"Roadway areas: {len(self.geometry.roadways)} (boats and parking outside are ignored)")
+        if self.geometry.occlusions:
+            self._append_log(f"Drop zones: {len(self.geometry.occlusions)} (recover a brief gap; detections inside still count)")
         self._append_log(f"Processing {len(jobs)} clip(s); skipped {len(skipped)}")
         self._append_log(f"Movements: {', '.join(self.geometry.movement_names())}")
 
@@ -1692,8 +2066,12 @@ class MainWindow(QMainWindow):
             export_dir=self.export_dir,
             clock_start=self._clock_start(),
             detector_mode=mode,
-            weights_path=self.settings.detector_weights or str(weights),
+            weights_path=str(weights),
             detector_conf=self.settings.detector_conf,
+            detector_iou=self.settings.detector_iou,
+            parked_radius=self.settings.parked_radius,
+            link_speed=self.settings.link_speed,
+            path_jump=self.settings.path_jump,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.preview.connect(self._on_preview)
@@ -1755,6 +2133,7 @@ class MainWindow(QMainWindow):
             self._fill_table(self.overview_table, None)
             self._fill_table(self.table, None)
             self._fill_table(self.tmc_table, None)
+            self._set_gate_trace(None)
             return
         self.report_clip.setCurrentIndex(0)
         self._show_report_clip()
@@ -1780,6 +2159,7 @@ class MainWindow(QMainWindow):
         self._fill_table(self.overview_table, overview, left_align_first=True)
         self._fill_table(self.table, gates)
         self._fill_table(self.tmc_table, tmc, left_align_first=True)
+        self._set_gate_trace(result.trace_image)
 
     def _fill_table(self, widget: QTableWidget, table, *, left_align_first: bool = False) -> None:
         widget.clear()
@@ -1803,6 +2183,18 @@ class MainWindow(QMainWindow):
         header = widget.horizontalHeader()
         if header is not None:
             header.setStretchLastSection(True)
+
+    def _set_gate_trace(self, frame: np.ndarray | None) -> None:
+        if frame is None:
+            self.gate_trace.clear()
+            self.gate_trace.setText("Path traces appear here after processing.")
+            return
+        rgb = np.ascontiguousarray(frame[:, :, ::-1])
+        height, width, channels = rgb.shape
+        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        self.gate_trace.setText("")
+        self.gate_trace.setPixmap(QPixmap.fromImage(image))
+        self.gate_trace.adjustSize()
 
     def _open_export_dir(self) -> None:
         from PyQt6.QtCore import QUrl
@@ -1857,15 +2249,35 @@ class MainWindow(QMainWindow):
         if hasattr(self, "theme_combo"):
             theme = self.theme_combo.currentData() or "dark"
         conf = self.settings.detector_conf
+        iou = self.settings.detector_iou
+        parked = self.settings.parked_radius
+        link = self.settings.link_speed
+        jump = self.settings.path_jump
+        preset = self.settings.precision_preset
+        source = self.settings.detector_source
         if hasattr(self, "detector_conf_slider"):
             conf = clamp_detector_conf(self.detector_conf_slider.value() / 100.0)
+            iou = clamp_detector_iou(self.detector_iou_slider.value() / 100.0)
+            parked = clamp_parked_radius(self.parked_radius_slider.value())
+            link = clamp_link_speed(self.link_speed_slider.value())
+            jump = clamp_path_jump(self.path_jump_slider.value())
+        if hasattr(self, "precision_combo"):
+            preset = self.precision_combo.currentData() or preset
+        if hasattr(self, "detector_source_combo"):
+            source = self.detector_source_combo.currentData() or source
         self.settings = AppSettings(
             export_dir=str(self.export_dir),
             warn_onedrive=warn,
             detector_mode=mode,
             detector_weights=self.settings.detector_weights,
+            detector_source=source if source in ("site", "visdrone", "custom") else "site",
             theme=theme if theme in ("dark", "light") else "dark",
+            precision_preset=preset if preset in ("strict", "balanced", "sensitive", "custom") else "balanced",
             detector_conf=conf,
+            detector_iou=iou,
+            parked_radius=parked,
+            link_speed=link,
+            path_jump=jump,
         )
         save_settings(self.settings)
         self._refresh_setup_list()
@@ -1873,14 +2285,41 @@ class MainWindow(QMainWindow):
     def _settings_changed(self, *_args) -> None:
         self._persist_settings()
 
-    def _detector_conf_text(self, conf: float) -> str:
-        return f"Detector confidence: {conf:.2f}"
-
-    def _detector_conf_changed(self, value: int) -> None:
-        conf = clamp_detector_conf(value / 100.0)
-        if hasattr(self, "detector_conf_label"):
-            self.detector_conf_label.setText(self._detector_conf_text(conf))
+    def _detection_slider_changed(self, label: QLabel, template: str, raw: int, scale: float) -> None:
+        label.setText(template.format(value=raw / scale))
+        if self._filling_preset:
+            return
+        if hasattr(self, "precision_combo") and self.precision_combo.currentData() != "custom":
+            self.precision_combo.blockSignals(True)
+            self.precision_combo.setCurrentIndex(max(0, self.precision_combo.findData("custom")))
+            self.precision_combo.blockSignals(False)
         self._persist_settings()
+
+    def _precision_preset_changed(self, *_args) -> None:
+        name = self.precision_combo.currentData() or "custom"
+        if name == "custom":
+            self._persist_settings()
+            return
+        tuned = apply_precision_preset(self.settings, name)
+        self._filling_preset = True
+        self.detector_conf_slider.setValue(int(round(tuned.detector_conf * 100)))
+        self.detector_iou_slider.setValue(int(round(tuned.detector_iou * 100)))
+        self.parked_radius_slider.setValue(int(round(tuned.parked_radius)))
+        self.link_speed_slider.setValue(int(round(tuned.link_speed)))
+        self.path_jump_slider.setValue(int(round(tuned.path_jump)))
+        self._filling_preset = False
+        self._persist_settings()
+
+    def _detector_source_changed(self, *_args) -> None:
+        source = self.detector_source_combo.currentData() or "site"
+        if source == "custom":
+            self._choose_detector_weights()
+            return
+        chosen = weights_for_source(source, self.settings.detector_weights)
+        self.settings.detector_weights = str(chosen)
+        self.settings.detector_source = source
+        self._persist_settings()
+        self._refresh_detector_status()
 
     def _detector_mode_changed(self, *_args) -> None:
         sender = self.sender()
@@ -1903,8 +2342,19 @@ class MainWindow(QMainWindow):
             "YOLO weights (*.pt *.onnx);;All files (*.*)",
         )
         if not path:
+            if hasattr(self, "detector_source_combo"):
+                self.detector_source_combo.blockSignals(True)
+                self.detector_source_combo.setCurrentIndex(
+                    max(0, self.detector_source_combo.findData(self.settings.detector_source))
+                )
+                self.detector_source_combo.blockSignals(False)
             return
         self.settings.detector_weights = path
+        self.settings.detector_source = "custom"
+        if hasattr(self, "detector_source_combo"):
+            self.detector_source_combo.blockSignals(True)
+            self.detector_source_combo.setCurrentIndex(max(0, self.detector_source_combo.findData("custom")))
+            self.detector_source_combo.blockSignals(False)
         if hasattr(self, "detector_combo"):
             self.detector_combo.blockSignals(True)
             self.detector_combo.setCurrentIndex(max(0, self.detector_combo.findData("trained")))
@@ -1927,20 +2377,23 @@ class MainWindow(QMainWindow):
         self._refresh_detector_status()
 
     def _refresh_detector_status(self) -> None:
-        weights = resolve_detector_weights(self.settings.detector_weights)
-        if has_trained_weights() and (
-            not self.settings.detector_weights or Path(self.settings.detector_weights) == trained_weights_path()
-        ):
-            text = f"Using site weights: {trained_weights_path()}"
-        elif self.settings.detector_weights and Path(self.settings.detector_weights).is_file():
-            text = f"Using {self.settings.detector_weights}"
+        weights = weights_for_source(self.settings.detector_source, self.settings.detector_weights)
+        source = self.settings.detector_source
+        if source == "visdrone":
+            ready = "ready" if visdrone_weights_path().is_file() else "not trained yet"
+            text = f"VisDrone weights ({ready}): {visdrone_weights_path()}"
+        elif source == "site":
+            site = site_weights_path()
+            if site.is_file():
+                text = f"Site fine-tune: {site}"
+            elif has_trained_weights():
+                text = f"Site weights (best.pt until the next fine-tune): {trained_weights_path()}"
+            else:
+                text = f"No site fine-tune yet. Train detector writes {site.name}."
         elif weights.is_file():
-            text = f"Using {weights} (no site best.pt yet)"
+            text = f"Using {weights}"
         else:
-            text = (
-                f"Will load {weights.name} on process (download if needed). "
-                "Choose a .pt file to use your own weights."
-            )
+            text = f"Will load {weights.name} on process. Choose a .pt file if this is missing."
         if hasattr(self, "detector_status"):
             self.detector_status.setText(text)
         if hasattr(self, "process_detector_status"):
@@ -2113,7 +2566,12 @@ class MainWindow(QMainWindow):
             )
             if go != QMessageBox.StandardButton.Yes:
                 return
-        self._launch_train_worker("site", "Starting site detector training…")
+        self._launch_train_worker(
+            "site",
+            "Starting site fine-tune on top of VisDrone…"
+            if visdrone_weights_path().is_file()
+            else "Starting site detector training from YOLO11n (no VisDrone weights yet)…",
+        )
 
     def _start_visdrone_train(self) -> None:
         if self.train_worker and self.train_worker.isRunning():
@@ -2174,7 +2632,27 @@ class MainWindow(QMainWindow):
         self.train_progress.setValue(self.train_progress.maximum())
         self.train_log.appendPlainText(f"Saved {path}")
         reset_detector_cache()
-        self.settings.detector_weights = str(trained_weights_path())
+        saved = Path(path)
+        if saved.name == "visdrone.pt":
+            self.settings.detector_source = "visdrone"
+            self.settings.detector_weights = str(visdrone_weights_path())
+            done_text = (
+                "VisDrone weights saved. Switch Weights to VisDrone in Settings to compare. "
+                "Train detector still fine-tunes those weights on your boxes."
+            )
+        else:
+            self.settings.detector_source = "site"
+            self.settings.detector_weights = str(saved if saved.is_file() else site_weights_path())
+            done_text = (
+                "Site fine-tune saved on top of VisDrone. Process will use Trained detector "
+                "with the site weights. VisDrone weights were left in place for comparison."
+            )
+        if hasattr(self, "detector_source_combo"):
+            self.detector_source_combo.blockSignals(True)
+            self.detector_source_combo.setCurrentIndex(
+                max(0, self.detector_source_combo.findData(self.settings.detector_source))
+            )
+            self.detector_source_combo.blockSignals(False)
         for combo in (getattr(self, "detector_combo", None), getattr(self, "process_detector_combo", None)):
             if combo is None:
                 continue
@@ -2185,12 +2663,7 @@ class MainWindow(QMainWindow):
         self._refresh_detector_status()
         self._refresh_training_inventory()
         self._refresh_train_ready_status()
-        QMessageBox.information(
-            self,
-            APP_NAME,
-            "Site weights saved. Process will use Trained detector. "
-            "Change it back to Motion mask in Settings if you need the old path.",
-        )
+        QMessageBox.information(self, APP_NAME, done_text)
 
     def _training_pick_video(self) -> None:
         start = str(self.videos[0].parent) if self.videos else ""

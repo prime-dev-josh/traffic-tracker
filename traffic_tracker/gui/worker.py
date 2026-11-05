@@ -8,7 +8,13 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from traffic_tracker.config import DETECTOR_CONF
+from traffic_tracker.config import (
+    DETECTOR_CONF,
+    DETECTOR_IOU,
+    DETECTOR_LINK_SPEED_PX_S,
+    DETECTOR_PARKED_RADIUS,
+    DETECTOR_PATH_JUMP,
+)
 from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
 from traffic_tracker.core.report import Trip, export_tmc_workbook
@@ -31,6 +37,10 @@ class ProcessWorker(QThread):
         detector_mode: str = "motion",
         weights_path: str | None = None,
         detector_conf: float = DETECTOR_CONF,
+        detector_iou: float = DETECTOR_IOU,
+        parked_radius: float = DETECTOR_PARKED_RADIUS,
+        link_speed: float = DETECTOR_LINK_SPEED_PX_S,
+        path_jump: float = DETECTOR_PATH_JUMP,
     ) -> None:
         super().__init__(parent)
         self._jobs = jobs
@@ -39,6 +49,10 @@ class ProcessWorker(QThread):
         self._detector_mode = detector_mode
         self._weights_path = weights_path
         self._detector_conf = detector_conf
+        self._detector_iou = detector_iou
+        self._parked_radius = parked_radius
+        self._link_speed = link_speed
+        self._path_jump = path_jump
         self._cancel = False
 
     def cancel(self) -> None:
@@ -66,6 +80,10 @@ class ProcessWorker(QThread):
                     detector_mode=self._detector_mode,
                     weights_path=self._weights_path,
                     detector_conf=self._detector_conf,
+                    detector_iou=self._detector_iou,
+                    parked_radius=self._parked_radius,
+                    link_speed=self._link_speed,
+                    path_jump=self._path_jump,
                 )
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")
@@ -79,6 +97,7 @@ class ProcessWorker(QThread):
                         duration_s=result.video.duration_s,
                         clock_start=self._clock_start,
                         device_label=result.device_label,
+                        path_image=result.trace_image,
                     )
                 results.append(result)
                 self.video_done.emit(result)

@@ -88,7 +88,8 @@ class RecordCrossingTests(unittest.TestCase):
         pending = _Pending()
         trips: list[Trip] = []
         starts_hit, _ = _record_crossings([(30, 20, 70, 60)], geom, pending, trips, "a.mp4", 1.0)
-        self.assertGreaterEqual(starts_hit, 1)
+        self.assertEqual(starts_hit, 0)
+        self.assertEqual(trips, [])
         _record_crossings([(30, 50, 70, 90)], geom, pending, trips, "a.mp4", 2.0)
         self.assertGreaterEqual(len(trips), 1)
         self.assertEqual(trips[0].start_destination, "N")
@@ -191,17 +192,282 @@ class RecordCrossingTests(unittest.TestCase):
         trips: list[Trip] = []
 
         def run(geom: Geometry) -> list[int]:
-            pending = _Pending(link_speed=180.0)
-            _record_crossings([(20, 180, 50, 210)], geom, pending, trips, "a.mp4", 1.00, moving_only=True, classes=["car"])
-            _record_crossings([(36, 180, 66, 210)], geom, pending, trips, "a.mp4", 1.12, moving_only=True, classes=["car"])
+            pending = _Pending(link_speed=180.0, parked_radius=40.0)
+            for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+                _record_crossings(
+                    [(x, 180, x + 30, 210)],
+                    geom,
+                    pending,
+                    trips,
+                    "a.mp4",
+                    1.00 + step * 0.12,
+                    moving_only=True,
+                    classes=["car"],
+                )
             first = next(iter(pending.live))
-            _record_crossings([(120, 180, 150, 210)], geom, pending, trips, "a.mp4", 1.36, moving_only=True, classes=["car"])
+            self.assertTrue(pending.live[first].active)
+            _record_crossings([(168, 180, 198, 210)], geom, pending, trips, "a.mp4", 1.91, moving_only=True, classes=["car"])
             return first, list(pending.live)
 
         bare_first, bare_ids = run(bare)
         self.assertNotEqual(bare_ids, [bare_first])
         marked_first, marked_ids = run(marked)
         self.assertEqual(marked_ids, [marked_first])
+
+    def test_drop_zone_keeps_id_across_wide_gap(self) -> None:
+        kwargs = dict(
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+        )
+        zone = Box(70, 160, 200, 230)
+        bare = Geometry(400, 400, **kwargs)
+        marked = Geometry(400, 400, **kwargs, occlusions=[zone])
+
+        def run(geom: Geometry) -> tuple[int, list[int], int, int]:
+            pending = _Pending(link_speed=180.0, parked_radius=40.0)
+            trips: list[Trip] = []
+            steps = [
+                (1.00, (20, 180, 50, 210)),
+                (1.12, (36, 180, 66, 210)),
+                (1.24, (52, 180, 82, 210)),
+                (1.36, (68, 180, 98, 210)),
+            ]
+            for when, box in steps:
+                _record_crossings([box], geom, pending, trips, "a.mp4", when, moving_only=True, classes=["car"])
+            first = next(iter(pending.live))
+            self.assertTrue(pending.live[first].active)
+            path_before = len(pending.live[first].path)
+            _record_crossings([], geom, pending, trips, "a.mp4", 1.48, moving_only=True)
+            _record_crossings([], geom, pending, trips, "a.mp4", 1.60, moving_only=True)
+            path_after_coast = len(pending.live[first].path) if first in pending.live else path_before
+            _record_crossings([(220, 180, 250, 210)], geom, pending, trips, "a.mp4", 2.21, moving_only=True, classes=["car"])
+            return first, list(pending.live), path_before, path_after_coast
+
+        bare_first, bare_ids, _, _ = run(bare)
+        self.assertNotEqual(bare_ids, [bare_first])
+        marked_first, marked_ids, path_before, path_after_coast = run(marked)
+        self.assertEqual(marked_ids, [marked_first])
+        self.assertGreater(path_after_coast, path_before)
+
+    def test_drop_zone_neighbor_keeps_own_id(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210)],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car"],
+            )
+        a_tid = next(iter(pending.live))
+        self.assertTrue(pending.live[a_tid].active)
+        _record_crossings([(80, 20, 110, 50)], geom, pending, trips, "a.mp4", 1.48, moving_only=True, classes=["car"])
+        self.assertIn(a_tid, pending.live)
+        others = [tid for tid in pending.live if tid != a_tid]
+        self.assertEqual(len(others), 1)
+        b_tid = others[0]
+        self.assertNotEqual(b_tid, a_tid)
+        _record_crossings(
+            [(220, 180, 250, 210), (80, 20, 110, 50)],
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            1.72,
+            moving_only=True,
+            classes=["car", "car"],
+        )
+        self.assertIn(a_tid, pending.live)
+        self.assertIn(b_tid, pending.live)
+        self.assertGreater(pending.live[a_tid].xy[1], 140.0)
+        self.assertLess(pending.live[b_tid].xy[1], 80.0)
+
+    def test_drop_zone_ignores_interior_detection(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0, path_jump=60.0)
+        trips: list[Trip] = []
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210)],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car"],
+            )
+        tid = next(iter(pending.live))
+        self.assertTrue(pending.live[tid].active)
+        ghost = (120, 175, 150, 205)
+        _record_crossings([ghost], geom, pending, trips, "a.mp4", 1.80, moving_only=True, classes=["car"])
+        self.assertEqual(list(pending.live), [tid])
+        self.assertGreater(pending.live[tid].xy[0], 120.0)
+        _record_crossings([(220, 180, 250, 210)], geom, pending, trips, "a.mp4", 2.50, moving_only=True, classes=["car"])
+        self.assertEqual(list(pending.live), [tid])
+        chunks = _path_chunks(pending.live[tid].path, 60.0, geom)
+        self.assertEqual(len(chunks), 1)
+        self.assertGreater(chunks[0][-1][0], 200.0)
+
+    def test_drop_zone_hop_stays_one_path_chunk(self) -> None:
+        points = [(40.0, 195.0), (220.0, 195.0)]
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        self.assertEqual(_path_chunks(points, 90.0), [])
+        chunks = _path_chunks(points, 90.0, geom)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0][-1], (220.0, 195.0))
+
+    def test_drop_zone_keeps_id_when_car_weaves(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0, path_jump=60.0)
+        trips: list[Trip] = []
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210)],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car"],
+            )
+        tid = next(iter(pending.live))
+        _record_crossings([], geom, pending, trips, "a.mp4", 1.48, moving_only=True)
+        _record_crossings([(210, 230, 240, 260)], geom, pending, trips, "a.mp4", 2.26, moving_only=True, classes=["car"])
+        self.assertEqual(list(pending.live), [tid])
+        chunks = _path_chunks(pending.live[tid].path, 60.0, geom)
+        self.assertEqual(len(chunks), 1)
+
+    def test_drop_zone_does_not_jump_to_far_car(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210)],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car"],
+            )
+        a_tid = next(iter(pending.live))
+        _record_crossings([], geom, pending, trips, "a.mp4", 1.48, moving_only=True)
+        _record_crossings([(300, 10, 330, 40)], geom, pending, trips, "a.mp4", 1.72, moving_only=True, classes=["car"])
+        self.assertIn(a_tid, pending.live)
+        far = [state for tid, state in pending.live.items() if tid != a_tid]
+        self.assertEqual(len(far), 1)
+        self.assertLess(pending.live[a_tid].xy[0], 160.0)
+        self.assertGreater(far[0].xy[0], 280.0)
+        self.assertLess(far[0].xy[1], 60.0)
+
+    def test_parked_beside_drop_zone_stays_untraced(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        parked = (40, 80, 70, 110)
+        for step in range(6):
+            _record_crossings(
+                [parked],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.0 + step * 0.2,
+                moving_only=True,
+                classes=["car"],
+            )
+        self.assertEqual(len(pending.live), 1)
+        state = next(iter(pending.live.values()))
+        self.assertFalse(state.active)
+        self.assertEqual(state.path, [])
+
+    def test_drop_zone_does_not_jump_to_parked_car(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        parked = (230, 80, 260, 110)
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210), parked],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car", "car"],
+            )
+        mover = next(state for state in pending.live.values() if state.active)
+        parked_state = next(state for state in pending.live.values() if not state.active)
+        mover_tid, parked_tid = mover.tid, parked_state.tid
+        _record_crossings([parked], geom, pending, trips, "a.mp4", 1.48, moving_only=True, classes=["car"])
+        _record_crossings([parked], geom, pending, trips, "a.mp4", 1.72, moving_only=True, classes=["car"])
+        self.assertIn(parked_tid, pending.live)
+        self.assertFalse(pending.live[parked_tid].active)
+        self.assertEqual(pending.live[parked_tid].path, [])
+        self.assertLess(pending.live[parked_tid].xy[1], 120.0)
+        if mover_tid in pending.live:
+            self.assertGreater(pending.live[mover_tid].xy[1], 150.0)
+            self.assertTrue(all(point[1] > 140.0 for point in pending.live[mover_tid].path))
 
     def test_close_moving_cars_keep_separate_tracks(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
@@ -271,7 +537,7 @@ class RecordCrossingTests(unittest.TestCase):
         pending = _Pending()
         trips: list[Trip] = []
         for step in range(12):
-            y = 120.0 + step * 6.0
+            y = 120.0 + (8.0 if step % 2 else -8.0)
             _record_crossings(
                 [(180, y, 220, y + 40)],
                 geom,

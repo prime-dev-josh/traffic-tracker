@@ -16,12 +16,15 @@ START_COLOR = QColor(0, 230, 120)
 END_COLOR = QColor(255, 56, 56)
 NORTH_COLOR = QColor(40, 200, 255)
 VEHICLE_COLOR = QColor(255, 20, 220)
+OCCLUSION_COLOR = QColor(255, 170, 0)
+ROADWAY_COLOR = QColor(80, 170, 255, 70)
+ROADWAY_EDGE = QColor(120, 200, 255)
 DRAFT_COLOR = QColor(40, 200, 255)
 LABEL_COLOR = QColor(255, 255, 255)
 MATCH_COLOR = QColor(255, 20, 220)
 HALO_COLOR = QColor(0, 0, 0)
 
-Mode = str  # view | draw | nudge | match
+Mode = str  # view | draw | nudge | match | polygon
 
 
 class FrameCanvas(QWidget):
@@ -42,8 +45,10 @@ class FrameCanvas(QWidget):
         self._nudge_last: QPointF | None = None
         self._match_points: list[tuple[float, float]] = []
         self._draft_box = False
+        self._poly_points: list[QPointF] = []
         self.on_line_drawn: Callable[[Line], None] | None = None
         self.on_box_drawn: Callable[[Box], None] | None = None
+        self.on_polygon_finished: Callable[[list[tuple[float, float]]], None] | None = None
         self.on_nudge: Callable[[float, float], None] | None = None
         self.on_scale: Callable[[float], None] | None = None
         self.on_point: Callable[[float, float], None] | None = None
@@ -52,9 +57,27 @@ class FrameCanvas(QWidget):
         self._mode = mode
         if mode != "draw":
             self.clear_draft()
+        if mode != "polygon":
+            self._poly_points = []
         if mode != "nudge":
             self._nudge_last = None
         self.update()
+
+    def begin_polygon(self) -> None:
+        self._poly_points = []
+        self.set_mode("polygon")
+
+    def cancel_polygon(self) -> None:
+        self._poly_points = []
+        self.set_mode("view")
+
+    def finish_polygon(self) -> list[tuple[float, float]] | None:
+        points = [(float(point.x()), float(point.y())) for point in self._poly_points]
+        self._poly_points = []
+        self.set_mode("view")
+        if self.on_polygon_finished and len(points) >= 3:
+            self.on_polygon_finished(points)
+        return points if len(points) >= 3 else None
 
     def set_match_points(self, points: list[tuple[float, float]]) -> None:
         self._match_points = list(points)
@@ -139,6 +162,21 @@ class FrameCanvas(QWidget):
         image_pos = self._widget_to_image(event.position())
         if image_pos is None:
             return
+        if self._mode == "polygon" and event.button() == Qt.MouseButton.LeftButton:
+            if self._poly_points:
+                first = self._poly_points[0]
+                if len(self._poly_points) >= 3 and abs(image_pos.x() - first.x()) <= 12 and abs(image_pos.y() - first.y()) <= 12:
+                    self.finish_polygon()
+                    return
+                last = self._poly_points[-1]
+                if abs(image_pos.x() - last.x()) <= 2 and abs(image_pos.y() - last.y()) <= 2:
+                    return
+            self._poly_points.append(image_pos)
+            self.update()
+            return
+        if self._mode == "polygon" and event.button() == Qt.MouseButton.RightButton:
+            self.cancel_polygon()
+            return
         if self._mode == "match" and event.button() == Qt.MouseButton.LeftButton:
             if self.on_point:
                 self.on_point(float(image_pos.x()), float(image_pos.y()))
@@ -167,6 +205,19 @@ class FrameCanvas(QWidget):
         if image_pos is not None:
             self._draft_end = image_pos
             self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._mode == "polygon" and event.button() == Qt.MouseButton.LeftButton and len(self._poly_points) >= 3:
+            self.finish_polygon()
+
+    def keyPressEvent(self, event) -> None:
+        if self._mode == "polygon" and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.finish_polygon()
+            return
+        if self._mode == "polygon" and event.key() == Qt.Key.Key_Escape:
+            self.cancel_polygon()
+            return
+        super().keyPressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._mode == "nudge" and event.button() == Qt.MouseButton.LeftButton:
@@ -263,6 +314,31 @@ class FrameCanvas(QWidget):
             draw_halo_rect(QRectF(p1, p2).normalized(), VEHICLE_COLOR)
             w, h = int(box.width()), int(box.height())
             draw_halo_text(p1 + QPointF(6, -6), f"Vehicle {index}  {w}×{h}", VEHICLE_COLOR)
+        for index, raw in enumerate(geom.occlusions, start=1):
+            box = raw.normalized()
+            p1 = self._image_to_widget(box.x1, box.y1)
+            p2 = self._image_to_widget(box.x2, box.y2)
+            draw_halo_rect(QRectF(p1, p2).normalized(), OCCLUSION_COLOR)
+            draw_halo_text(p1 + QPointF(6, -6), f"Drop zone {index}", OCCLUSION_COLOR)
+        for index, poly in enumerate(geom.roadways, start=1):
+            if len(poly.points) < 3:
+                continue
+            widget_pts = QPolygonF([self._image_to_widget(x, y) for x, y in poly.points])
+            painter.setPen(QPen(ROADWAY_EDGE, 2))
+            painter.setBrush(ROADWAY_COLOR)
+            painter.drawPolygon(widget_pts)
+            draw_halo_text(widget_pts.at(0) + QPointF(6, -6), f"Roadway {index}", ROADWAY_EDGE)
+        if self._poly_points:
+            draft = QPolygonF([self._image_to_widget(point.x(), point.y()) for point in self._poly_points])
+            painter.setPen(QPen(DRAFT_COLOR, 2))
+            painter.setBrush(QColor(40, 200, 255, 40))
+            if len(self._poly_points) >= 3:
+                painter.drawPolygon(draft)
+            else:
+                painter.drawPolyline(draft)
+            for point in draft:
+                painter.setBrush(DRAFT_COLOR)
+                painter.drawEllipse(point, 4, 4)
 
         if self._draft_start is not None and self._draft_end is not None:
             p1 = self._image_to_widget(self._draft_start.x(), self._draft_start.y())
