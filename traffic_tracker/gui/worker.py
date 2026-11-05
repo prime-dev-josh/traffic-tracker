@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+from traffic_tracker.config import DETECTOR_CONF
 from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
 from traffic_tracker.core.report import Trip, export_tmc_workbook
@@ -29,6 +30,7 @@ class ProcessWorker(QThread):
         parent: QObject | None = None,
         detector_mode: str = "motion",
         weights_path: str | None = None,
+        detector_conf: float = DETECTOR_CONF,
     ) -> None:
         super().__init__(parent)
         self._jobs = jobs
@@ -36,6 +38,7 @@ class ProcessWorker(QThread):
         self._clock_start = clock_start
         self._detector_mode = detector_mode
         self._weights_path = weights_path
+        self._detector_conf = detector_conf
         self._cancel = False
 
     def cancel(self) -> None:
@@ -62,6 +65,7 @@ class ProcessWorker(QThread):
                     preview_cb=preview_cb,
                     detector_mode=self._detector_mode,
                     weights_path=self._weights_path,
+                    detector_conf=self._detector_conf,
                 )
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")

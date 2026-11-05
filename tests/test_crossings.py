@@ -137,6 +137,42 @@ class RecordCrossingTests(unittest.TestCase):
         _expire_tracks(pending, geom, trips, "a.mp4", 8.0)
         self.assertNotIn(tid, pending.live)
 
+    def test_trained_mode_skips_parked_and_inferred_trips(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+        )
+        pending = _Pending()
+        trips: list[Trip] = []
+        parked = [(180, 100, 220, 140)]
+        _record_crossings(parked, geom, pending, trips, "a.mp4", 1.0, moving_only=True)
+        _record_crossings(parked, geom, pending, trips, "a.mp4", 2.0, moving_only=True)
+        self.assertEqual(trips, [])
+        inferred = _expire_tracks(pending, geom, trips, "a.mp4", 10.0, coast_s=0.0, infer_path=False)
+        self.assertEqual(inferred, 0)
+        self.assertEqual(trips, [])
+
+        moving = _Pending()
+        _record_crossings([(180, 100, 220, 140)], geom, moving, trips, "a.mp4", 1.0, moving_only=True)
+        _record_crossings([(180, 250, 220, 290)], geom, moving, trips, "a.mp4", 2.0, moving_only=True)
+        inferred = _expire_tracks(moving, geom, trips, "a.mp4", 10.0, coast_s=0.0, infer_path=False)
+        self.assertEqual(inferred, 0)
+        self.assertEqual(trips, [])
+
+    def test_trained_mode_counts_moving_gate_pair(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0, moving_only=True)
+        self.assertEqual(trips, [])
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0, moving_only=True)
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(trips[0].start_destination, "N")
+        self.assertEqual(trips[0].end_destination, "SB")
+
 
 if __name__ == "__main__":
     unittest.main()

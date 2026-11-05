@@ -8,10 +8,10 @@ import unittest
 
 import numpy as np
 
-from traffic_tracker.config import TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
+from traffic_tracker.config import DETECTOR_CONF, TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
 from traffic_tracker.core.detector import boxes_from_detector, keep_detector_class, resolve_detector_weights
+from traffic_tracker.core.settings import AppSettings, clamp_detector_conf, load_settings, save_settings
 from traffic_tracker.core.geometry import Box, Geometry, area_limits_from_areas, merge_area_limits
-from traffic_tracker.core.settings import AppSettings, load_settings, save_settings
 from traffic_tracker.core.trainer import yolo_train_device
 from traffic_tracker.core.training import (
     LabeledFrame,
@@ -129,6 +129,7 @@ class SettingsTests(unittest.TestCase):
                     warn_onedrive=False,
                     detector_mode="trained",
                     theme="light",
+                    detector_conf=0.4,
                 ),
                 base=base,
             )
@@ -137,6 +138,13 @@ class SettingsTests(unittest.TestCase):
             self.assertFalse(loaded.warn_onedrive)
             self.assertEqual(loaded.detector_mode, "trained")
             self.assertEqual(loaded.theme, "light")
+            self.assertAlmostEqual(loaded.detector_conf, 0.4)
+
+    def test_detector_conf_clamps(self) -> None:
+        self.assertEqual(clamp_detector_conf(0.4), 0.4)
+        self.assertEqual(clamp_detector_conf(-1), 0.15)
+        self.assertEqual(clamp_detector_conf(2), 0.60)
+        self.assertEqual(clamp_detector_conf("nope"), DETECTOR_CONF)
 
 
 class DetectorWeightsTests(unittest.TestCase):
@@ -172,10 +180,16 @@ class DetectorWeightsTests(unittest.TestCase):
             9: "motor",
         }
         self.assertTrue(keep_detector_class(names, 3))
+        self.assertTrue(keep_detector_class(names, 4))
+        self.assertTrue(keep_detector_class(names, 5))
         self.assertTrue(keep_detector_class(names, 8))
         self.assertTrue(keep_detector_class(names, 9))
         self.assertFalse(keep_detector_class(names, 0))
+        self.assertFalse(keep_detector_class(names, 1))
         self.assertFalse(keep_detector_class(names, 2))
+        self.assertFalse(keep_detector_class(names, 6))
+        self.assertFalse(keep_detector_class(names, 7))
+        self.assertFalse(keep_detector_class({8: "boat", 2: "car"}, 8))
 
     def test_site_single_class_keeps_all(self) -> None:
         self.assertTrue(keep_detector_class({0: "vehicle"}, 0))

@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from traffic_tracker.config import (
+    DETECTOR_CONF,
     MOTION_COAST_S,
     MOTION_HOLD_S,
     MOTION_HOLD_SPEED_PX_S,
@@ -104,6 +105,7 @@ def process_video(
     training_base: Path | None = None,
     detector_mode: str = "motion",
     weights_path: str | None = None,
+    detector_conf: float = DETECTOR_CONF,
 ) -> ProcessResult:
     """Process one video. Moving blobs or YOLO boxes in the size band are vehicles."""
     del device, overhead_drone
@@ -181,7 +183,11 @@ def process_video(
             elapsed_s = frame_idx / info.fps
             if use_detector and detector is not None:
                 boxes, mask = boxes_from_detector(
-                    detector, frame, min_area=min_area, max_area=max_area
+                    detector,
+                    frame,
+                    min_area=min_area,
+                    max_area=max_area,
+                    conf=detector_conf,
                 )
             else:
                 freeze = [
@@ -201,13 +207,21 @@ def process_video(
 
             if use_detector or elapsed_s >= MOTION_WARMUP_S:
                 starts, ends = _record_crossings(
-                    boxes, fitted, pending, trips, info.name, elapsed_s
+                    boxes,
+                    fitted,
+                    pending,
+                    trips,
+                    info.name,
+                    elapsed_s,
+                    moving_only=use_detector,
                 )
                 start_crossings += starts
                 end_crossings += ends
                 if boxes or pending.live:
                     frames_with_tracks += 1
-                end_crossings += _expire_tracks(pending, fitted, trips, info.name, elapsed_s)
+                end_crossings += _expire_tracks(
+                    pending, fitted, trips, info.name, elapsed_s, infer_path=not use_detector
+                )
 
             if preview_cb and (frame_idx == 1 or frame_idx % preview_every == 0):
                 preview = _draw_motion_preview(frame, mask, boxes, pending, fitted)
@@ -223,7 +237,13 @@ def process_video(
         cap.release()
 
     end_crossings += _expire_tracks(
-        pending, fitted, trips, info.name, (frame_idx / max(info.fps, 1e-6)) + MOTION_COAST_S + 1.0, coast_s=0.0
+        pending,
+        fitted,
+        trips,
+        info.name,
+        (frame_idx / max(info.fps, 1e-6)) + MOTION_COAST_S + 1.0,
+        coast_s=0.0,
+        infer_path=not use_detector,
     )
     if progress_cb:
         progress_cb(info.frame_count or frame_idx, info.frame_count or frame_idx, f"Finished {info.name}")
@@ -350,6 +370,12 @@ def _min_travel(geometry: Geometry) -> float:
     return max(40.0, 0.08 * min(geometry.frame_width, geometry.frame_height))
 
 
+def _has_moved(state: _TrackState, xy: tuple[float, float], geometry: Geometry) -> bool:
+    """Parked boxes stay put; moving vehicles travel at least _min_travel from first sight."""
+    travel = ((xy[0] - state.first_xy[0]) ** 2 + (xy[1] - state.first_xy[1]) ** 2) ** 0.5
+    return travel >= _min_travel(geometry)
+
+
 def _point_side(xy: tuple[float, float], geometry: Geometry) -> str | None:
     if geometry.north is None:
         return None
@@ -469,7 +495,14 @@ def _release_track_hold(state: _TrackState) -> None:
     state.last_xyxy = None
 
 
-def _finalize_track(state: _TrackState, geometry: Geometry, trips: list[Trip], video_name: str) -> int:
+def _finalize_track(
+    state: _TrackState,
+    geometry: Geometry,
+    trips: list[Trip],
+    video_name: str,
+    *,
+    infer_path: bool = True,
+) -> int:
     """Finish a dead track from last side or first→last path when gates were missed."""
     if state.start is not None:
         last_side = _point_side(state.xy, geometry)
@@ -490,7 +523,7 @@ def _finalize_track(state: _TrackState, geometry: Geometry, trips: list[Trip], v
             state.had_gate_trip = True
             return 1
         return 0
-    if state.had_gate_trip:
+    if not infer_path or state.had_gate_trip:
         return 0
     first_side = _point_side(state.first_xy, geometry)
     last_side = _point_side(state.xy, geometry)
@@ -542,6 +575,7 @@ def _expire_tracks(
     now_s: float,
     *,
     coast_s: float | None = None,
+    infer_path: bool = True,
 ) -> int:
     keep: dict[int, _TrackState] = {}
     inferred = 0
@@ -551,7 +585,7 @@ def _expire_tracks(
             limit = coast_s
         age = now_s - state.last_motion_s
         if age > limit:
-            inferred += _finalize_track(state, geometry, trips, video_name)
+            inferred += _finalize_track(state, geometry, trips, video_name, infer_path=infer_path)
         else:
             keep[tid] = state
     pending.live = keep
@@ -565,6 +599,8 @@ def _record_crossings(
     trips: list[Trip],
     video_name: str,
     elapsed_s: float,
+    *,
+    moving_only: bool = False,
 ) -> tuple[int, int]:
     gates = [(_gate_origin(item, geometry), item.line) for item in (*geometry.starts, *geometry.ends)]
     pad = max(32.0, 0.03 * max(geometry.frame_width, geometry.frame_height))
@@ -586,6 +622,11 @@ def _record_crossings(
         state.last_xyxy = (x1, y1, x2, y2)
         state.sightings += 0 if is_new else 1
         state.holding = False
+        if moving_only and not _has_moved(state, xy, geometry):
+            state.xy = xy
+            state.last_time_s = elapsed_s
+            state.last_motion_s = elapsed_s
+            continue
         added_s, added_e = _apply_gate_hits(
             state, state.xy, xy, (x1, y1, x2, y2), gates, pad, trips, video_name, elapsed_s
         )
@@ -604,6 +645,10 @@ def _record_crossings(
         state.holding = True
         state.speed = min(state.speed, MOTION_HOLD_SPEED_PX_S)
         x1, y1, x2, y2 = state.last_xyxy
+        if moving_only and not _has_moved(state, state.xy, geometry):
+            state.last_time_s = elapsed_s
+            seen.add(state.tid)
+            continue
         added_s, added_e = _apply_gate_hits(
             state, state.xy, state.xy, (x1, y1, x2, y2), gates, pad, trips, video_name, elapsed_s
         )

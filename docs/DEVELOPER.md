@@ -175,7 +175,7 @@ Route masks live on the drawing step. Training boxes live in `training/sessions/
 - Minimum to train: `TRAIN_MIN_FRAMES` (20) and `TRAIN_MIN_BOXES` (40).
 - North/gates are not required.
 
-`traffic_tracker/core/trainer.py` fine-tunes `yolo11n.pt` for 60 epochs at imgsz 1280 on a `TrainWorker` thread. Site boxing writes `training/weights/best.pt`. **Train on VisDrone** (`python -m traffic_tracker.train_visdrone`) downloads VisDrone2019-DET, writes `training/weights/visdrone.pt`, and copies it to `best.pt`. Detector keeps VisDrone motor-vehicle classes (car, van, truck, bus, motor, tricycles) and drops people/bicycles. Do not run a live train in unit tests. The boxed Training UI stays until VisDrone is proven better.
+`traffic_tracker/core/trainer.py` fine-tunes `yolo11n.pt` for 60 epochs at imgsz 1280 on a `TrainWorker` thread. Site boxing writes `training/weights/best.pt`. **Train on VisDrone** (`python -m traffic_tracker.train_visdrone`) downloads VisDrone2019-DET, writes `training/weights/visdrone.pt`, and copies it to `best.pt`. Detector keeps cars, vans, trucks, buses, and motorcycles (`DETECTOR_CONF` 0.30, `DETECTOR_IOU` 0.45) and drops people, bicycles, boats, and tricycles. Trained mode also skips parked boxes (no travel) and does not infer first→last trips without a gate start. Do not run a live train in unit tests. The boxed Training UI stays until VisDrone is proven better.
 
 ## Project file
 

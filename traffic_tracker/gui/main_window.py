@@ -33,7 +33,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from traffic_tracker.config import APP_NAME, APP_VERSION, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
+from traffic_tracker.config import (
+    APP_NAME,
+    APP_VERSION,
+    DETECTOR_CONF_MAX,
+    DETECTOR_CONF_MIN,
+    TRAIN_MIN_BOXES,
+    TRAIN_MIN_FRAMES,
+)
 from traffic_tracker.core.geometry import (
     BOUNDS,
     MAX_GATES,
@@ -62,7 +69,7 @@ from traffic_tracker.core.report import (
     build_overview_table,
     build_tmc_summary_table,
 )
-from traffic_tracker.core.settings import AppSettings, load_settings, save_settings
+from traffic_tracker.core.settings import AppSettings, clamp_detector_conf, load_settings, save_settings
 from traffic_tracker.core.detector import reset_detector_cache, resolve_detector_weights
 from traffic_tracker.core.device import device_report
 from traffic_tracker.core.training import (
@@ -384,6 +391,24 @@ class MainWindow(QMainWindow):
         weights_row.addWidget(self.detector_status, 1)
         weights_row.addWidget(choose_weights)
         form.addLayout(weights_row)
+
+        conf_hint = QLabel(
+            "Trained detector keeps cars, vans, trucks, motorcycles, and buses. "
+            "People, bicycles, boats, and parked vehicles are ignored. "
+            "Higher confidence drops extra boxes; lower finds smaller cars."
+        )
+        conf_hint.setObjectName("hint")
+        conf_hint.setWordWrap(True)
+        form.addWidget(conf_hint)
+        conf_row = QHBoxLayout()
+        self.detector_conf_label = QLabel(self._detector_conf_text(self.settings.detector_conf))
+        self.detector_conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.detector_conf_slider.setRange(int(DETECTOR_CONF_MIN * 100), int(DETECTOR_CONF_MAX * 100))
+        self.detector_conf_slider.setValue(int(round(self.settings.detector_conf * 100)))
+        self.detector_conf_slider.valueChanged.connect(self._detector_conf_changed)
+        conf_row.addWidget(self.detector_conf_label)
+        conf_row.addWidget(self.detector_conf_slider, 1)
+        form.addLayout(conf_row)
 
         form.addWidget(self._section("Training data"))
         train_hint = QLabel(
@@ -1644,7 +1669,10 @@ class MainWindow(QMainWindow):
         mode = self.settings.detector_mode
         weights = resolve_detector_weights(self.settings.detector_weights)
         if mode == "trained":
-            self._append_log(f"Detection: trained detector  •  {weights}")
+            self._append_log(
+                f"Detection: trained detector  •  {weights}  •  "
+                f"conf {self.settings.detector_conf:.2f}  •  cars/vans/trucks/motorcycles/buses"
+            )
         else:
             self._append_log("Detection: motion mask (all vehicles the same)")
         limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
@@ -1665,6 +1693,7 @@ class MainWindow(QMainWindow):
             clock_start=self._clock_start(),
             detector_mode=mode,
             weights_path=self.settings.detector_weights or str(weights),
+            detector_conf=self.settings.detector_conf,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.preview.connect(self._on_preview)
@@ -1827,17 +1856,30 @@ class MainWindow(QMainWindow):
         theme = self.settings.theme
         if hasattr(self, "theme_combo"):
             theme = self.theme_combo.currentData() or "dark"
+        conf = self.settings.detector_conf
+        if hasattr(self, "detector_conf_slider"):
+            conf = clamp_detector_conf(self.detector_conf_slider.value() / 100.0)
         self.settings = AppSettings(
             export_dir=str(self.export_dir),
             warn_onedrive=warn,
             detector_mode=mode,
             detector_weights=self.settings.detector_weights,
             theme=theme if theme in ("dark", "light") else "dark",
+            detector_conf=conf,
         )
         save_settings(self.settings)
         self._refresh_setup_list()
 
     def _settings_changed(self, *_args) -> None:
+        self._persist_settings()
+
+    def _detector_conf_text(self, conf: float) -> str:
+        return f"Detector confidence: {conf:.2f}"
+
+    def _detector_conf_changed(self, value: int) -> None:
+        conf = clamp_detector_conf(value / 100.0)
+        if hasattr(self, "detector_conf_label"):
+            self.detector_conf_label.setText(self._detector_conf_text(conf))
         self._persist_settings()
 
     def _detector_mode_changed(self, *_args) -> None:

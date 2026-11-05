@@ -56,3 +56,9 @@ TRAIN_PATIENCE = 15
 TRAIN_VAL_FRACTION = 0.2
 TRAIN_SPLIT_SEED = 42
 SETTINGS_FILE_NAME = "app_settings.json"
+
+# Trained detector inference. Low conf overcounts ghosts; raise if still high.
+DETECTOR_CONF = 0.30
+DETECTOR_CONF_MIN = 0.15
+DETECTOR_CONF_MAX = 0.60
+DETECTOR_IOU = 0.45

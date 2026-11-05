@@ -90,12 +90,15 @@ Stock COCO weights miss nadir drone cars. Use a fine-tuned `best.pt`, not `yolo1
 
 **Train on VisDrone** (or `python -m traffic_tracker.train_visdrone`) fine-tunes the same YOLO11n on VisDrone2019-DET (~2 GB download). Weights go to `training/weights/visdrone.pt` and are copied to `training/weights/best.pt`. Boxed sessions stay so we can compare. If VisDrone counts better, the site Training feature can be removed later.
 
+Trained detector keeps **cars, vans, trucks, motorcycles, and buses** at confidence **0.30** (Settings slider 0.15–0.60) and IoU **0.45**. People, bicycles, boats, tricycles, and parked vehicles are ignored. Motion mask still counts every moving blob in the size band.
+
 ### Settings
 
 - Dark / Light theme.
 - Default export folder (also on the Process videos page).
 - OneDrive warning on/off.
 - Detection mode: Motion (default) or Trained detector (YOLO). After **Train detector**, the app selects the site weights. You can still choose another `.pt` or switch back to Motion on Align before Process.
+- Detector confidence (trained mode only). Raise it if the count is still high.
 - Training data: view sessions, export a zip, import a zip or folder, open the `training/` folder.
 
 ## Tests
