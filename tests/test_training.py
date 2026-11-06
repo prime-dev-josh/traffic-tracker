@@ -9,8 +9,17 @@ import unittest
 import numpy as np
 
 from traffic_tracker.config import DETECTOR_CONF, TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
-from traffic_tracker.core.detector import boxes_from_detector, keep_detector_class, resolve_detector_weights
-from traffic_tracker.core.settings import AppSettings, clamp_detector_conf, load_settings, save_settings
+from traffic_tracker.core.detector import boxes_from_detector, keep_detector_class, resolve_detector_weights, weights_for_source
+from traffic_tracker.core.settings import (
+    AppSettings,
+    apply_precision_preset,
+    clamp_detector_conf,
+    clamp_detector_iou,
+    load_settings,
+    save_settings,
+)
+from traffic_tracker.core.trainer import train_site_detector
+from traffic_tracker.core.training import site_weights_path, visdrone_weights_path
 from traffic_tracker.core.geometry import Box, Geometry, area_limits_from_areas, merge_area_limits
 from traffic_tracker.core.trainer import yolo_train_device
 from traffic_tracker.core.training import (
@@ -145,6 +154,18 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(clamp_detector_conf(-1), 0.15)
         self.assertEqual(clamp_detector_conf(2), 0.60)
         self.assertEqual(clamp_detector_conf("nope"), DETECTOR_CONF)
+        self.assertEqual(clamp_detector_iou(0.2), 0.2)
+        self.assertEqual(clamp_detector_iou(2), 0.70)
+
+    def test_precision_preset_fills_sliders(self) -> None:
+        tuned = apply_precision_preset(AppSettings(), "strict")
+        self.assertEqual(tuned.precision_preset, "strict")
+        self.assertAlmostEqual(tuned.detector_conf, 0.45)
+        self.assertAlmostEqual(tuned.detector_iou, 0.50)
+        self.assertGreater(tuned.parked_radius, AppSettings().parked_radius)
+        self.assertLess(tuned.link_speed, AppSettings().link_speed)
+        custom = apply_precision_preset(tuned, "nope")
+        self.assertEqual(custom.precision_preset, "custom")
 
 
 class DetectorWeightsTests(unittest.TestCase):
@@ -153,6 +174,25 @@ class DetectorWeightsTests(unittest.TestCase):
             weights = Path(tmp) / "custom.pt"
             weights.write_bytes(b"pt")
             self.assertEqual(resolve_detector_weights(str(weights), Path(tmp)), weights)
+
+    def test_source_picks_visdrone_or_site(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            vis = visdrone_weights_path(base)
+            site = site_weights_path(base)
+            vis.parent.mkdir(parents=True, exist_ok=True)
+            vis.write_bytes(b"vis")
+            site.write_bytes(b"site")
+            self.assertEqual(weights_for_source("visdrone", None, base), vis)
+            self.assertEqual(weights_for_source("site", None, base), site)
+
+    def test_site_train_starts_from_visdrone(self) -> None:
+        import inspect
+
+        source = inspect.getsource(train_site_detector)
+        self.assertIn("visdrone_weights_path", source)
+        self.assertIn("site_weights_path", source)
+        self.assertEqual(inspect.signature(train_site_detector).parameters["epochs"].default, 40)
 
     def test_site_best_pt_is_used(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +230,9 @@ class DetectorWeightsTests(unittest.TestCase):
         self.assertFalse(keep_detector_class(names, 6))
         self.assertFalse(keep_detector_class(names, 7))
         self.assertFalse(keep_detector_class({8: "boat", 2: "car"}, 8))
+        self.assertFalse(keep_detector_class({8: "ship", 2: "car"}, 8))
+        self.assertFalse(keep_detector_class({8: "speedboat", 2: "car"}, 8))
+        self.assertFalse(keep_detector_class({8: "yacht", 2: "car"}, 8))
 
     def test_site_single_class_keeps_all(self) -> None:
         self.assertTrue(keep_detector_class({0: "vehicle"}, 0))

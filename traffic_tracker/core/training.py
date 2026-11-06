@@ -21,6 +21,7 @@ from traffic_tracker.config import (
     TRAIN_MIN_FRAMES,
     TRAIN_SPLIT_SEED,
     TRAIN_VAL_FRACTION,
+    SITE_WEIGHTS_REL,
     TRAINED_WEIGHTS_REL,
     VISDRONE_WEIGHTS_REL,
     TRAINING_DIR_NAME,
@@ -65,6 +66,10 @@ def trained_weights_path(base: Path | None = None) -> Path:
 
 def visdrone_weights_path(base: Path | None = None) -> Path:
     return training_root(base) / VISDRONE_WEIGHTS_REL
+
+
+def site_weights_path(base: Path | None = None) -> Path:
+    return training_root(base) / SITE_WEIGHTS_REL
 
 
 def dataset_dir(base: Path | None = None) -> Path:
@@ -258,13 +263,49 @@ def build_yolo_dataset(base: Path | None = None) -> dict:
 
     train_items, val_items = _split_items(items)
     root = dataset_dir(base)
+    # #region agent log
+    def _dbg(message: str, data: dict, hid: str) -> None:
+        import json, time
+        try:
+            with open(r"c:\Users\Josh.Marrero\OneDrive - PRIME AE Group, Inc\Desktop\Project Process AI Work\traffic-tracker\.cursor\debug-da0e48.log", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"sessionId": "da0e48", "timestamp": int(time.time() * 1000), "location": "training.py:build_yolo_dataset", "message": message, "hypothesisId": hid, "data": data}) + "\n")
+        except Exception:
+            pass
+    train_dir = root / "images" / "train"
+    _dbg("before rebuild", {
+        "root": str(root),
+        "root_exists": root.exists(),
+        "train_exists": train_dir.exists(),
+        "onedrive": "OneDrive" in str(root),
+        "train_items": len(train_items),
+        "val_items": len(val_items),
+    }, "A")
+    # #endregion
     if root.exists():
-        shutil.rmtree(root)
+        try:
+            shutil.rmtree(root)
+            # #region agent log
+            _dbg("rmtree ok", {"root": str(root), "still_exists": root.exists()}, "A")
+            # #endregion
+        except Exception as exc:
+            # #region agent log
+            _dbg("rmtree failed", {"root": str(root), "error": f"{type(exc).__name__}: {exc}", "winerror": getattr(exc, "winerror", None)}, "A")
+            # #endregion
+            raise
     for split, split_items in (("train", train_items), ("val", val_items)):
         images = root / "images" / split
         labels = root / "labels" / split
-        images.mkdir(parents=True, exist_ok=True)
-        labels.mkdir(parents=True, exist_ok=True)
+        try:
+            images.mkdir(parents=True, exist_ok=True)
+            labels.mkdir(parents=True, exist_ok=True)
+            # #region agent log
+            _dbg("mkdir ok", {"images": str(images), "labels": str(labels)}, "B")
+            # #endregion
+        except Exception as exc:
+            # #region agent log
+            _dbg("mkdir failed", {"images": str(images), "error": f"{type(exc).__name__}: {exc}", "winerror": getattr(exc, "winerror", None)}, "B")
+            # #endregion
+            raise
         for item in split_items:
             dest_image = images / f"{item['dest_stem']}{item['image_path'].suffix}"
             dest_label = labels / f"{item['dest_stem']}.txt"

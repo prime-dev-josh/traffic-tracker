@@ -38,6 +38,8 @@ if (-not (Test-Path $venvPip)) {
 Write-Host "Installing/updating dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install --upgrade pip | Out-Null
 & $venvPython -m pip install -r (Join-Path $Root "requirements.txt")
+Write-Host "Installing CUDA PyTorch (RTX / NVIDIA GPU)..." -ForegroundColor Cyan
+& $venvPython -m pip install -r (Join-Path $Root "requirements-cuda.txt")
 
 Write-Host "Starting Traffic Tracker..." -ForegroundColor Green
 & $venvPython (Join-Path $Root "run.py")

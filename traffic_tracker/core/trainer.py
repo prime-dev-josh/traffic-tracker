@@ -11,12 +11,14 @@ from traffic_tracker.config import (
     TRAIN_IMGSZ,
     TRAIN_PATIENCE,
     TRAIN_RUNS_REL,
+    TRAIN_SITE_EPOCHS,
     YOLO_PT_NAME,
 )
 from traffic_tracker.core.device import describe_device, detect_device
 from traffic_tracker.core.models import resolve_model_source
 from traffic_tracker.core.training import (
     build_yolo_dataset,
+    site_weights_path,
     trained_weights_path,
     training_root,
     visdrone_weights_path,
@@ -122,13 +124,13 @@ def _fine_tune_yolo(
 def train_site_detector(
     base: Path | None = None,
     *,
-    epochs: int = TRAIN_EPOCHS,
+    epochs: int = TRAIN_SITE_EPOCHS,
     imgsz: int = TRAIN_IMGSZ,
     progress_cb=None,
     log_cb=None,
     cancel_flag=None,
 ) -> Path:
-    """Build the flattened dataset, fine-tune yolo11n, copy best.pt into training/weights."""
+    """Fine-tune from visdrone.pt when it exists, otherwise yolo11n. Writes site.pt and best.pt."""
 
     def log(message: str) -> None:
         if log_cb:
@@ -150,16 +152,21 @@ def train_site_detector(
     if cancel_flag and cancel_flag():
         raise RuntimeError("Training cancelled.")
 
+    start = visdrone_weights_path(base)
+    from_visdrone = start.is_file()
+    if log_cb and from_visdrone:
+        log_cb(f"Starting from VisDrone weights: {start}")
     return _fine_tune_yolo(
         data=str(dataset["yaml_path"]),
         run_name="site",
-        dest=trained_weights_path(base),
+        dest=site_weights_path(base),
         base=base,
         epochs=epochs,
         imgsz=imgsz,
         progress_cb=progress,
         cancel_flag=cancel_flag,
-        start_message="Fine-tuning",
+        start_message="Fine-tuning site boxes on top of" if from_visdrone else "Fine-tuning",
+        start_weights=start if from_visdrone else None,
     )
 
 
