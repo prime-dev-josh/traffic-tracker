@@ -3,11 +3,16 @@ $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 Set-Location $Root
 
-$venvPython = Join-Path $Root ".venv\Scripts\python.exe"
+if ($Root -match 'OneDrive') {
+    $VenvDir = Join-Path $env:LOCALAPPDATA "traffic-tracker\venv"
+} else {
+    $VenvDir = Join-Path $Root ".venv"
+}
+$venvPython = Join-Path $VenvDir "Scripts\python.exe"
 
 function Ensure-Venv {
     if (Test-Path $venvPython) { return }
-    Write-Host "Creating virtual environment (.venv)..." -ForegroundColor Cyan
+    Write-Host "Creating virtual environment ($VenvDir)..." -ForegroundColor Cyan
     $py311 = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
     if (-not (Test-Path $py311)) {
         $py311 = (& py -3.11 -c "import sys; print(sys.executable)" 2>$null).Trim()
@@ -15,7 +20,8 @@ function Ensure-Venv {
     if (-not $py311 -or -not (Test-Path $py311)) {
         throw "Python 3.11 not found. Run .\run.ps1 once or install Python 3.11."
     }
-    & $py311 -m venv (Join-Path $Root ".venv")
+    New-Item -ItemType Directory -Force (Split-Path $VenvDir) | Out-Null
+    & $py311 -m venv $VenvDir
 }
 
 Ensure-Venv

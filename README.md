@@ -15,7 +15,7 @@ Motion mask counts every moving blob in the vehicle-size band. Trained detector 
 - **Size, not class.** Drawn route masks plus Training boxes decide the size band. Pedestrians and flicker fall below the min; lighting washes fall above the max.
 - **Vehicle reference masks** on the drawing step. Drag one or more boxes around typical vehicles. Processing keeps blobs from 35% of the smallest sample to 350% of the largest.
 - **Classified Gate Statistics.** Overview and Gate Statistics list **Car / Van / Truck / Motorcycle / Bus count** plus **Number of all vehicles**. Motion-mask trips stay in the total row. TMC Summary is still by movement (`N-SB`, …).
-- **Path traces in the workbook.** Each track keeps a centroid polyline. The Gate Statistics sheet embeds a darkened still with neon class-colored traces and gate labels. A `{video}_paths.png` is written next to the xlsx.
+- **Path traces in the workbook.** Only traces that belong to a completed trip are kept. The Gate Statistics sheet embeds a darkened still of every trip path. Next to the xlsx: `{video}_paths.png` (all trips) and `{video}_paths_{route}.png` for each movement that had trips (for example `N-SB`).
 - **Gates, not required 8 lines.** Set North, then only the start/end lines that exist (one-way is fine). Names are `{origin}-{bound}` such as `N-SB`.
 - **Path crossings.** A trip is a centroid path that hits two different sides. ByteTrack IDs are not used.
 - **Las Olas-style workbook** (Overview / Gate Statistics / TMC Summary). No copied logos or branding.
@@ -32,8 +32,16 @@ Developer internals: [docs/DEVELOPER.md](docs/DEVELOPER.md).
 ## Install
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\run.ps1
+```
+
+That creates the venv, installs dependencies, and launches the app. If this repo lives on OneDrive, the venv is stored at `%LOCALAPPDATA%\traffic-tracker\venv` so sync cannot corrupt PyTorch. Otherwise it uses `.venv` in the project folder.
+
+Manual install (same locations):
+
+```powershell
+py -3.11 -m venv $env:LOCALAPPDATA\traffic-tracker\venv
+& "$env:LOCALAPPDATA\traffic-tracker\venv\Scripts\Activate.ps1"
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 pip install -r requirements-cuda.txt
@@ -49,7 +57,7 @@ No model download is required for motion counting.
 .\run.ps1
 ```
 
-Or: `.\.venv\Scripts\Activate.ps1` then `python run.py`.
+Or activate the venv (`%LOCALAPPDATA%\traffic-tracker\venv` on OneDrive, otherwise `.venv`) then `python run.py`.
 
 ## Workflow
 
@@ -67,6 +75,7 @@ The app starts on a dashboard. Open one of the three cards.
    - **Add roadway**: click around the intersection and the approaches, then Finish roadway. Leave the marina, parking lots, buildings, and sidewalks outside. No roadway means the full frame is used. Keep pavement on both sides of each gate.
    - **Add vehicle mask**: drag a box around a typical vehicle. Repeat for other sizes. That size band is the processing filter.
    - **Add drop zone**: drag a box over a dark patch where cars briefly disappear. Detections inside the box still count. The zone only helps reconnect a track across a short gap.
+   - **Set prediction reach**: drag a short line on the photo (about one car-length through that shadow). When a car is lost in a drop zone, a pickup stays that far ahead so the same ID and trace reconnect if the detector finds it again nearby. Nudge the slider under Drop zones if you need a small change.
 4. **Align** later clips: drag/scale/rotate the overlay (or match 2–4 landmarks). Confirm each clip. Unconfirmed clips are skipped.
 5. Process confirmed clips. Each writes `{video_name}_tmc.xlsx`.
 
@@ -97,17 +106,18 @@ Trained detector keeps **moving cars, vans, trucks, motorcycles, and buses**. Se
 
 ### Settings
 
-- Dark / Light theme.
+- Dark / Light theme using the Prime AE navy, white, and orange palette.
 - Default export folder (also on the Process videos page).
 - OneDrive warning on/off.
 - Detection mode: Motion (default) or Trained detector (YOLO). After **Train detector**, the app selects the site weights. You can still choose another `.pt` or switch back to Motion on Align before Process.
 - Detector confidence (trained mode only). Raise it if the count is still high.
+- Speed (trained mode unless noted): CUDA + FP16 is used automatically when a GPU is available. **Detect size** 640 / 960 / 1280 (training stays 1280; smaller is faster and can miss distant cars). **Detect every** 1 / 2 / 3 frames (skipped frames keep the last ID via hold and drop-zone pickup). **Live preview** Off / every 15 / 30 / 60 frames (Off is fastest; counts do not use the live picture).
 - Training data: view sessions, export a zip, import a zip or folder, open the `training/` folder.
 
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_crossings tests.test_motion tests.test_geometry_names tests.test_report tests.test_transform tests.test_models tests.test_training tests.test_device -q
+& "$env:LOCALAPPDATA\traffic-tracker\venv\Scripts\python.exe" -m unittest tests.test_crossings tests.test_motion tests.test_geometry_names tests.test_report tests.test_transform tests.test_models tests.test_training tests.test_device tests.test_tracking_rules -q
 ```
 
 ## Build a Windows `.exe`

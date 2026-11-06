@@ -40,6 +40,7 @@ from traffic_tracker.config import (
     APP_VERSION,
     DETECTOR_CONF_MAX,
     DETECTOR_CONF_MIN,
+    DETECTOR_IMGSZ_CHOICES,
     DETECTOR_IOU_MAX,
     DETECTOR_IOU_MIN,
     DETECTOR_LINK_SPEED_MAX,
@@ -48,6 +49,11 @@ from traffic_tracker.config import (
     DETECTOR_PARKED_RADIUS_MIN,
     DETECTOR_PATH_JUMP_MAX,
     DETECTOR_PATH_JUMP_MIN,
+    DETECTOR_STRIDE_MAX,
+    PREVIEW_EVERY_CHOICES,
+    PREDICTION_REACH_MAX,
+    PREDICTION_REACH_MIN,
+    PREDICTION_REACH_PX,
     TRAIN_MIN_BOXES,
     TRAIN_MIN_FRAMES,
     TRAIN_SITE_EPOCHS,
@@ -88,11 +94,14 @@ from traffic_tracker.core.report import (
 from traffic_tracker.core.settings import (
     AppSettings,
     apply_precision_preset,
+    clamp_detect_stride,
     clamp_detector_conf,
+    clamp_detector_imgsz,
     clamp_detector_iou,
     clamp_link_speed,
     clamp_parked_radius,
     clamp_path_jump,
+    clamp_preview_every,
     load_settings,
     save_settings,
 )
@@ -115,7 +124,7 @@ from traffic_tracker.core.training import (
     training_root,
     visdrone_weights_path,
 )
-from traffic_tracker.gui.style import stylesheet_for
+from traffic_tracker.gui.style import load_brand_pixmap, stylesheet_for
 from traffic_tracker.core.video import (
     file_size_gb,
     format_duration,
@@ -187,6 +196,10 @@ class MainWindow(QMainWindow):
         self.header_bar = QWidget()
         title_row = QHBoxLayout(self.header_bar)
         title_row.setContentsMargins(16, 16, 16, 0)
+        self.header_logo = QLabel()
+        self.header_logo.setObjectName("brandMark")
+        self.header_logo.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        title_row.addWidget(self.header_logo, 0, Qt.AlignmentFlag.AlignTop)
         header = QVBoxLayout()
         title = QLabel(APP_NAME)
         title.setObjectName("title")
@@ -527,6 +540,62 @@ class MainWindow(QMainWindow):
             "Lower to stop lot-spanning teleport lines.",
         )
 
+        form.addWidget(self._section("Speed"))
+        speed_hint = QLabel(
+            "These only change how fast a clip processes. GPU FP16 is used automatically when CUDA is available. "
+            "A smaller detect size and detecting every 2nd or 3rd frame are faster but can miss small cars. "
+            "Live preview off skips drawing while the clip runs."
+        )
+        speed_hint.setObjectName("hint")
+        speed_hint.setWordWrap(True)
+        form.addWidget(speed_hint)
+
+        imgsz_row = QHBoxLayout()
+        imgsz_row.addWidget(QLabel("Detect size"))
+        self.detector_imgsz_combo = QComboBox()
+        for size in DETECTOR_IMGSZ_CHOICES:
+            self.detector_imgsz_combo.addItem(f"{size} px", size)
+        self.detector_imgsz_combo.setCurrentIndex(
+            max(0, self.detector_imgsz_combo.findData(self.settings.detector_imgsz))
+        )
+        self.detector_imgsz_combo.setToolTip(
+            "YOLO letterbox at process time. Training stays 1280. "
+            "640 is fastest; 1280 is closest to how the model was trained."
+        )
+        self.detector_imgsz_combo.currentIndexChanged.connect(self._settings_changed)
+        imgsz_row.addWidget(self.detector_imgsz_combo, 1)
+        form.addLayout(imgsz_row)
+
+        stride_row = QHBoxLayout()
+        stride_row.addWidget(QLabel("Detect every"))
+        self.detect_stride_combo = QComboBox()
+        for step in range(1, DETECTOR_STRIDE_MAX + 1):
+            label = "frame" if step == 1 else f"{step} frames"
+            self.detect_stride_combo.addItem(label, step)
+        self.detect_stride_combo.setCurrentIndex(
+            max(0, self.detect_stride_combo.findData(self.settings.detect_stride))
+        )
+        self.detect_stride_combo.setToolTip(
+            "Trained detector only. Skipped frames keep the last ID via hold and drop-zone pickup."
+        )
+        self.detect_stride_combo.currentIndexChanged.connect(self._settings_changed)
+        stride_row.addWidget(self.detect_stride_combo, 1)
+        form.addLayout(stride_row)
+
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("Live preview"))
+        self.preview_every_combo = QComboBox()
+        preview_labels = {0: "Off", 15: "Every 15 frames", 30: "Every 30 frames", 60: "Every 60 frames"}
+        for every in PREVIEW_EVERY_CHOICES:
+            self.preview_every_combo.addItem(preview_labels.get(every, str(every)), every)
+        self.preview_every_combo.setCurrentIndex(
+            max(0, self.preview_every_combo.findData(self.settings.preview_every))
+        )
+        self.preview_every_combo.setToolTip("Off is fastest. Counts do not depend on the live picture.")
+        self.preview_every_combo.currentIndexChanged.connect(self._settings_changed)
+        preview_row.addWidget(self.preview_every_combo, 1)
+        form.addLayout(preview_row)
+
         form.addWidget(self._section("Training data"))
         train_hint = QLabel(
             "Boxed frames live under training/sessions. Train detector fine-tunes "
@@ -696,7 +765,8 @@ class MainWindow(QMainWindow):
         self.route_hint = QLabel(
             "Set North, then add the entry and exit lines that exist. "
             "Outline the roadway so boats and parking lots are ignored. "
-            "Box a typical vehicle for size. Optionally box dark patches where cars briefly disappear."
+            "Box a typical vehicle for size. Optionally box dark patches where cars briefly disappear, "
+            "then set how far ahead to look when a car is lost there."
         )
         self.route_hint.setObjectName("hint")
         self.route_hint.setWordWrap(True)
@@ -733,6 +803,11 @@ class MainWindow(QMainWindow):
             tooltip="Drag a box over a dark patch, joint, or pole shadow that hides cars.",
         )
         add_shadow.clicked.connect(self._start_mask_occlusion)
+        add_reach = self._wide_button(
+            "Set prediction reach",
+            tooltip="Drag a short line on the photo: how far a car should travel through a drop zone.",
+        )
+        add_reach.clicked.connect(self._start_set_reach)
         add_road = self._wide_button(
             "Add roadway",
             tooltip="Click around the intersection and approaches. Exclude marina, parking, buildings, and sidewalks.",
@@ -759,14 +834,15 @@ class MainWindow(QMainWindow):
         actions.addWidget(add_exit, 1, 1)
         actions.addWidget(add_mask, 2, 0)
         actions.addWidget(add_shadow, 2, 1)
-        actions.addWidget(add_road, 3, 0)
-        actions.addWidget(self.finish_road_btn, 3, 1)
-        actions.addWidget(self.cancel_road_btn, 4, 0, 1, 2)
-        actions.addWidget(save_geom, 5, 0)
-        actions.addWidget(load_geom, 5, 1)
-        actions.addWidget(clear_geom, 6, 0, 1, 2)
-        actions.addWidget(back, 7, 0)
-        actions.addWidget(nxt, 7, 1)
+        actions.addWidget(add_reach, 3, 0, 1, 2)
+        actions.addWidget(add_road, 4, 0)
+        actions.addWidget(self.finish_road_btn, 4, 1)
+        actions.addWidget(self.cancel_road_btn, 5, 0, 1, 2)
+        actions.addWidget(save_geom, 6, 0)
+        actions.addWidget(load_geom, 6, 1)
+        actions.addWidget(clear_geom, 7, 0, 1, 2)
+        actions.addWidget(back, 8, 0)
+        actions.addWidget(nxt, 8, 1)
         left_layout.addLayout(actions)
 
         right = self._card()
@@ -1257,6 +1333,32 @@ class MainWindow(QMainWindow):
                     on_delete=lambda mask=box: self._delete_occlusion_item(mask),
                 )
             )
+        reach_px = int(round(self.geometry.prediction_reach_px))
+        reach_label = QLabel(f"Prediction reach: {reach_px} px")
+        reach_label.setObjectName("hint")
+        self.route_items.addWidget(reach_label)
+        reach_slider = QSlider(Qt.Orientation.Horizontal)
+        reach_slider.setRange(int(PREDICTION_REACH_MIN), int(PREDICTION_REACH_MAX))
+        reach_slider.setValue(reach_px)
+        reach_slider.setToolTip(
+            "How far ahead to freeze a pickup when a car is lost in a drop zone. "
+            "Drag Set prediction reach on the photo to match this footage."
+        )
+
+        def _on_reach_slider(value: int, label=reach_label) -> None:
+            self.geometry.set_prediction_reach(float(value))
+            label.setText(f"Prediction reach: {int(round(self.geometry.prediction_reach_px))} px")
+            self.canvas.set_geometry(self.geometry)
+            self.project.geometry = self.geometry
+
+        reach_slider.valueChanged.connect(_on_reach_slider)
+        self.route_items.addWidget(reach_slider)
+        reach_hint = QLabel(
+            "Drag Set prediction reach on the photo (about one car-length through a shadow), or nudge this slider."
+        )
+        reach_hint.setObjectName("hint")
+        reach_hint.setWordWrap(True)
+        self.route_items.addWidget(reach_hint)
         if self.geometry.is_ready():
             ready = QLabel("Movements: " + ", ".join(self.geometry.movement_names()))
             ready.setObjectName("hint")
@@ -1274,6 +1376,18 @@ class MainWindow(QMainWindow):
         self.route_hint.setText(
             "On the photo: click the middle of the intersection, drag toward geographic North, release. "
             "If North is at the bottom of the photo, drag downward."
+        )
+
+    def _start_set_reach(self, *_args) -> None:
+        if self._draw_step == "roadway":
+            self._cancel_roadway()
+        self._draw_step = "reach"
+        self._redraw_index = None
+        self._redraw_target = None
+        self.canvas.set_drawing_enabled(True)
+        self.route_hint.setText(
+            "On the photo: drag a short line the distance a car should travel through a drop zone, then release. "
+            "Use a typical gap on this footage, not a global pixel guess."
         )
 
     def _start_draw_lines(self, kind: str, *, replace=None) -> None:
@@ -1573,7 +1687,7 @@ class MainWindow(QMainWindow):
         go = QMessageBox.question(
             self,
             APP_NAME,
-            "Clear North, all entry/exit lines, the roadway, vehicle masks, and drop zones?",
+            "Clear North, all entry/exit lines, the roadway, vehicle masks, drop zones, and prediction reach?",
         )
         if go != QMessageBox.StandardButton.Yes:
             return
@@ -1583,6 +1697,8 @@ class MainWindow(QMainWindow):
         self.geometry.vehicle_refs = []
         self.geometry.occlusions = []
         self.geometry.roadways = []
+        self.geometry.prediction_reach = None
+        self.geometry.set_prediction_reach(PREDICTION_REACH_PX)
         self._set_roadway_actions(False)
         self._draw_step = "idle"
         self._redraw_index = None
@@ -1592,6 +1708,27 @@ class MainWindow(QMainWindow):
         self.route_hint.setText("Cleared. Set North, then add the entry and exit lines that exist.")
 
     def _on_line_drawn(self, line: Line) -> None:
+        if self._draw_step == "reach":
+            if line.length() < 8:
+                QMessageBox.information(
+                    self,
+                    APP_NAME,
+                    "That line is too short. Drag about one car-length through a typical drop-zone gap.",
+                )
+                self.canvas.clear_draft()
+                return
+            self.geometry.set_prediction_reach(line.length(), line=line)
+            self._draw_step = "idle"
+            self._redraw_index = None
+            self._redraw_target = None
+            self.canvas.set_drawing_enabled(False)
+            self.canvas.clear_draft()
+            self._refresh_route_list()
+            self.route_hint.setText(
+                f"Prediction reach set to {int(round(self.geometry.prediction_reach_px))} px. "
+                "A lost car in a drop zone keeps a pickup that far ahead."
+            )
+            return
         if self._draw_step == "north":
             self.geometry.north = line
             self.geometry.assign_names()
@@ -2041,10 +2178,13 @@ class MainWindow(QMainWindow):
             self._append_log(
                 f"Detection: trained detector  •  {weights}  •  "
                 f"conf {self.settings.detector_conf:.2f}  •  NMS {self.settings.detector_iou:.2f}  •  "
-                f"parked {self.settings.parked_radius:.0f}px  •  link {self.settings.link_speed:.0f}px/s"
+                f"parked {self.settings.parked_radius:.0f}px  •  link {self.settings.link_speed:.0f}px/s  •  "
+                f"imgsz {self.settings.detector_imgsz}  •  every {self.settings.detect_stride} frame(s)"
             )
         else:
             self._append_log("Detection: motion mask (all vehicles the same)")
+        if self.settings.preview_every <= 0:
+            self._append_log("Live preview: off")
         limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
         if limits:
             extra = f" + {len(prior_areas())} training box(es)" if prior_areas() else ""
@@ -2072,6 +2212,9 @@ class MainWindow(QMainWindow):
             parked_radius=self.settings.parked_radius,
             link_speed=self.settings.link_speed,
             path_jump=self.settings.path_jump,
+            detector_imgsz=self.settings.detector_imgsz,
+            detect_stride=self.settings.detect_stride,
+            preview_every=self.settings.preview_every,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.preview.connect(self._on_preview)
@@ -2253,6 +2396,9 @@ class MainWindow(QMainWindow):
         parked = self.settings.parked_radius
         link = self.settings.link_speed
         jump = self.settings.path_jump
+        imgsz = self.settings.detector_imgsz
+        stride = self.settings.detect_stride
+        preview_every = self.settings.preview_every
         preset = self.settings.precision_preset
         source = self.settings.detector_source
         if hasattr(self, "detector_conf_slider"):
@@ -2265,6 +2411,10 @@ class MainWindow(QMainWindow):
             preset = self.precision_combo.currentData() or preset
         if hasattr(self, "detector_source_combo"):
             source = self.detector_source_combo.currentData() or source
+        if hasattr(self, "detector_imgsz_combo"):
+            imgsz = clamp_detector_imgsz(self.detector_imgsz_combo.currentData())
+            stride = clamp_detect_stride(self.detect_stride_combo.currentData())
+            preview_every = clamp_preview_every(self.preview_every_combo.currentData())
         self.settings = AppSettings(
             export_dir=str(self.export_dir),
             warn_onedrive=warn,
@@ -2278,6 +2428,9 @@ class MainWindow(QMainWindow):
             parked_radius=parked,
             link_speed=link,
             path_jump=jump,
+            detector_imgsz=imgsz,
+            detect_stride=stride,
+            preview_every=preview_every,
         )
         save_settings(self.settings)
         self._refresh_setup_list()
@@ -2409,8 +2562,14 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(stylesheet_for(theme))
+        if hasattr(self, "header_logo"):
+            self.header_logo.setPixmap(load_brand_pixmap(theme, 40))
         if hasattr(self, "home_stage"):
             self.home_stage.set_theme(theme)
+        for name in ("canvas", "ref_canvas", "align_canvas", "preview_canvas", "train_canvas"):
+            widget = getattr(self, name, None)
+            if widget is not None and hasattr(widget, "set_theme"):
+                widget.set_theme(theme)
 
     def _refresh_training_inventory(self) -> None:
         info = training_inventory()
@@ -2498,6 +2657,22 @@ class MainWindow(QMainWindow):
         self.theme_combo.blockSignals(True)
         self.theme_combo.setCurrentIndex(max(0, self.theme_combo.findData(self.settings.theme)))
         self.theme_combo.blockSignals(False)
+        if hasattr(self, "detector_imgsz_combo"):
+            self.detector_imgsz_combo.blockSignals(True)
+            self.detector_imgsz_combo.setCurrentIndex(
+                max(0, self.detector_imgsz_combo.findData(self.settings.detector_imgsz))
+            )
+            self.detector_imgsz_combo.blockSignals(False)
+            self.detect_stride_combo.blockSignals(True)
+            self.detect_stride_combo.setCurrentIndex(
+                max(0, self.detect_stride_combo.findData(self.settings.detect_stride))
+            )
+            self.detect_stride_combo.blockSignals(False)
+            self.preview_every_combo.blockSignals(True)
+            self.preview_every_combo.setCurrentIndex(
+                max(0, self.preview_every_combo.findData(self.settings.preview_every))
+            )
+            self.preview_every_combo.blockSignals(False)
         self._refresh_training_inventory()
         self._sync_detector_ui()
 

@@ -10,6 +10,8 @@ from traffic_tracker.config import (
     DETECTOR_CONF,
     DETECTOR_CONF_MAX,
     DETECTOR_CONF_MIN,
+    DETECTOR_IMGSZ,
+    DETECTOR_IMGSZ_CHOICES,
     DETECTOR_IOU,
     DETECTOR_IOU_MAX,
     DETECTOR_IOU_MIN,
@@ -22,7 +24,11 @@ from traffic_tracker.config import (
     DETECTOR_PATH_JUMP,
     DETECTOR_PATH_JUMP_MAX,
     DETECTOR_PATH_JUMP_MIN,
+    DETECTOR_STRIDE,
+    DETECTOR_STRIDE_MAX,
     PRECISION_PRESETS,
+    PREVIEW_EVERY,
+    PREVIEW_EVERY_CHOICES,
     SETTINGS_FILE_NAME,
 )
 
@@ -55,6 +61,30 @@ def clamp_path_jump(value: object) -> float:
     return _clamp(value, DETECTOR_PATH_JUMP, DETECTOR_PATH_JUMP_MIN, DETECTOR_PATH_JUMP_MAX)
 
 
+def clamp_detector_imgsz(value: object) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DETECTOR_IMGSZ
+    return min(DETECTOR_IMGSZ_CHOICES, key=lambda choice: abs(choice - number))
+
+
+def clamp_detect_stride(value: object) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DETECTOR_STRIDE
+    return max(1, min(DETECTOR_STRIDE_MAX, number))
+
+
+def clamp_preview_every(value: object) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return PREVIEW_EVERY
+    return min(PREVIEW_EVERY_CHOICES, key=lambda choice: abs(choice - number))
+
+
 @dataclass
 class AppSettings:
     export_dir: str = ""
@@ -69,6 +99,9 @@ class AppSettings:
     parked_radius: float = DETECTOR_PARKED_RADIUS
     link_speed: float = DETECTOR_LINK_SPEED_PX_S
     path_jump: float = DETECTOR_PATH_JUMP
+    detector_imgsz: int = DETECTOR_IMGSZ
+    detect_stride: int = DETECTOR_STRIDE
+    preview_every: int = PREVIEW_EVERY
 
 
 def apply_precision_preset(settings: AppSettings, name: str) -> AppSettings:
@@ -120,6 +153,9 @@ def load_settings(base: Path | None = None) -> AppSettings:
         parked_radius=clamp_parked_radius(data.get("parked_radius", DETECTOR_PARKED_RADIUS)),
         link_speed=clamp_link_speed(data.get("link_speed", DETECTOR_LINK_SPEED_PX_S)),
         path_jump=clamp_path_jump(data.get("path_jump", DETECTOR_PATH_JUMP)),
+        detector_imgsz=clamp_detector_imgsz(data.get("detector_imgsz", DETECTOR_IMGSZ)),
+        detect_stride=clamp_detect_stride(data.get("detect_stride", DETECTOR_STRIDE)),
+        preview_every=clamp_preview_every(data.get("preview_every", PREVIEW_EVERY)),
     )
 
 

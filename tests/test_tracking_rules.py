@@ -15,7 +15,13 @@ from traffic_tracker.core.geometry import (
     polygon_is_valid,
     roadway_approach_warnings,
 )
-from traffic_tracker.core.processor import _Pending, _expire_tracks, _record_crossings
+from traffic_tracker.core.processor import (
+    _Pending,
+    _expire_tracks,
+    _record_crossings,
+    should_emit_preview,
+    should_run_detector,
+)
 from traffic_tracker.core.project import BundleProject, ClipRecord
 from traffic_tracker.core.report import Trip
 
@@ -111,6 +117,101 @@ class TrackingRuleTests(unittest.TestCase):
         _expire_tracks(pending, geom, trips, "a.mp4", observed + MOTION_COAST_S + 0.1, infer_path=False)
         self.assertEqual(pending.live, {})
         self.assertTrue(any(event["action"] == "expired" for event in pending.diagnostics))
+
+    def test_drop_zone_lead_pickup_stitches_id_and_path(self) -> None:
+        geom = _geom(
+            occlusions=[Box(120, 170, 300, 230)],
+            prediction_reach_px=64.0,
+        )
+        pending = _Pending(link_speed=60.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        samples = []
+        x = 40.0
+        when = 1.0
+        for _step in range(8):
+            samples.append((when, [_box(x, 200)], ["car"]))
+            x += 16.0
+            when += 0.2
+        _feed(pending, geom, samples, trips, expire=False)
+        self.assertEqual(list(pending.live), [1])
+        self.assertTrue(pending.live[1].active)
+        last_x = pending.live[1].last_observed_xy[0]
+        _record_crossings([], geom, pending, trips, "a.mp4", when, moving_only=True)
+        self.assertIsNotNone(pending.live[1].pickup_xy)
+        pickup_x = pending.live[1].pickup_xy[0]
+        self.assertGreater(pickup_x, last_x + 20)
+        _record_crossings(
+            [_box(pickup_x - 4.0, 200)],
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            when + 0.2,
+            moving_only=True,
+            classes=["car"],
+        )
+        self.assertEqual(list(pending.live), [1])
+        self.assertIsNone(pending.live[1].pickup_xy)
+        path = pending.live[1].path
+        self.assertGreater(len(path), 8)
+        steps = [
+            ((path[i][0] - path[i - 1][0]) ** 2 + (path[i][1] - path[i - 1][1]) ** 2) ** 0.5
+            for i in range(1, len(path))
+        ]
+        self.assertLess(max(steps), 40.0)
+        self.assertGreater(path[-1][0], last_x)
+        self.assertEqual(trips, [])
+
+    def test_drop_zone_flicker_does_not_spike_through_lead(self) -> None:
+        geom = _geom(
+            occlusions=[Box(120, 170, 300, 230)],
+            prediction_reach_px=80.0,
+        )
+        pending = _Pending(link_speed=60.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        samples = []
+        x = 40.0
+        when = 1.0
+        for _step in range(8):
+            samples.append((when, [_box(x, 200)], ["car"]))
+            x += 16.0
+            when += 0.2
+        _feed(pending, geom, samples, trips, expire=False)
+        last_x = pending.live[1].last_observed_xy[0]
+        _record_crossings([], geom, pending, trips, "a.mp4", when, moving_only=True)
+        pickup_x = pending.live[1].pickup_xy[0]
+        self.assertGreater(pickup_x, last_x + 30)
+        _record_crossings(
+            [_box(last_x + 6.0, 200)],
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            when + 0.2,
+            moving_only=True,
+            classes=["car"],
+        )
+        path_xs = [point[0] for point in pending.live[1].path]
+        self.assertLess(max(path_xs), pickup_x - 10)
+
+    def test_lead_pickup_across_a_gate_does_not_count(self) -> None:
+        geom = _geom(
+            occlusions=[Box(150, 250, 250, 360)],
+            prediction_reach_px=80.0,
+            starts=[NamedLine("N", Line(0, 40, 400, 40))],
+            ends=[NamedLine("SB", Line(0, 300, 400, 300))],
+        )
+        pending = _Pending(link_speed=80.0, parked_radius=24.0)
+        trips: list[Trip] = []
+        samples = [(1.0 + step * 0.15, [_box(200, 40 + step * 18)], ["car"]) for step in range(10)]
+        _feed(pending, geom, samples, trips, expire=False)
+        self.assertTrue(pending.live)
+        last_t = samples[-1][0]
+        _record_crossings([], geom, pending, trips, "a.mp4", last_t + 0.2, moving_only=True)
+        _record_crossings([], geom, pending, trips, "a.mp4", last_t + 0.4, moving_only=True)
+        self.assertEqual(trips, [])
+        _expire_tracks(pending, geom, trips, "a.mp4", last_t + 8.0, coast_s=0.0, infer_path=True)
+        self.assertEqual(trips, [])
 
     def test_visible_detection_inside_drop_zone_is_kept(self) -> None:
         geom = _geom(occlusions=[Box(70, 160, 220, 240)])
@@ -309,6 +410,29 @@ class TrackingRuleTests(unittest.TestCase):
         _expire_tracks(pending, geom, trips, "a.mp4", 20.0, coast_s=0.0, infer_path=False)
         self.assertEqual(trips, [])
         self.assertLess(DETECTOR_STATIC_EXPIRE_S, MOTION_COAST_S)
+
+
+class ProcessSpeedHelpersTests(unittest.TestCase):
+    def test_should_run_detector_stride(self) -> None:
+        self.assertTrue(should_run_detector(1, 1))
+        self.assertTrue(should_run_detector(2, 1))
+        self.assertTrue(should_run_detector(1, 2))
+        self.assertFalse(should_run_detector(2, 2))
+        self.assertTrue(should_run_detector(3, 2))
+        self.assertTrue(should_run_detector(1, 3))
+        self.assertFalse(should_run_detector(2, 3))
+        self.assertFalse(should_run_detector(3, 3))
+        self.assertTrue(should_run_detector(4, 3))
+        self.assertTrue(should_run_detector(1, 0))
+
+    def test_should_emit_preview(self) -> None:
+        self.assertFalse(should_emit_preview(1, 0))
+        self.assertFalse(should_emit_preview(15, 0))
+        self.assertTrue(should_emit_preview(1, 15))
+        self.assertFalse(should_emit_preview(14, 15))
+        self.assertTrue(should_emit_preview(15, 15))
+        self.assertTrue(should_emit_preview(30, 30))
+        self.assertFalse(should_emit_preview(29, 30))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 from traffic_tracker.core.geometry import Box, Geometry, Line, NamedLine
 from traffic_tracker.core.report import (
     Trip,
+    _safe_route_token,
     build_gate_statistics_table,
     build_overview_rows,
     build_overview_table,
@@ -20,6 +21,11 @@ from traffic_tracker.core.report import (
 
 
 class ReportTests(unittest.TestCase):
+    def test_safe_route_token(self) -> None:
+        self.assertEqual(_safe_route_token("N-SB"), "N-SB")
+        self.assertEqual(_safe_route_token("E/WB"), "E_WB")
+        self.assertEqual(_safe_route_token("  "), "route")
+
     def test_elapsed_bins(self) -> None:
         trips = [
             Trip("a.mp4", 1, "N", 60, "SB", 60, "car"),
@@ -163,8 +169,44 @@ class ReportTests(unittest.TestCase):
             )
             png = path.with_name("out_paths.png")
             self.assertTrue(png.exists())
+            route_png = path.with_name("out_paths_N-SB.png")
+            self.assertFalse(route_png.exists())
             wb = load_workbook(path)
             self.assertTrue(wb["Gate Statistics"]._images)
+
+    def test_export_writes_per_route_path_pngs(self) -> None:
+        import numpy as np
+
+        geom = Geometry(
+            100,
+            100,
+            north=Line(50, 90, 50, 10),
+            starts=[NamedLine("N", Line(10, 10, 20, 10)), NamedLine("E", Line(90, 10, 90, 20))],
+            ends=[NamedLine("SB", Line(80, 90, 90, 90)), NamedLine("WB", Line(10, 80, 10, 90))],
+        )
+        trips = [
+            Trip("site.mp4", 1, "N", 10, "SB", 20, "car", path=[(10.0, 10.0), (80.0, 80.0)]),
+            Trip("site.mp4", 2, "E", 12, "WB", 22, "car", path=[(90.0, 20.0), (20.0, 80.0)]),
+        ]
+        all_paths = np.full((60, 90, 3), 40, dtype=np.uint8)
+        n_sb = np.full((60, 90, 3), 80, dtype=np.uint8)
+        e_wb = np.full((60, 90, 3), 120, dtype=np.uint8)
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "clip_tmc.xlsx"
+            export_tmc_workbook(
+                path,
+                trips,
+                geom,
+                video_name="site.mp4",
+                duration_s=900,
+                clock_start=None,
+                device_label="CPU",
+                path_image=all_paths,
+                route_images={"N-SB": n_sb, "E-WB": e_wb},
+            )
+            self.assertTrue(path.with_name("clip_tmc_paths.png").exists())
+            self.assertTrue(path.with_name("clip_tmc_paths_N-SB.png").exists())
+            self.assertTrue(path.with_name("clip_tmc_paths_E-WB.png").exists())
 
     def test_geometry_roundtrip(self) -> None:
         geom = Geometry(

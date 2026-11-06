@@ -8,6 +8,7 @@ from traffic_tracker.core.processor import (
     _expire_tracks,
     _path_chunks,
     _record_crossings,
+    _route_path_overlays,
 )
 from traffic_tracker.core.report import Trip
 
@@ -242,13 +243,15 @@ class RecordCrossingTests(unittest.TestCase):
             _record_crossings([], geom, pending, trips, "a.mp4", 1.60, moving_only=True)
             path_after_coast = len(pending.live[first].path) if first in pending.live else path_before
             _record_crossings([(220, 180, 250, 210)], geom, pending, trips, "a.mp4", 2.21, moving_only=True, classes=["car"])
-            return first, list(pending.live), path_before, path_after_coast
+            path_after = len(pending.live[first].path) if first in pending.live else path_before
+            return first, list(pending.live), path_before, path_after_coast, path_after
 
-        bare_first, bare_ids, _, _ = run(bare)
+        bare_first, bare_ids, _, _, _ = run(bare)
         self.assertNotEqual(bare_ids, [bare_first])
-        marked_first, marked_ids, path_before, path_after_coast = run(marked)
+        marked_first, marked_ids, path_before, path_after_coast, path_after = run(marked)
         self.assertEqual(marked_ids, [marked_first])
-        self.assertGreater(path_after_coast, path_before)
+        self.assertEqual(path_after_coast, path_before)
+        self.assertGreater(path_after, path_before)
 
     def test_drop_zone_neighbor_keeps_own_id(self) -> None:
         geom = Geometry(
@@ -594,12 +597,32 @@ class RecordCrossingTests(unittest.TestCase):
 
         frame = np.zeros((80, 120, 3), dtype=np.uint8)
         pending = _Pending()
-        pending.finished_paths.append(("car", [(10.0, 40.0), (40.0, 40.0), (70.0, 40.0), (110.0, 40.0)]))
-        _draw_paths(frame, pending)
+        trips = [
+            Trip(
+                "a.mp4",
+                1,
+                "N",
+                1.0,
+                "SB",
+                2.0,
+                "car",
+                path=[(10.0, 40.0), (40.0, 40.0), (70.0, 40.0), (110.0, 40.0)],
+            )
+        ]
+        _draw_paths(frame, pending, trips)
         lit = int((frame[38:43] > 0).any(axis=2).sum())
         self.assertGreater(lit, 90)
 
-    def test_expired_path_is_kept_without_a_trip(self) -> None:
+    def test_unlinked_path_is_not_drawn(self) -> None:
+        import numpy as np
+
+        frame = np.zeros((80, 120, 3), dtype=np.uint8)
+        pending = _Pending()
+        pending.finished_paths.append(("car", [(10.0, 40.0), (40.0, 40.0), (70.0, 40.0), (110.0, 40.0)]))
+        _draw_paths(frame, pending, trips=[])
+        self.assertEqual(int(frame.sum()), 0)
+
+    def test_expired_path_without_a_trip_is_dropped(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
         pending = _Pending()
         trips: list[Trip] = []
@@ -610,8 +633,38 @@ class RecordCrossingTests(unittest.TestCase):
         self.assertEqual(inferred, 0)
         self.assertEqual(trips, [])
         self.assertEqual(pending.live, {})
+        self.assertEqual(pending.finished_paths, [])
+
+    def test_completed_trip_keeps_its_path(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0, classes=["car"])
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0, classes=["car"])
+        self.assertEqual(len(trips), 1)
         self.assertTrue(pending.finished_paths)
-        self.assertGreaterEqual(len(pending.finished_paths[0][1]), 2)
+        self.assertGreaterEqual(len(trips[0].path), 2)
+
+    def test_route_overlays_split_by_movement(self) -> None:
+        import numpy as np
+
+        geom = Geometry(
+            120,
+            80,
+            north=Line(60, 70, 60, 10),
+            starts=[NamedLine("N", Line(10, 8, 40, 8)), NamedLine("E", Line(110, 10, 110, 30))],
+            ends=[NamedLine("SB", Line(80, 72, 110, 72)), NamedLine("WB", Line(8, 50, 8, 70))],
+        )
+        frame = np.full((80, 120, 3), 30, dtype=np.uint8)
+        pending = _Pending()
+        trips = [
+            Trip("a.mp4", 1, "N", 1.0, "SB", 2.0, "car", path=[(20.0, 10.0), (90.0, 70.0)]),
+            Trip("a.mp4", 2, "N", 3.0, "SB", 4.0, "car", path=[(22.0, 12.0), (88.0, 68.0)]),
+            Trip("a.mp4", 3, "E", 1.5, "WB", 2.5, "car", path=[(110.0, 20.0), (10.0, 60.0)]),
+        ]
+        images = _route_path_overlays(frame, trips, pending, geom)
+        self.assertEqual(set(images), {"N-SB", "E-WB"})
+        self.assertTrue(all(item.shape == frame.shape for item in images.values()))
 
     def test_class_and_path_are_recorded(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])

@@ -99,6 +99,27 @@ class NamingTests(unittest.TestCase):
         loaded = Geometry.from_dict(geom.to_dict())
         self.assertEqual(loaded.vehicle_refs[0].area(), 1200)
 
+    def test_prediction_reach_roundtrip_and_scale(self) -> None:
+        geom = Geometry(
+            200,
+            200,
+            occlusions=[Box(90, 10, 110, 180)],
+            prediction_reach_px=80.0,
+            prediction_reach=Line(90, 100, 170, 100),
+        )
+        loaded = Geometry.from_dict(geom.to_dict())
+        self.assertAlmostEqual(loaded.prediction_reach_px, 80.0)
+        self.assertIsNotNone(loaded.prediction_reach)
+        self.assertAlmostEqual(loaded.prediction_reach.length(), 80.0)
+        scaled = loaded.scaled_to(100, 100)
+        self.assertAlmostEqual(scaled.prediction_reach_px, 40.0, places=5)
+        self.assertAlmostEqual(scaled.prediction_reach.length(), 40.0, places=5)
+        geom.set_prediction_reach(200.0)
+        self.assertEqual(geom.prediction_reach_px, 160.0)
+        self.assertAlmostEqual(geom.prediction_reach.length(), 160.0)
+        legacy = Geometry.from_dict({"frame_width": 10, "frame_height": 10})
+        self.assertGreaterEqual(legacy.prediction_reach_px, 24.0)
+
     def test_occlusion_boxes_roundtrip_and_scale(self) -> None:
         geom = Geometry(200, 200, occlusions=[Box(90, 10, 110, 180)])
         loaded = Geometry.from_dict(geom.to_dict())

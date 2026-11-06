@@ -12,7 +12,7 @@ Trained detector classifies cars, vans, trucks, motorcycles, and buses. Motion m
 
 ## Design rules
 
-- **Motion is the default count path.** `detector_mode=trained` runs Ultralytics YOLO detect (not ByteTrack) at `TRAIN_IMGSZ` 1280 and feeds the same trip logic. Prefer site `training/weights/best.pt`; otherwise a user-chosen `.pt` or `yolo11n.pt`.
+- **Motion is the default count path.** `detector_mode=trained` runs Ultralytics YOLO detect (not ByteTrack) at `DETECTOR_IMGSZ` (default 960; Settings 640 / 960 / 1280) on CUDA with FP16 when available, and feeds the same trip logic. Training stays at `TRAIN_IMGSZ` 1280. Prefer site `training/weights/best.pt`; otherwise a user-chosen `.pt` or `yolo11n.pt`.
 - **Classes come from the trained detector only.** Motion trips stay `vehicle`. Export rows are Car / Van / Truck / Motorcycle / Bus count plus Number of all vehicles.
 - **North is whatever the operator drew**, not image-up.
 - **Gates are optional per side.** One-way intersections are valid (`is_ready` = North + ≥1 start + ≥1 end).
@@ -54,10 +54,10 @@ videos on disk
 | `traffic_tracker/core/project.py` | Clip list, confirm/skip, `ready_jobs`. |
 | `traffic_tracker/core/training.py` | Session folders, JSON + YOLO labels, `size_prior.json`, flattened `training/dataset`. |
 | `traffic_tracker/core/trainer.py` | Fine-tune YOLO11n from boxed sessions; copy `training/weights/best.pt`. |
-| `traffic_tracker/core/detector.py` | YOLO predict at imgsz 1280 for the trained process path. |
-| `traffic_tracker/core/settings.py` | `app_settings.json`: export dir, OneDrive warning, detector mode, theme. |
+| `traffic_tracker/core/detector.py` | YOLO predict at `DETECTOR_IMGSZ` with CUDA device + FP16 when available. |
+| `traffic_tracker/core/settings.py` | `app_settings.json`: export dir, OneDrive warning, detector mode, theme, precision, detect size, stride, live preview. |
 | `traffic_tracker/core/video.py` | Probe, duration, random frame, OneDrive path hint. |
-| `traffic_tracker/core/device.py` | CUDA / MPS / CPU probe. Distinguishes a missing GPU from a CPU-only PyTorch wheel. |
+| `traffic_tracker/core/device.py` | CUDA / MPS / CPU probe. `yolo_runtime` maps CUDA to device index 0 + FP16. Distinguishes a missing GPU from a CPU-only PyTorch wheel. |
 | `traffic_tracker/core/models.py` | Resolves bundled `yolo11n.pt` as the fine-tune start. |
 | `traffic_tracker/gui/main_window.py` | Home + Process wizard + Training + Settings. |
 | `traffic_tracker/gui/worker.py` | `ProcessWorker` and `TrainWorker` threads. |
@@ -122,7 +122,7 @@ Preview tints the mask green and labels each box `#{id} width×height`.
 
 ## Tracks and trips
 
-`processor.py` does **not** use ByteTrack. Each frame’s boxes are matched to live tracks with greedy IoU first, then nearest unused centroid within a speed-capped radius (trained) or `_adopt_radius` (motion), plus a 4× area similarity check. Path traces skip inactive tracks and split on teleport jumps. User-drawn **drop zones** (`geometry.occlusions`) mark dark patches that hide cars: an active track coasts along its velocity through the box, and reconnect distance is the zone size plus predicted travel instead of a flat +48 px.
+`processor.py` does **not** use ByteTrack. Each frame’s boxes are matched to live tracks with greedy IoU first, then nearest unused centroid within a speed-capped radius (trained) or `_adopt_radius` (motion), plus a 4× area similarity check. Path traces skip inactive tracks and split on teleport jumps. User-drawn **drop zones** (`geometry.occlusions`) mark dark patches that hide cars. An active track keeps a lead point `prediction_reach_px` ahead (set on the drawing step). When the box is lost in a zone that tip freezes as a pickup; a nearby re-detection reconnects the same ID. The drawn trace stitches the last real point to the next real point in a straight line — predicted leads are not drawn, because that sprayed a fan on every flicker. Predictions do not count gate crossings.
 
 A track stores first/last point, last box size, and an optional first-gate origin.
 
@@ -135,11 +135,11 @@ Once a track has two sightings and is moving slowly (or already held), it stays 
 
 If the track dies with only one gate, the last point’s side can finish the trip. If it never hit a gate but first and last sides differ and travel exceeds `_min_travel`, that path still becomes a trip.
 
-`Trip.vehicle_class` is `car` / `van` / `truck` / `motorcycle` / `bus` from the trained detector, or `vehicle` from motion. `Trip.path` is the centroid polyline used for the export overlay.
+`Trip.vehicle_class` is `car` / `van` / `truck` / `motorcycle` / `bus` from the trained detector, or `vehicle` from motion. `Trip.path` is the centroid polyline used for the export overlay. Tracks that never complete a trip do not keep a finished path and are not drawn.
 
 ## Export
 
-`export_tmc_workbook` writes three sheets. If `path_image` is set, Gate Statistics also embeds that PNG and writes `{stem}_paths.png` beside the workbook.
+`export_tmc_workbook` writes three sheets. If `path_image` is set, Gate Statistics embeds that PNG and writes `{stem}_paths.png` (all trip traces) beside the workbook. `route_images` writes `{stem}_paths_{route}.png` for each movement that has trips.
 
 - **Overview** — Car / Van / Truck / Motorcycle / Bus count, then **Number of all vehicles**.
 - **Gate Statistics** — the same class rows per entry/exit, plus the darkened path-trace still under the table.
@@ -153,12 +153,12 @@ Clock time is optional. If the operator sets a start datetime, bin labels are wa
 
 0. **Home** — Process / Training / Settings cards.
 1. **Setup** — add videos/folder, OneDrive warning, clock, export folder, load/save project.
-2. **Routes** — North, add start/end (Auto or explicit name), add one or more vehicle masks, optional drop zones over dark patches, save/load geometry JSON.
+2. **Routes** — North, add start/end (Auto or explicit name), add one or more vehicle masks, optional drop zones over dark patches, prediction reach (px on this frame), save/load geometry JSON.
 3. **Align** — per-clip nudge, wheel zoom, rotate, match points, optional redraw, confirm.
 4. **Process** — log, progress, live preview.
 5. **Report** — tabs matching the workbook (Overview / Gate Statistics / TMC Summary), plus Open export folder.
 6. **Training** — pick a video, box vehicles on random frames, save/load/delete sessions, **Train detector**.
-7. **Settings** — theme, export folder, OneDrive warning, detector mode, view/import/export training data.
+7. **Settings** — theme (Prime AE navy / orange dark + white / navy light), export folder, OneDrive warning, detector mode, view/import/export training data. Logos live in `traffic_tracker/gui/brand/`.
 
 `FrameCanvas` modes: `view`, `draw` (line or box), `nudge`, `match`. Vehicle mask and Training use `set_drawing_enabled(True, box=True)` and `on_box_drawn`.
 
@@ -175,7 +175,7 @@ Route masks live on the drawing step. Training boxes live in `training/sessions/
 - Minimum to train: `TRAIN_MIN_FRAMES` (20) and `TRAIN_MIN_BOXES` (40).
 - North/gates are not required.
 
-`traffic_tracker/core/trainer.py` fine-tunes `yolo11n.pt` for 60 epochs at imgsz 1280 on a `TrainWorker` thread. **Train detector** starts from `visdrone.pt` when that file exists, writes `training/weights/site.pt`, and copies it to `best.pt` (`TRAIN_SITE_EPOCHS` 40). VisDrone weights stay selectable in Settings. **Train on VisDrone** (`python -m traffic_tracker.train_visdrone`) downloads VisDrone2019-DET, writes `training/weights/visdrone.pt`, and copies it to `best.pt`. Detector keeps cars, vans, trucks, buses, and motorcycles. Settings stores a precision preset (`strict` / `balanced` / `sensitive` / `custom`) and passes confidence, NMS IoU, parked radius, link speed, and path-jump into `process_video`. Balanced defaults are confidence 0.35 and NMS IoU 0.40. Frame-to-frame association prefers `box_iou` ≥ `DETECTOR_MATCH_IOU_MIN`, then speed-capped centroid linking. It drops people, bicycles, boats/watercraft, and tricycles. Trained mode only activates a track after it walks out of a settle radius (`DETECTOR_STATIC_RADIUS_*`) with small steps (`DETECTOR_LINK_*`). The settle point creeps with hover drift so parked cars and mislabeled boats do not appear in preview, traces, or trips. A hop to another stall starts a new track instead of a lot-spanning line. It does not infer first→last trips without a gate start. Do not run a live train in unit tests. The boxed Training UI stays until VisDrone is proven better.
+`traffic_tracker/core/trainer.py` fine-tunes `yolo11n.pt` for 60 epochs at imgsz 1280 on a `TrainWorker` thread. **Train detector** starts from `visdrone.pt` when that file exists, writes `training/weights/site.pt`, and copies it to `best.pt` (`TRAIN_SITE_EPOCHS` 40). VisDrone weights stay selectable in Settings. **Train on VisDrone** (`python -m traffic_tracker.train_visdrone`) downloads VisDrone2019-DET, writes `training/weights/visdrone.pt`, and copies it to `best.pt`. Detector keeps cars, vans, trucks, buses, and motorcycles. Settings stores a precision preset (`strict` / `balanced` / `sensitive` / `custom`) and passes confidence, NMS IoU, parked radius, link speed, path-jump, detect size, detect stride, and live-preview interval into `process_video`. Speed knobs do not switch the preset to Custom. GPU inference uses `yolo_runtime` (CUDA index 0 + FP16). Detect stride skips YOLO on non-multiples of N and still calls `_record_crossings` so hold / coast / drop-zone pickup continue; motion mode still runs MOG2 every frame. Balanced defaults are confidence 0.35 and NMS IoU 0.40. Frame-to-frame association prefers `box_iou` ≥ `DETECTOR_MATCH_IOU_MIN`, then speed-capped centroid linking. It drops people, bicycles, boats/watercraft, and tricycles. Trained mode only activates a track after it walks out of a settle radius (`DETECTOR_STATIC_RADIUS_*`) with small steps (`DETECTOR_LINK_*`). The settle point creeps with hover drift so parked cars and mislabeled boats do not appear in preview, traces, or trips. A hop to another stall starts a new track instead of a lot-spanning line. It does not infer first→last trips without a gate start. Do not run a live train in unit tests. The boxed Training UI stays until VisDrone is proven better.
 
 ## Project file
 
@@ -197,7 +197,7 @@ Route masks live on the drawing step. Training boxes live in `training/sessions/
 Run from the repo root with the venv:
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_crossings tests.test_motion tests.test_geometry_names tests.test_report tests.test_transform tests.test_models tests.test_training tests.test_device -q
+& "$env:LOCALAPPDATA\traffic-tracker\venv\Scripts\python.exe" -m unittest tests.test_crossings tests.test_motion tests.test_geometry_names tests.test_report tests.test_transform tests.test_models tests.test_training tests.test_device tests.test_tracking_rules -q
 ```
 
 | File | Covers |
@@ -208,7 +208,9 @@ Run from the repo root with the venv:
 | `tests/test_report.py` | Bins, Las Olas sheets, geometry round-trip including vehicle masks. |
 | `tests/test_transform.py` | Translate/scale/homography, project file. |
 | `tests/test_models.py` | Legacy weight-path resolver (unused by the count path). |
-| `tests/test_training.py` | Session JPEG/JSON/YOLO round-trip, size prior, dataset flatten/split, settings fallback. |
+| `tests/test_training.py` | Session JPEG/JSON/YOLO round-trip, size prior, dataset flatten/split, settings fallback, detect size / GPU predict kwargs. |
+| `tests/test_device.py` | CUDA probe, `yolo_runtime` FP16 mapping. |
+| `tests/test_tracking_rules.py` | Hold / drop-zone pickup, detect stride, live-preview gating. |
 | `tests/test_backend_parity.py` | Opt-in golden-video compare; both calls now hit the same motion path. |
 
 Avoid spinning a `QApplication` in unit tests (Qt plugin path issues on some Windows setups). Prefer testing geometry, motion, and report without the GUI.
@@ -230,6 +232,10 @@ In `traffic_tracker/config.py`:
 | `VEHICLE_REF_MIN_FACTOR` / `VEHICLE_REF_MAX_FACTOR` | Band around drawn masks and Training boxes. |
 | `TRAINING_DIR_NAME` / `SIZE_PRIOR_NAME` | Local dataset + size prior. |
 | `TRAINED_WEIGHTS_REL` | `weights/best.pt` under the training folder. |
+| `TRAIN_IMGSZ` | Training letterbox (1280). Process does not use this. |
+| `DETECTOR_IMGSZ` / `DETECTOR_IMGSZ_CHOICES` | Process-time YOLO letterbox (default 960). |
+| `DETECTOR_STRIDE` / `DETECTOR_STRIDE_MAX` | Run YOLO every N frames (1–3). Motion still every frame. |
+| `PREVIEW_EVERY` / `PREVIEW_EVERY_CHOICES` | Live preview interval; 0 is off. |
 | `SETTINGS_FILE_NAME` | `app_settings.json`. |
 | `RANDOM_FRAME_MARGIN` | Avoid black first/last frames when picking a draw frame. |
 

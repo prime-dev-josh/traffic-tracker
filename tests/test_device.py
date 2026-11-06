@@ -6,6 +6,7 @@ from traffic_tracker.core.device import (
     nvidia_gpu_names,
     reset_device_cache,
     torch_cuda_build,
+    yolo_runtime,
 )
 
 
@@ -42,6 +43,13 @@ class DeviceReportTests(unittest.TestCase):
 
     def test_torch_cuda_build_reads_version(self) -> None:
         self.assertIsInstance(torch_cuda_build(), bool)
+
+    def test_yolo_runtime_uses_cuda_index_and_half(self) -> None:
+        self.assertEqual(yolo_runtime("cuda"), (0, True))
+        self.assertEqual(yolo_runtime("cpu"), ("cpu", False))
+        self.assertEqual(yolo_runtime("mps"), ("mps", False))
+        with patch("traffic_tracker.core.device.detect_device", return_value="cuda"):
+            self.assertEqual(yolo_runtime(), (0, True))
 
 
 if __name__ == "__main__":

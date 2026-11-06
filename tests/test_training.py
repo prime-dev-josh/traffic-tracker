@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 import tempfile
 import unittest
 
 import numpy as np
 
-from traffic_tracker.config import DETECTOR_CONF, TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
+from traffic_tracker.config import DETECTOR_CONF, DETECTOR_IMGSZ, TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
 from traffic_tracker.core.detector import boxes_from_detector, keep_detector_class, resolve_detector_weights, weights_for_source
 from traffic_tracker.core.settings import (
     AppSettings,
     apply_precision_preset,
+    clamp_detect_stride,
     clamp_detector_conf,
+    clamp_detector_imgsz,
     clamp_detector_iou,
+    clamp_preview_every,
     load_settings,
     save_settings,
 )
@@ -139,6 +143,9 @@ class SettingsTests(unittest.TestCase):
                     detector_mode="trained",
                     theme="light",
                     detector_conf=0.4,
+                    detector_imgsz=640,
+                    detect_stride=2,
+                    preview_every=0,
                 ),
                 base=base,
             )
@@ -148,6 +155,9 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.detector_mode, "trained")
             self.assertEqual(loaded.theme, "light")
             self.assertAlmostEqual(loaded.detector_conf, 0.4)
+            self.assertEqual(loaded.detector_imgsz, 640)
+            self.assertEqual(loaded.detect_stride, 2)
+            self.assertEqual(loaded.preview_every, 0)
 
     def test_detector_conf_clamps(self) -> None:
         self.assertEqual(clamp_detector_conf(0.4), 0.4)
@@ -156,6 +166,16 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(clamp_detector_conf("nope"), DETECTOR_CONF)
         self.assertEqual(clamp_detector_iou(0.2), 0.2)
         self.assertEqual(clamp_detector_iou(2), 0.70)
+        self.assertEqual(clamp_detector_imgsz(640), 640)
+        self.assertEqual(clamp_detector_imgsz(700), 640)
+        self.assertEqual(clamp_detector_imgsz(2000), 1280)
+        self.assertEqual(clamp_detector_imgsz("nope"), DETECTOR_IMGSZ)
+        self.assertEqual(clamp_detect_stride(2), 2)
+        self.assertEqual(clamp_detect_stride(0), 1)
+        self.assertEqual(clamp_detect_stride(9), 3)
+        self.assertEqual(clamp_preview_every(0), 0)
+        self.assertEqual(clamp_preview_every(18), 15)
+        self.assertEqual(clamp_preview_every(90), 60)
 
     def test_precision_preset_fills_sliders(self) -> None:
         tuned = apply_precision_preset(AppSettings(), "strict")
@@ -166,6 +186,13 @@ class SettingsTests(unittest.TestCase):
         self.assertLess(tuned.link_speed, AppSettings().link_speed)
         custom = apply_precision_preset(tuned, "nope")
         self.assertEqual(custom.precision_preset, "custom")
+
+    def test_precision_preset_leaves_speed_knobs(self) -> None:
+        settings = AppSettings(detector_imgsz=640, detect_stride=3, preview_every=0)
+        tuned = apply_precision_preset(settings, "strict")
+        self.assertEqual(tuned.detector_imgsz, 640)
+        self.assertEqual(tuned.detect_stride, 3)
+        self.assertEqual(tuned.preview_every, 0)
 
 
 class DetectorWeightsTests(unittest.TestCase):
@@ -202,9 +229,33 @@ class DetectorWeightsTests(unittest.TestCase):
             dest.write_bytes(b"pt")
             self.assertEqual(resolve_detector_weights(None, base), dest)
 
-    def test_predict_uses_train_image_size(self) -> None:
+    def test_predict_uses_detector_image_size(self) -> None:
         self.assertEqual(TRAIN_IMGSZ, 1280)
-        self.assertIn("TRAIN_IMGSZ", boxes_from_detector.__code__.co_names)
+        self.assertEqual(DETECTOR_IMGSZ, 960)
+        self.assertIn("DETECTOR_IMGSZ", boxes_from_detector.__code__.co_names)
+        self.assertNotIn("TRAIN_IMGSZ", boxes_from_detector.__code__.co_names)
+
+    def test_predict_passes_device_half_and_imgsz(self) -> None:
+        model = MagicMock()
+        model.names = {2: "car"}
+        result = MagicMock()
+        result.boxes = None
+        model.predict.return_value = [result]
+        frame = np.zeros((80, 80, 3), dtype=np.uint8)
+        with patch("traffic_tracker.core.detector.yolo_runtime", return_value=(0, True)) as runtime:
+            boxes_from_detector(
+                model,
+                frame,
+                min_area=1,
+                max_area=1e9,
+                imgsz=640,
+                device="cuda",
+            )
+        runtime.assert_called_once_with("cuda")
+        kwargs = model.predict.call_args.kwargs
+        self.assertEqual(kwargs["imgsz"], 640)
+        self.assertEqual(kwargs["device"], 0)
+        self.assertTrue(kwargs["half"])
 
     def test_visdrone_keeps_vehicles_drops_people(self) -> None:
         names = {

@@ -455,20 +455,39 @@ def _write_tmc_summary(
     ws.freeze_panes = "A5"
 
 
-def _embed_path_image(ws, image, last_row: int, dest: Path) -> Path | None:
-    if image is None:
-        return None
+def _safe_route_token(name: str) -> str:
+    token = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(name).strip())
+    return token.strip("._") or "route"
+
+
+def _resized_still(image, max_side: int = 1400):
     import cv2
-    from openpyxl.drawing.image import Image as ExcelImage
 
     frame = image
     height, width = frame.shape[:2]
-    max_side = 1400
     if max(height, width) > max_side:
         scale = max_side / max(height, width)
         frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
-    png_path = dest.with_name(f"{dest.stem}_paths.png")
-    cv2.imwrite(str(png_path), frame)
+    return frame
+
+
+def _write_path_png(dest: Path, image) -> Path:
+    import cv2
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dest), _resized_still(image))
+    return dest
+
+
+def _embed_path_image(ws, image, last_row: int, dest: Path, route_images: dict | None = None) -> Path | None:
+    if image is None:
+        return None
+    from openpyxl.drawing.image import Image as ExcelImage
+
+    png_path = _write_path_png(dest.with_name(f"{dest.stem}_paths.png"), image)
+    for route, frame in (route_images or {}).items():
+        token = _safe_route_token(route)
+        _write_path_png(dest.with_name(f"{dest.stem}_paths_{token}.png"), frame)
     picture = ExcelImage(str(png_path))
     max_w = 720
     if picture.width and picture.width > max_w:
@@ -492,6 +511,7 @@ def export_tmc_workbook(
     trip_count: int | None = None,
     table: pd.DataFrame | None = None,
     path_image=None,
+    route_images: dict | None = None,
 ) -> Path:
     del table, trip_count
     path = Path(path)
@@ -513,7 +533,7 @@ def export_tmc_workbook(
 
     gates = wb.create_sheet("Gate Statistics")
     last_row = _write_gate_statistics(gates, trips, geometry)
-    _embed_path_image(gates, path_image, last_row, path)
+    _embed_path_image(gates, path_image, last_row, path, route_images=route_images)
 
     tmc = wb.create_sheet("TMC Summary")
     _write_tmc_summary(tmc, trips, geometry, duration_s, clock_start)

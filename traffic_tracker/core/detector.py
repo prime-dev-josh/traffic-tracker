@@ -7,7 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from traffic_tracker.config import DETECTOR_CONF, DETECTOR_IOU, TRAIN_IMGSZ, YOLO_PT_NAME
+from traffic_tracker.config import DETECTOR_CONF, DETECTOR_IMGSZ, DETECTOR_IOU, YOLO_PT_NAME
+from traffic_tracker.core.device import yolo_runtime
 from traffic_tracker.core.models import resolve_model_source
 from traffic_tracker.core.training import (
     has_trained_weights,
@@ -147,11 +148,22 @@ def boxes_from_detector(
     max_area: float,
     conf: float = DETECTOR_CONF,
     iou: float = DETECTOR_IOU,
+    imgsz: int = DETECTOR_IMGSZ,
+    device: str | None = None,
 ) -> tuple[list[tuple[tuple[float, float, float, float], str, float]], np.ndarray]:
     """Return ((x1, y1, x2, y2), class, confidence) detections and a preview mask."""
     height, width = frame.shape[:2]
     mask = np.zeros((height, width), dtype=np.uint8)
-    results = model.predict(frame, verbose=False, imgsz=TRAIN_IMGSZ, conf=conf, iou=iou)
+    runtime, half = yolo_runtime(device)
+    results = model.predict(
+        frame,
+        verbose=False,
+        imgsz=int(imgsz) or DETECTOR_IMGSZ,
+        conf=conf,
+        iou=iou,
+        device=runtime,
+        half=half,
+    )
     names = getattr(model, "names", {}) or {}
     if not isinstance(names, dict):
         names = {index: name for index, name in enumerate(names)}

@@ -8,7 +8,13 @@ from typing import Any
 import json
 import math
 
-from traffic_tracker.config import VEHICLE_REF_MAX_FACTOR, VEHICLE_REF_MIN_FACTOR
+from traffic_tracker.config import (
+    PREDICTION_REACH_MAX,
+    PREDICTION_REACH_MIN,
+    PREDICTION_REACH_PX,
+    VEHICLE_REF_MAX_FACTOR,
+    VEHICLE_REF_MIN_FACTOR,
+)
 
 ORIGINS = ("N", "S", "E", "W")
 BOUNDS = ("NB", "SB", "EB", "WB")
@@ -20,6 +26,10 @@ MAX_ROADWAYS = 8
 # Centers this close to a roadway edge still count as inside, so box jitter
 # on the boundary does not create and destroy tracks.
 ROADWAY_MARGIN_PX = 12.0
+
+
+def clamp_prediction_reach(value: float) -> float:
+    return max(PREDICTION_REACH_MIN, min(PREDICTION_REACH_MAX, float(value)))
 
 
 def area_limits_from_areas(areas: list[float]) -> tuple[int, int] | None:
@@ -77,6 +87,16 @@ class Line:
 
     def midpoint(self) -> tuple[float, float]:
         return (self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0
+
+    def length(self) -> float:
+        return math.hypot(self.x2 - self.x1, self.y2 - self.y1)
+
+
+def line_with_length(line: Line, length: float) -> Line:
+    dx, dy = line.x2 - line.x1, line.y2 - line.y1
+    mag = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / mag, dy / mag
+    return Line(line.x1, line.y1, line.x1 + ux * length, line.y1 + uy * length)
 
 
 @dataclass
@@ -300,6 +320,15 @@ class Transform:
         north = None
         if geom.north is not None:
             north = self.apply_line(geom.north, cx, cy)
+        reach = None
+        reach_px = geom.prediction_reach_px
+        if geom.prediction_reach is not None:
+            reach = self.apply_line(geom.prediction_reach, cx, cy)
+            reach_px = clamp_prediction_reach(reach.length())
+        else:
+            x1, y1 = self.apply_point(0.0, 0.0, cx, cy)
+            x2, y2 = self.apply_point(geom.prediction_reach_px, 0.0, cx, cy)
+            reach_px = clamp_prediction_reach(math.hypot(x2 - x1, y2 - y1))
         return Geometry(
             frame_width=geom.frame_width,
             frame_height=geom.frame_height,
@@ -309,6 +338,8 @@ class Transform:
             vehicle_refs=[self.apply_box(box, cx, cy) for box in geom.vehicle_refs],
             occlusions=[self.apply_box(box, cx, cy) for box in geom.occlusions],
             roadways=[self.apply_polygon(poly, cx, cy) for poly in geom.roadways],
+            prediction_reach_px=reach_px,
+            prediction_reach=reach,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -456,6 +487,32 @@ class Geometry:
     vehicle_refs: list[Box] = field(default_factory=list)
     occlusions: list[Box] = field(default_factory=list)
     roadways: list[Polygon] = field(default_factory=list)
+    prediction_reach_px: float = PREDICTION_REACH_PX
+    prediction_reach: Line | None = None
+
+    def __post_init__(self) -> None:
+        self.prediction_reach_px = clamp_prediction_reach(self.prediction_reach_px)
+
+    def set_prediction_reach(self, px: float, line: Line | None = None) -> None:
+        self.prediction_reach_px = clamp_prediction_reach(px)
+        source = line if line is not None else self.prediction_reach
+        if source is not None:
+            self.prediction_reach = line_with_length(source, self.prediction_reach_px)
+
+    def sample_prediction_reach_line(self) -> Line | None:
+        """Drawn reach line, or a sample arrow of length D next to a drop zone / vehicle."""
+        if self.prediction_reach is not None:
+            return self.prediction_reach
+        d = self.prediction_reach_px
+        if self.occlusions:
+            box = self.occlusions[0].normalized()
+            y = (box.y1 + box.y2) / 2.0
+            return Line(box.x1, y, box.x1 + d, y)
+        if self.vehicle_refs:
+            box = self.vehicle_refs[0].normalized()
+            y = (box.y1 + box.y2) / 2.0
+            return Line(box.x2 + 8.0, y, box.x2 + 8.0 + d, y)
+        return None
 
     @property
     def routes(self) -> list[Route]:
@@ -521,6 +578,11 @@ class Geometry:
         sx = width / self.frame_width
         sy = height / self.frame_height
         north = self.north.scaled(sx, sy) if self.north else None
+        reach = self.prediction_reach.scaled(sx, sy) if self.prediction_reach else None
+        if reach is not None:
+            reach_px = clamp_prediction_reach(reach.length())
+        else:
+            reach_px = clamp_prediction_reach(self.prediction_reach_px * ((abs(sx) + abs(sy)) / 2.0))
         return Geometry(
             frame_width=width,
             frame_height=height,
@@ -530,6 +592,8 @@ class Geometry:
             vehicle_refs=[box.scaled(sx, sy) for box in self.vehicle_refs],
             occlusions=[box.scaled(sx, sy) for box in self.occlusions],
             roadways=[poly.scaled(sx, sy) for poly in self.roadways],
+            prediction_reach_px=reach_px,
+            prediction_reach=reach,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -542,6 +606,8 @@ class Geometry:
             "vehicle_refs": [asdict(box) for box in self.vehicle_refs],
             "occlusions": [asdict(box) for box in self.occlusions],
             "roadways": [{"points": [[x, y] for x, y in poly.points]} for poly in self.roadways],
+            "prediction_reach_px": self.prediction_reach_px,
+            "prediction_reach": asdict(self.prediction_reach) if self.prediction_reach else None,
         }
 
     @classmethod
@@ -559,6 +625,11 @@ class Geometry:
             points = [(float(pt[0]), float(pt[1])) for pt in (raw_points or []) if len(pt) >= 2]
             if polygon_is_valid(points):
                 roadways.append(Polygon(_distinct_vertices(points)))
+        reach_raw = data.get("prediction_reach")
+        reach = Line(**reach_raw) if isinstance(reach_raw, dict) else None
+        reach_px = data.get("prediction_reach_px")
+        if reach_px is None and reach is not None:
+            reach_px = reach.length()
         geom = cls(
             frame_width=int(data.get("frame_width", 1)),
             frame_height=int(data.get("frame_height", 1)),
@@ -568,6 +639,8 @@ class Geometry:
             vehicle_refs=refs,
             occlusions=occlusions,
             roadways=roadways,
+            prediction_reach_px=float(reach_px) if reach_px is not None else PREDICTION_REACH_PX,
+            prediction_reach=reach,
         )
         # Legacy pair files: treat each pair as unnamed start/end segments.
         if not starts and data.get("routes"):

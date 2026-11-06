@@ -11,6 +11,7 @@ import numpy as np
 
 from traffic_tracker.config import (
     DETECTOR_CONF,
+    DETECTOR_IMGSZ,
     DETECTOR_LINK_CAP_FRAC,
     DETECTOR_LINK_CAP_MIN,
     DETECTOR_LINK_MIN_PX,
@@ -23,10 +24,13 @@ from traffic_tracker.config import (
     DETECTOR_STATIC_RADIUS_FRAC,
     DETECTOR_STATIC_RADIUS_MIN,
     DETECTOR_STATIC_SETTLE_S,
+    DETECTOR_STRIDE,
     MOTION_COAST_S,
     MOTION_HOLD_S,
     MOTION_HOLD_SPEED_PX_S,
     MOTION_WARMUP_S,
+    PREDICTION_REACH_PX,
+    PREVIEW_EVERY,
 )
 from traffic_tracker.core.crossings import bbox_center, box_iou, confirmed_cross_t, path_cross_t, signed_offset
 from traffic_tracker.core.geometry import (
@@ -34,6 +38,7 @@ from traffic_tracker.core.geometry import (
     ORIGINS,
     Geometry,
     NamedLine,
+    clamp_prediction_reach,
     name_from_north,
     point_in_roadway,
     side_from_point,
@@ -44,6 +49,7 @@ from traffic_tracker.core.detector import (
     reset_detector_cache,
     resolve_detector_weights,
 )
+from traffic_tracker.core.device import describe_device, detect_device
 from traffic_tracker.core.motion import (
     blobs_from_frame,
     create_subtractor,
@@ -71,6 +77,7 @@ class ProcessResult:
     end_crossings: int = 0
     frames_with_tracks: int = 0
     trace_image: np.ndarray | None = None
+    route_images: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +109,8 @@ class _TrackState:
     estimate: str = "observed"
     confidence: float = 0.0
     start_evidence: str = "observed"
+    lead_xy: tuple[float, float] | None = None
+    pickup_xy: tuple[float, float] | None = None
 
 
 @dataclass
@@ -157,6 +166,20 @@ def reset_model_cache() -> None:
     reset_detector_cache()
 
 
+def should_run_detector(frame_idx: int, stride: int) -> bool:
+    """True on frame 1 and every Nth frame after that (1-based index)."""
+    step = max(1, int(stride))
+    return (max(int(frame_idx), 1) - 1) % step == 0
+
+
+def should_emit_preview(frame_idx: int, preview_every: int) -> bool:
+    """False when preview_every is 0 (live preview off)."""
+    every = int(preview_every)
+    if every <= 0:
+        return False
+    return frame_idx == 1 or frame_idx % every == 0
+
+
 def process_video(
     video_path: str,
     geometry: Geometry,
@@ -165,7 +188,7 @@ def process_video(
     cancel_flag: Callable[[], bool] | None = None,
     progress_cb: ProgressCb | None = None,
     preview_cb: PreviewCb | None = None,
-    preview_every: int = 15,
+    preview_every: int = PREVIEW_EVERY,
     min_area: int | None = None,
     max_area: int | None = None,
     overhead_drone: bool = True,
@@ -178,9 +201,11 @@ def process_video(
     link_speed: float | None = None,
     path_jump: float | None = None,
     diagnostics: bool = False,
+    detector_imgsz: int = DETECTOR_IMGSZ,
+    detect_stride: int = DETECTOR_STRIDE,
 ) -> ProcessResult:
     """Process one video. Moving blobs or YOLO boxes in the size band are vehicles."""
-    del device, overhead_drone
+    del overhead_drone
     info = probe_video(video_path)
     fitted = geometry.scaled_to(info.width, info.height)
     suggested_min, suggested_max = default_area_limits(info.width, info.height)
@@ -206,11 +231,15 @@ def process_video(
                 fitted,
                 error=f"Could not load detector weights {weights}: {exc}",
             )
-        device_label = f"trained detector ({weights.name})"
+        infer_device = device or detect_device()
+        device_label = f"trained detector ({weights.name}) on {describe_device(infer_device)}"
         model_label = device_label
     else:
+        infer_device = None
         device_label = "motion mask (CPU)"
         model_label = "motion mask"
+    stride = max(1, int(detect_stride or DETECTOR_STRIDE))
+    imgsz = int(detector_imgsz or DETECTOR_IMGSZ)
 
     if progress_cb:
         progress_cb(
@@ -261,17 +290,23 @@ def process_video(
             frame_idx += 1
             elapsed_s = frame_idx / info.fps
             if use_detector and detector is not None:
-                detections, mask = boxes_from_detector(
-                    detector,
-                    frame,
-                    min_area=min_area,
-                    max_area=max_area,
-                    conf=detector_conf,
-                    iou=detector_iou,
-                )
-                boxes = [item[0] for item in detections]
-                classes = [item[1] for item in detections]
-                confs = [float(item[2]) for item in detections]
+                if should_run_detector(frame_idx, stride):
+                    detections, mask = boxes_from_detector(
+                        detector,
+                        frame,
+                        min_area=min_area,
+                        max_area=max_area,
+                        conf=detector_conf,
+                        iou=detector_iou,
+                        imgsz=imgsz,
+                        device=infer_device,
+                    )
+                    boxes = [item[0] for item in detections]
+                    classes = [item[1] for item in detections]
+                    confs = [float(item[2]) for item in detections]
+                else:
+                    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                    boxes, classes, confs = [], [], []
             else:
                 freeze = [
                     state.last_xyxy
@@ -314,7 +349,7 @@ def process_video(
                     pending, fitted, trips, info.name, elapsed_s, infer_path=not use_detector
                 )
 
-            if preview_cb and (frame_idx == 1 or frame_idx % preview_every == 0):
+            if preview_cb and should_emit_preview(frame_idx, preview_every):
                 preview = _draw_motion_preview(
                     frame, mask, boxes, pending, fitted, trips, active_only=use_detector
                 )
@@ -356,8 +391,10 @@ def process_video(
         },
     )
     overlay = None
+    route_images: dict[str, np.ndarray] = {}
     if trace_frame is not None:
         overlay = _draw_path_overlay(trace_frame, trips, pending, fitted)
+        route_images = _route_path_overlays(trace_frame, trips, pending, fitted)
     return ProcessResult(
         info,
         trips,
@@ -368,6 +405,7 @@ def process_video(
         end_crossings=end_crossings,
         frames_with_tracks=frames_with_tracks,
         trace_image=overlay,
+        route_images=route_images,
     )
 
 
@@ -377,6 +415,15 @@ PATH_WIDTH = 1
 
 def _path_color(_cls: str = "") -> tuple[int, int, int]:
     return PATH_COLOR
+
+
+def _path_push(state: _TrackState, xy: tuple[float, float]) -> None:
+    if not state.path:
+        state.path.append(xy)
+        return
+    last = state.path[-1]
+    if ((xy[0] - last[0]) ** 2 + (xy[1] - last[1]) ** 2) ** 0.5 >= 1.0:
+        state.path.append(xy)
 
 
 def _append_path(state: _TrackState, xy: tuple[float, float], geometry: Geometry | None = None) -> None:
@@ -392,15 +439,17 @@ def _append_path(state: _TrackState, xy: tuple[float, float], geometry: Geometry
             for index in range(1, steps):
                 t = index / steps
                 point = (last[0] + dx * t, last[1] + dy * t)
-                prev = state.path[-1]
-                if ((point[0] - prev[0]) ** 2 + (point[1] - prev[1]) ** 2) ** 0.5 >= 1.0:
-                    state.path.append(point)
-    if not state.path:
-        state.path.append(xy)
-        return
-    last = state.path[-1]
-    if ((xy[0] - last[0]) ** 2 + (xy[1] - last[1]) ** 2) ** 0.5 >= 1.0:
-        state.path.append(xy)
+                _path_push(state, point)
+    _path_push(state, xy)
+
+
+def _append_reconnect_path(state: _TrackState, xy: tuple[float, float], geometry: Geometry) -> None:
+    """Stitch a drop-zone gap with a straight line between real observations.
+
+    Pickup/lead is only for re-acquiring the same ID. Drawing through that
+    point sprays a fan every time detection flickers in the zone.
+    """
+    _append_path(state, xy, geometry)
 
 
 def _path_jump_limit(geometry: Geometry | None = None, path_jump: float | None = None) -> float:
@@ -443,7 +492,7 @@ def _path_chunks(
 
 
 def _keep_path(pending: _Pending, state: _TrackState, geometry: Geometry | None = None) -> None:
-    if not state.active:
+    if not state.active or not state.had_gate_trip:
         return
     for chunk in _path_chunks(state.path, _path_jump_limit(geometry, pending.path_jump), geometry):
         pending.finished_paths.append((state.cls, chunk))
@@ -485,16 +534,9 @@ def _draw_paths(
     trips: list[Trip] | None = None,
     geometry: Geometry | None = None,
 ) -> None:
-    del trips
-    traces: list[tuple[str, list[tuple[float, float]]]] = list(pending.finished_paths)
-    traces.extend(
-        (state.cls, state.path)
-        for state in pending.live.values()
-        if state.active and len(state.path) >= 2
-    )
     jump = _path_jump_limit(geometry, pending.path_jump)
-    for _cls, points in traces:
-        for chunk in _path_chunks(points, jump, geometry):
+    for trip in trips or []:
+        for chunk in _path_chunks(list(trip.path), jump, geometry):
             _halo_polyline(frame, chunk, PATH_COLOR, PATH_WIDTH)
 
 
@@ -503,11 +545,36 @@ def _draw_path_overlay(
     trips: list[Trip],
     pending: _Pending,
     geometry: Geometry,
+    *,
+    title: str | None = None,
 ) -> np.ndarray:
     """Darken the still so neon traces stay readable on pale drone pavement."""
     preview = (frame.astype(np.float32) * 0.72).astype(np.uint8)
     _draw_paths(preview, pending, trips, geometry)
-    return _draw_route_overlay(preview, geometry)
+    preview = _draw_route_overlay(preview, geometry)
+    if title:
+        _halo_text(preview, title, (16, 32), PATH_COLOR, 0.8)
+    return preview
+
+
+def _route_path_overlays(
+    frame: np.ndarray,
+    trips: list[Trip],
+    pending: _Pending,
+    geometry: Geometry,
+) -> dict[str, np.ndarray]:
+    """One overlay per movement that has at least one completed trip."""
+    names = list(geometry.movement_names())
+    for trip in trips:
+        if trip.route_name not in names:
+            names.append(trip.route_name)
+    images: dict[str, np.ndarray] = {}
+    for name in names:
+        subset = [trip for trip in trips if trip.route_name == name]
+        if not subset:
+            continue
+        images[name] = _draw_path_overlay(frame, subset, pending, geometry, title=name)
+    return images
 
 
 def _draw_motion_preview(
@@ -588,8 +655,26 @@ def _draw_motion_preview(
             label = f"#{state.tid}"
         _halo_rect(preview, p1, p2, color)
         _halo_text(preview, label, (p1[0], max(16, p1[1] - 6)), color, 0.45)
+    _draw_leads(preview, pending)
     _draw_paths(preview, pending, trips, geometry)
     return _draw_route_overlay(preview, geometry)
+
+
+def _draw_leads(frame: np.ndarray, pending: _Pending) -> None:
+    for state in pending.live.values():
+        if not state.active:
+            continue
+        tip = state.pickup_xy or state.lead_xy
+        if tip is None:
+            continue
+        origin = _observed_origin(state)
+        frozen = state.pickup_xy is not None
+        color = (0, 200, 255) if frozen else (255, 200, 0)
+        a = (int(round(origin[0])), int(round(origin[1])))
+        b = (int(round(tip[0])), int(round(tip[1])))
+        _halo_line(frame, a, b, color, 1)
+        cv2.circle(frame, b, 5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.circle(frame, b, 4, color, -1, cv2.LINE_AA)
 
 
 def _halo_line(frame: np.ndarray, a: tuple[int, int], b: tuple[int, int], color: tuple[int, int, int], width: int = 3) -> None:
@@ -841,6 +926,59 @@ def _predicted_xy(state: _TrackState, elapsed_s: float) -> tuple[float, float]:
     return (origin[0] + state.vel[0] * dt, origin[1] + state.vel[1] * dt)
 
 
+def _prediction_reach(geometry: Geometry) -> float:
+    return clamp_prediction_reach(getattr(geometry, "prediction_reach_px", PREDICTION_REACH_PX) or PREDICTION_REACH_PX)
+
+
+def _heading_unit(state: _TrackState) -> tuple[float, float] | None:
+    speed = (state.vel[0] ** 2 + state.vel[1] ** 2) ** 0.5
+    if speed < MOTION_HOLD_SPEED_PX_S:
+        return None
+    return state.vel[0] / speed, state.vel[1] / speed
+
+
+def _lead_from_state(state: _TrackState, geometry: Geometry) -> tuple[float, float] | None:
+    if not state.active:
+        return None
+    unit = _heading_unit(state)
+    if unit is None:
+        return None
+    origin = _observed_origin(state)
+    reach = _prediction_reach(geometry)
+    return (origin[0] + unit[0] * reach, origin[1] + unit[1] * reach)
+
+
+def _pickup_radius(state: _TrackState, geometry: Geometry) -> float:
+    return max(0.5 * _prediction_reach(geometry), 0.6 * max(state.bbox_wh))
+
+
+def _point_to_segment_dist(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-9:
+        return ((point[0] - start[0]) ** 2 + (point[1] - start[1]) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length2))
+    qx, qy = start[0] + t * dx, start[1] + t * dy
+    return ((point[0] - qx) ** 2 + (point[1] - qy) ** 2) ** 0.5
+
+
+def _near_pickup(state: _TrackState, xy: tuple[float, float], geometry: Geometry) -> bool:
+    pickup = state.pickup_xy
+    if pickup is None:
+        return False
+    radius = _pickup_radius(state, geometry)
+    dist = ((xy[0] - pickup[0]) ** 2 + (xy[1] - pickup[1]) ** 2) ** 0.5
+    if dist <= radius:
+        return True
+    origin = _observed_origin(state)
+    lateral = max(0.5 * max(state.bbox_wh), 0.35 * radius)
+    return _point_to_segment_dist(xy, origin, pickup) <= lateral
+
+
 def _hits_drop_zone(
     state: _TrackState,
     xyxy: tuple[float, float, float, float] | None,
@@ -958,6 +1096,10 @@ def _association_cost(
     dist_last = ((xy[0] - origin[0]) ** 2 + (xy[1] - origin[1]) ** 2) ** 0.5
     dist_pred = ((xy[0] - pred[0]) ** 2 + (xy[1] - pred[1]) ** 2) ** 0.5
     limit = _match_limit(state, dt, geometry, moving_only, link_speed, origin, xy)
+    if state.pickup_xy is not None and _near_pickup(state, xy, geometry):
+        pickup = state.pickup_xy
+        dist_pick = ((xy[0] - pickup[0]) ** 2 + (xy[1] - pickup[1]) ** 2) ** 0.5
+        return dist_pick, "lead-pickup"
     if dist_last > limit:
         return None
     # A hard turn is inside the disk. A neighbor off the velocity is not,
@@ -1366,7 +1508,7 @@ def _record_crossings(
         prev_xy = state.last_observed_xy or state.xy
         prev_t = state.last_observed_s or state.first_time_s
         gap = (not is_new) and (elapsed_s - prev_t) > 0.25
-        evidence = "gap" if gap or method == "drop-zone" else "observed"
+        evidence = "gap" if gap or method in {"drop-zone", "lead-pickup"} else "observed"
         seen.add(state.tid)
         dt = max(elapsed_s - prev_t, 1e-3)
         step_x, step_y = xy[0] - prev_xy[0], xy[1] - prev_xy[1]
@@ -1429,7 +1571,12 @@ def _record_crossings(
             continue
         state.active = True
         state.last_motion_s = elapsed_s
-        _append_path(state, xy, geometry)
+        if state.pickup_xy is not None:
+            _append_reconnect_path(state, xy, geometry)
+        else:
+            _append_path(state, xy, geometry)
+        state.lead_xy = _lead_from_state(state, geometry)
+        state.pickup_xy = None
         if is_new:
             added_s, added_e = 0, 0
             for origin, line in gates:
@@ -1476,13 +1623,16 @@ def _record_crossings(
             continue
         age = elapsed_s - state.last_observed_s
         if _can_coast_drop_zone(state, elapsed_s, geometry):
-            pred = _predicted_xy(state, elapsed_s)
+            if state.pickup_xy is None:
+                state.pickup_xy = state.lead_xy or _lead_from_state(state, geometry)
+            pred = state.pickup_xy or _predicted_xy(state, elapsed_s)
+            state.pickup_xy = pred
+            state.lead_xy = pred
             half_w, half_h = state.bbox_wh[0] / 2.0, state.bbox_wh[1] / 2.0
             state.xy = pred
             state.last_time_s = elapsed_s
             state.estimate = "predicted"
             state.last_xyxy = (pred[0] - half_w, pred[1] - half_h, pred[0] + half_w, pred[1] + half_h)
-            _append_path(state, pred, geometry)
             _note(
                 pending,
                 time_s=elapsed_s,
@@ -1492,7 +1642,7 @@ def _record_crossings(
                 status="predicted",
                 age_s=age,
                 action="predicted",
-                match="drop-zone",
+                match="lead-pickup" if state.pickup_xy is not None else "drop-zone",
                 crossing="rejected",
                 reason="prediction is not a count",
             )

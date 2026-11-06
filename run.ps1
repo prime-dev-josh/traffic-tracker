@@ -1,10 +1,20 @@
-# Launch Traffic Tracker from source (creates .venv and installs deps on first run).
+# Launch Traffic Tracker from source (creates a venv and installs deps on first run).
+# If the repo is on OneDrive, keep the venv in LocalAppData so sync cannot
+# corrupt torch/ultralytics (missing is_fake_tensor, half-written wheels, etc.).
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 Set-Location $Root
 
-$venvPython = Join-Path $Root ".venv\Scripts\python.exe"
-$venvPip = Join-Path $Root ".venv\Scripts\pip.exe"
+function Get-TrafficTrackerVenvDir {
+    if ($Root -match 'OneDrive') {
+        return Join-Path $env:LOCALAPPDATA "traffic-tracker\venv"
+    }
+    return Join-Path $Root ".venv"
+}
+
+$VenvDir = Get-TrafficTrackerVenvDir
+$venvPython = Join-Path $VenvDir "Scripts\python.exe"
+$venvPip = Join-Path $VenvDir "Scripts\pip.exe"
 
 function Find-Python311 {
     $candidates = @(
@@ -26,13 +36,14 @@ function Find-Python311 {
 }
 
 if (-not (Test-Path $venvPython)) {
-    Write-Host "Creating virtual environment (.venv)..." -ForegroundColor Cyan
+    Write-Host "Creating virtual environment ($VenvDir)..." -ForegroundColor Cyan
     $py311 = Find-Python311
-    & $py311 -m venv (Join-Path $Root ".venv")
+    New-Item -ItemType Directory -Force (Split-Path $VenvDir) | Out-Null
+    & $py311 -m venv $VenvDir
 }
 
 if (-not (Test-Path $venvPip)) {
-    throw "Virtual environment is incomplete. Delete .venv and run this script again."
+    throw "Virtual environment is incomplete. Delete $VenvDir and run this script again."
 }
 
 Write-Host "Installing/updating dependencies..." -ForegroundColor Cyan

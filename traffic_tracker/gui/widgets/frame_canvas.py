@@ -17,6 +17,7 @@ END_COLOR = QColor(255, 56, 56)
 NORTH_COLOR = QColor(40, 200, 255)
 VEHICLE_COLOR = QColor(255, 20, 220)
 OCCLUSION_COLOR = QColor(255, 170, 0)
+REACH_COLOR = QColor(255, 210, 80)
 ROADWAY_COLOR = QColor(80, 170, 255, 70)
 ROADWAY_EDGE = QColor(120, 200, 255)
 DRAFT_COLOR = QColor(40, 200, 255)
@@ -46,6 +47,7 @@ class FrameCanvas(QWidget):
         self._match_points: list[tuple[float, float]] = []
         self._draft_box = False
         self._poly_points: list[QPointF] = []
+        self._theme = "dark"
         self.on_line_drawn: Callable[[Line], None] | None = None
         self.on_box_drawn: Callable[[Box], None] | None = None
         self.on_polygon_finished: Callable[[list[tuple[float, float]]], None] | None = None
@@ -93,6 +95,10 @@ class FrameCanvas(QWidget):
 
     def set_geometry(self, geometry: Geometry | None) -> None:
         self._geometry = geometry or Geometry(1, 1)
+        self.update()
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = "light" if theme == "light" else "dark"
         self.update()
 
     def set_routes(self, _routes) -> None:
@@ -246,9 +252,10 @@ class FrameCanvas(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(12, 14, 18))
+        letterbox = QColor(247, 248, 252) if self._theme == "light" else QColor(34, 26, 74)
+        painter.fillRect(self.rect(), letterbox)
         if self._pixmap.isNull():
-            painter.setPen(LABEL_COLOR)
+            painter.setPen(QColor(36, 50, 138) if self._theme == "light" else LABEL_COLOR)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Load a video to see a frame here")
             return
 
@@ -320,6 +327,26 @@ class FrameCanvas(QWidget):
             p2 = self._image_to_widget(box.x2, box.y2)
             draw_halo_rect(QRectF(p1, p2).normalized(), OCCLUSION_COLOR)
             draw_halo_text(p1 + QPointF(6, -6), f"Drop zone {index}", OCCLUSION_COLOR)
+        reach = geom.prediction_reach
+        if reach is None and geom.occlusions:
+            reach = geom.sample_prediction_reach_line()
+        if reach is not None:
+            p1 = self._image_to_widget(reach.x1, reach.y1)
+            p2 = self._image_to_widget(reach.x2, reach.y2)
+            painter.setPen(QPen(HALO_COLOR, 5, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QLineF(p1, p2))
+            painter.setPen(QPen(REACH_COLOR, 2, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(QLineF(p1, p2))
+            painter.setBrush(REACH_COLOR)
+            painter.setPen(QPen(HALO_COLOR, 3))
+            painter.drawEllipse(p2, 6, 6)
+            painter.setPen(QPen(REACH_COLOR, 1))
+            painter.drawEllipse(p2, 5, 5)
+            draw_halo_text(
+                p2 + QPointF(8, -8),
+                f"Reach {int(round(geom.prediction_reach_px))} px",
+                REACH_COLOR,
+            )
         for index, poly in enumerate(geom.roadways, start=1):
             if len(poly.points) < 3:
                 continue

@@ -19,6 +19,12 @@ datas.append(
         "traffic_tracker/core",
     )
 )
+datas.append(
+    (
+        str(project_root / "traffic_tracker" / "gui" / "brand"),
+        "traffic_tracker/gui/brand",
+    )
+)
 
 for pkg in (
     "PyQt6",

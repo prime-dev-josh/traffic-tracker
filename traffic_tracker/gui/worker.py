@@ -10,10 +10,13 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from traffic_tracker.config import (
     DETECTOR_CONF,
+    DETECTOR_IMGSZ,
     DETECTOR_IOU,
     DETECTOR_LINK_SPEED_PX_S,
     DETECTOR_PARKED_RADIUS,
     DETECTOR_PATH_JUMP,
+    DETECTOR_STRIDE,
+    PREVIEW_EVERY,
 )
 from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
@@ -41,6 +44,9 @@ class ProcessWorker(QThread):
         parked_radius: float = DETECTOR_PARKED_RADIUS,
         link_speed: float = DETECTOR_LINK_SPEED_PX_S,
         path_jump: float = DETECTOR_PATH_JUMP,
+        detector_imgsz: int = DETECTOR_IMGSZ,
+        detect_stride: int = DETECTOR_STRIDE,
+        preview_every: int = PREVIEW_EVERY,
     ) -> None:
         super().__init__(parent)
         self._jobs = jobs
@@ -53,6 +59,9 @@ class ProcessWorker(QThread):
         self._parked_radius = parked_radius
         self._link_speed = link_speed
         self._path_jump = path_jump
+        self._detector_imgsz = detector_imgsz
+        self._detect_stride = detect_stride
+        self._preview_every = preview_every
         self._cancel = False
 
     def cancel(self) -> None:
@@ -76,7 +85,8 @@ class ProcessWorker(QThread):
                     geometry,
                     cancel_flag=lambda: self._cancel,
                     progress_cb=progress_cb,
-                    preview_cb=preview_cb,
+                    preview_cb=preview_cb if self._preview_every > 0 else None,
+                    preview_every=self._preview_every,
                     detector_mode=self._detector_mode,
                     weights_path=self._weights_path,
                     detector_conf=self._detector_conf,
@@ -84,6 +94,8 @@ class ProcessWorker(QThread):
                     parked_radius=self._parked_radius,
                     link_speed=self._link_speed,
                     path_jump=self._path_jump,
+                    detector_imgsz=self._detector_imgsz,
+                    detect_stride=self._detect_stride,
                 )
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")
@@ -98,6 +110,7 @@ class ProcessWorker(QThread):
                         clock_start=self._clock_start,
                         device_label=result.device_label,
                         path_image=result.trace_image,
+                        route_images=result.route_images,
                     )
                 results.append(result)
                 self.video_done.emit(result)

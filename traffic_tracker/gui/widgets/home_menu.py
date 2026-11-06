@@ -10,10 +10,13 @@ from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from traffic_tracker.config import APP_NAME, APP_VERSION
+from traffic_tracker.gui.style import load_brand_pixmap
 
-ACCENT = QColor(61, 139, 253)
-AMBER = QColor(255, 196, 72)
-INK = QColor(232, 234, 237)
+ACCENT = QColor(241, 91, 44)
+AMBER = QColor(241, 91, 44)
+INK = QColor(255, 255, 255)
+NAVY = QColor(34, 26, 74)
+NAVY_TEXT = QColor(36, 50, 138)
 
 
 def hud_font(size: int, *, bold: bool = True, mono: bool = False, tracking: float = 0.0) -> QFont:
@@ -78,10 +81,10 @@ class HomeMenuRow(QWidget):
         self.selected = selected
         self.caret.setVisible(selected)
         light = self._theme == "light"
-        color = (QColor(17, 20, 24) if light else INK) if selected else (
-            QColor(90, 98, 112) if light else QColor(154, 160, 166)
+        color = (NAVY_TEXT if light else INK) if selected else (
+            QColor(107, 115, 161) if light else QColor(197, 192, 220)
         )
-        accent = ACCENT if selected else (QColor(110, 120, 134) if light else QColor(90, 98, 112))
+        accent = ACCENT if selected else (QColor(107, 115, 161) if light else QColor(138, 132, 168))
         self.caret.setStyleSheet(f"color: rgb({ACCENT.red()},{ACCENT.green()},{ACCENT.blue()}); background: transparent;")
         self.code_label.setStyleSheet(f"color: rgb({accent.red()},{accent.green()},{accent.blue()}); background: transparent;")
         self.title_label.setStyleSheet(f"color: rgb({color.red()},{color.green()},{color.blue()}); background: transparent;")
@@ -101,8 +104,8 @@ class HomeMenuRow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect().adjusted(2, 4, -2, -4)
         if self.selected:
-            fill = QColor(61, 139, 253, 38)
-            painter.setPen(QPen(QColor(61, 139, 253, 160), 1))
+            fill = QColor(241, 91, 44, 42)
+            painter.setPen(QPen(QColor(241, 91, 44, 180), 1))
             painter.setBrush(fill)
             painter.drawRoundedRect(rect, 4, 4)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -110,11 +113,11 @@ class HomeMenuRow(QWidget):
             painter.drawRect(rect.left(), rect.top() + 8, 3, rect.height() - 16)
         else:
             if self._theme == "light":
-                painter.setPen(QPen(QColor(197, 206, 216, 160), 1))
-                painter.setBrush(QColor(255, 255, 255, 140))
+                painter.setPen(QPen(QColor(212, 216, 236, 180), 1))
+                painter.setBrush(QColor(255, 255, 255, 180))
             else:
-                painter.setPen(QPen(QColor(52, 58, 70, 90), 1))
-                painter.setBrush(QColor(18, 22, 30, 70))
+                painter.setPen(QPen(QColor(74, 66, 120, 120), 1))
+                painter.setBrush(QColor(24, 18, 67, 90))
             painter.drawRoundedRect(rect, 4, 4)
 
 
@@ -136,8 +139,14 @@ class HomeStage(QWidget):
         self._actions = [item[3] for item in actions]
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(72, 56, 72, 36)
+        root.setContentsMargins(72, 40, 72, 36)
         root.setSpacing(0)
+
+        self.logo = QLabel()
+        self.logo.setObjectName("brandMark")
+        self.logo.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        root.addWidget(self.logo)
+        root.addSpacing(8)
 
         self.eyebrow = QLabel("AERIAL COUNT  //  MOTION MASK")
         self.eyebrow.setFont(hud_font(10, mono=True, bold=False, tracking=3))
@@ -213,13 +222,14 @@ class HomeStage(QWidget):
     def set_theme(self, theme: str) -> None:
         self._theme = "light" if theme == "light" else "dark"
         light = self._theme == "light"
-        ink = "#111418" if light else "#ffffff"
-        mute = "#5b6573" if light else "#8b93a1"
-        faint = "#7a8492" if light else "#66707f"
-        self.eyebrow.setStyleSheet("color: #2b6fd6; background: transparent;")
+        ink = "#24328A" if light else "#FFFFFF"
+        mute = "#6B73A1" if light else "#C5C0DC"
+        faint = "#8A90B4" if light else "#8A84A8"
+        self.logo.setPixmap(load_brand_pixmap(self._theme, 72 if light else 88))
+        self.eyebrow.setStyleSheet("color: #F15B2C; background: transparent;")
         self.title_label.setStyleSheet(f"color: {ink}; background: transparent;")
         self.tag.setStyleSheet(f"color: {mute}; background: transparent;")
-        self.detail_code.setStyleSheet("color: #3d8bfd; background: transparent;")
+        self.detail_code.setStyleSheet("color: #F15B2C; background: transparent;")
         self.detail_title.setStyleSheet(f"color: {ink}; background: transparent;")
         self.detail_blurb.setStyleSheet(f"color: {mute}; background: transparent;")
         self.move_hint.setStyleSheet(f"color: {faint}; background: transparent;")
@@ -269,39 +279,40 @@ class HomeStage(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         width, height = self.width(), self.height()
         light = self._theme == "light"
-        painter.fillRect(self.rect(), QColor(236, 240, 245) if light else QColor(6, 8, 12))
+        painter.fillRect(self.rect(), QColor(247, 248, 252) if light else NAVY)
 
         glow = QLinearGradient(0, 0, 0, height)
         if light:
-            glow.setColorAt(0.0, QColor(200, 220, 245, 160))
-            glow.setColorAt(0.45, QColor(236, 240, 245, 0))
-            glow.setColorAt(1.0, QColor(220, 226, 234, 200))
+            glow.setColorAt(0.0, QColor(252, 216, 204, 90))
+            glow.setColorAt(0.4, QColor(247, 248, 252, 0))
+            glow.setColorAt(1.0, QColor(228, 231, 244, 180))
         else:
-            glow.setColorAt(0.0, QColor(20, 36, 64, 160))
-            glow.setColorAt(0.45, QColor(8, 12, 20, 0))
-            glow.setColorAt(1.0, QColor(4, 6, 10, 220))
+            glow.setColorAt(0.0, QColor(241, 91, 44, 50))
+            glow.setColorAt(0.4, QColor(34, 26, 74, 0))
+            glow.setColorAt(1.0, QColor(24, 18, 67, 220))
         painter.fillRect(self.rect(), glow)
 
         pulse = 0.45 + 0.25 * math.sin(self._pulse)
         horizon_y = int(height * 0.42)
-        painter.setPen(QPen(QColor(61, 139, 253, int(40 + 50 * pulse)), 2))
+        painter.setPen(QPen(QColor(241, 91, 44, int(40 + 50 * pulse)), 2))
         painter.drawLine(0, horizon_y, width, horizon_y)
 
         vanish_x = int(width * 0.72)
-        painter.setPen(QPen(QColor(61, 139, 253, 28), 1))
+        painter.setPen(QPen(QColor(241, 91, 44, 28), 1))
         for t in range(-8, 9):
             x = vanish_x + t * 70
             painter.drawLine(vanish_x, horizon_y, x + t * 40, height)
         painter.setPen(QPen(AMBER, 1, Qt.PenStyle.DashLine))
         painter.drawLine(vanish_x, horizon_y, int(width * 0.55), height)
 
+        scan = QColor(255, 255, 255, 10) if not light else QColor(36, 50, 138, 8)
         for y in range(0, height, 4):
-            painter.setPen(QPen(QColor(255, 255, 255, 6), 1))
+            painter.setPen(QPen(scan, 1))
             painter.drawLine(0, y, width, y)
 
-        painter.setPen(QPen(QColor(61, 139, 253, 70), 1))
+        painter.setPen(QPen(QColor(241, 91, 44, 80), 1))
         painter.drawRect(QRect(18, 18, width - 36, height - 36))
-        painter.setPen(QPen(QColor(255, 196, 72, 80), 1))
+        painter.setPen(QPen(QColor(241, 91, 44, 140), 1))
         painter.drawLine(18, 18, 72, 18)
         painter.drawLine(18, 18, 18, 72)
         painter.drawLine(width - 18, height - 18, width - 72, height - 18)
