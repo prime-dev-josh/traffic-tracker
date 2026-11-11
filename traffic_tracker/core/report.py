@@ -216,12 +216,11 @@ def build_tmc_summary_table(
     duration_s: float,
     clock_start: datetime | None = None,
 ) -> pd.DataFrame:
-    origins = geometry.origin_names()
-    moves = geometry.movement_names()
+    groups = _tmc_origin_groups(geometry)
     bin_count = _bin_count(duration_s, trips)
     columns = ["Period"]
-    for origin in origins:
-        columns.extend([name for name in moves if name.startswith(f"{origin}-")])
+    for origin, names in groups:
+        columns.extend(names)
         columns.append(f"{origin} Total")
 
     def empty_counts() -> dict[str, int]:
@@ -380,8 +379,7 @@ def _write_tmc_summary(
     alt_fill = PatternFill("solid", fgColor="F2F2F2")
     thin = _border()
 
-    origins = geometry.origin_names()
-    bounds = geometry.bound_names()
+    groups = _tmc_origin_groups(geometry)
     table = build_tmc_summary_table(trips, geometry, duration_s, clock_start)
 
     ws["A1"] = "TMC Summary"
@@ -394,8 +392,8 @@ def _write_tmc_summary(
     ws.cell(header_row, 1).border = thin
 
     col = 3
-    for index, origin in enumerate(origins):
-        width = max(1, len(bounds)) + 1
+    for index, (origin, moves) in enumerate(groups):
+        width = len(moves) + 1
         start = col
         end = col + width - 1
         ws.merge_cells(start_row=group_row, start_column=start, end_row=group_row, end_column=end)
@@ -403,7 +401,8 @@ def _write_tmc_summary(
         group.font = group_font
         group.fill = group_fills[index % len(group_fills)]
         group.alignment = Alignment(horizontal="center")
-        for offset, bound in enumerate(bounds):
+        for offset, name in enumerate(moves):
+            bound = name.split("-", 1)[1] if "-" in name else name
             cell = ws.cell(header_row, start + offset, bound)
             cell.font = header_font
             cell.fill = col_fill
@@ -430,10 +429,11 @@ def _write_tmc_summary(
             period_cell.fill = hour_fill
 
         col = 3
-        for origin in origins:
-            values = [row[f"{origin}-{bound}"] for bound in bounds] + [row[f"{origin} Total"]]
+        for origin, moves in groups:
+            values = [int(row[name]) if name in row else 0 for name in moves]
+            values.append(int(row[f"{origin} Total"]) if f"{origin} Total" in row else 0)
             for offset, value in enumerate(values):
-                cell = ws.cell(excel_row, col + offset, int(value))
+                cell = ws.cell(excel_row, col + offset, value)
                 cell.font = total_font if is_hour or is_seq else body_font
                 cell.alignment = Alignment(horizontal="center")
                 cell.border = thin
@@ -447,12 +447,23 @@ def _write_tmc_summary(
 
     ws.column_dimensions["A"].width = 28
     used_col = 3
-    for _origin in origins:
-        for _ in range(len(bounds) + 1):
+    for _origin, moves in groups:
+        for _ in range(len(moves) + 1):
             ws.column_dimensions[get_column_letter(used_col)].width = 10
             used_col += 1
         used_col += 1
     ws.freeze_panes = "A5"
+
+
+def _tmc_origin_groups(geometry: Geometry) -> list[tuple[str, list[str]]]:
+    """Per-entry movement columns used by both the on-screen TMC and the Excel sheet."""
+    moves = geometry.movement_names()
+    groups: list[tuple[str, list[str]]] = []
+    for origin in geometry.origin_names():
+        names = [name for name in moves if name.startswith(f"{origin}-")]
+        if names:
+            groups.append((origin, names))
+    return groups
 
 
 def _safe_route_token(name: str) -> str:

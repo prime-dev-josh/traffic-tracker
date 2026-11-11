@@ -18,6 +18,7 @@ from traffic_tracker.core.geometry import (
 )
 from traffic_tracker.core.processor import (
     ID_COUNTED_BGR,
+    ID_ENTRY_BGR,
     ID_LIVE_BGR,
     TrackIssue,
     _Pending,
@@ -552,7 +553,9 @@ class IdLabelTests(unittest.TestCase):
         live = _TrackState(tid=1, xy=(0.0, 0.0), first_xy=(0.0, 0.0), first_time_s=0.0, last_time_s=0.0)
         self.assertEqual(_id_label_color(None), ID_LIVE_BGR)
         self.assertEqual(_id_label_color(live), ID_LIVE_BGR)
-        live.had_gate_trip = True
+        live.entry_origin = "N"
+        self.assertEqual(_id_label_color(live), ID_ENTRY_BGR)
+        live.exit_bound = "SB"
         self.assertEqual(_id_label_color(live), ID_COUNTED_BGR)
 
     def test_id_labels_are_drawn_after_traces(self) -> None:
@@ -592,11 +595,13 @@ class IdLabelTests(unittest.TestCase):
         _record_crossings([_box(50, 55, 20, 20)], geom, pending, trips, "a.mp4", 1.5, moving_only=False)
         state = pending.live[1]
         self.assertEqual(_route_label(state), "N→")
+        self.assertEqual(_id_label_color(state), ID_ENTRY_BGR)
         self.assertEqual(trips, [])
         _record_crossings([_box(50, 90, 20, 20)], geom, pending, trips, "a.mp4", 2.0, moving_only=False)
         self.assertEqual(len(trips), 1)
         state = pending.live[1]
         self.assertEqual(_route_label(state), "N→SB")
+        self.assertEqual(_id_label_color(state), ID_COUNTED_BGR)
         self.assertTrue(state.had_gate_trip)
 
 

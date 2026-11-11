@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import tempfile
@@ -9,7 +10,7 @@ import unittest
 
 import numpy as np
 
-from traffic_tracker.config import DETECTOR_CONF, DETECTOR_IMGSZ, TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
+from traffic_tracker.config import DETECTOR_CONF, DETECTOR_IMGSZ, EXPORT_SUBFOLDER_PATTERN, TRAIN_IMGSZ, TRAIN_MIN_BOXES, TRAIN_MIN_FRAMES
 from traffic_tracker.core.detector import boxes_from_detector, keep_detector_class, resolve_detector_weights, weights_for_source
 from traffic_tracker.core.settings import (
     AppSettings,
@@ -18,8 +19,11 @@ from traffic_tracker.core.settings import (
     clamp_detector_conf,
     clamp_detector_imgsz,
     clamp_detector_iou,
+    clamp_export_pattern,
     clamp_preview_every,
+    export_workbook_path,
     load_settings,
+    resolve_export_folder,
     save_settings,
 )
 from traffic_tracker.core.geometry import Box, Geometry, area_limits_from_areas, merge_area_limits
@@ -138,6 +142,7 @@ class SettingsTests(unittest.TestCase):
             save_settings(
                 AppSettings(
                     export_dir=str(base / "out"),
+                    export_pattern="{date}/{video}",
                     warn_onedrive=False,
                     detector_mode="trained",
                     detector_source="visdrone",
@@ -152,6 +157,7 @@ class SettingsTests(unittest.TestCase):
             )
             loaded = load_settings(base)
             self.assertEqual(loaded.export_dir, str(base / "out"))
+            self.assertEqual(loaded.export_pattern, "{date}/{video}")
             self.assertFalse(loaded.warn_onedrive)
             self.assertEqual(loaded.detector_mode, "trained")
             self.assertEqual(loaded.detector_source, "visdrone")
@@ -161,6 +167,41 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.detect_stride, 2)
             self.assertEqual(loaded.preview_every, 0)
             self.assertFalse(loaded.infer_trips_from_traces)
+
+    def test_missing_export_pattern_uses_default(self) -> None:
+        from traffic_tracker.config import SETTINGS_FILE_NAME
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / SETTINGS_FILE_NAME).write_text('{"export_dir": "out"}', encoding="utf-8")
+            self.assertEqual(load_settings(base).export_pattern, EXPORT_SUBFOLDER_PATTERN)
+
+    def test_export_pattern_clamps_parent_segments(self) -> None:
+        self.assertEqual(clamp_export_pattern("{video}/{date}_{time}"), "{video}/{date}_{time}")
+        self.assertEqual(clamp_export_pattern(""), "")
+        self.assertEqual(clamp_export_pattern("..\\{video}"), "{video}")
+        self.assertEqual(clamp_export_pattern("C:/{video}"), "{video}")
+
+    def test_resolve_export_folder_tokens(self) -> None:
+        stamp = datetime(2026, 11, 11, 16, 52, 3)
+        folder = resolve_export_folder(
+            Path("outputs"),
+            "{video}/{date}_{time}",
+            video_stem="site clip",
+            when=stamp,
+        )
+        self.assertEqual(folder, Path("outputs") / "site_clip" / "2026-11-11_165203")
+        self.assertEqual(
+            resolve_export_folder(Path("outputs"), "", video_stem="clip", when=stamp),
+            Path("outputs"),
+        )
+        workbook = export_workbook_path(
+            Path("outputs"),
+            "{date}/{video}",
+            "north gate",
+            when=stamp,
+        )
+        self.assertEqual(workbook, Path("outputs") / "2026-11-11" / "north_gate" / "north_gate_tmc.xlsx")
 
     def test_legacy_infer_trips_follows_detector_mode(self) -> None:
         from traffic_tracker.config import SETTINGS_FILE_NAME

@@ -112,6 +112,7 @@ class ProcessResult:
     trace_image: np.ndarray | None = None
     route_images: dict[str, np.ndarray] = field(default_factory=dict)
     issues: list[TrackIssue] = field(default_factory=list)
+    export_path: Path | None = None
 
 
 @dataclass
@@ -766,6 +767,7 @@ def _halo_rect(frame: np.ndarray, p1: tuple[int, int], p2: tuple[int, int], colo
 
 
 ID_LIVE_BGR = (40, 40, 255)
+ID_ENTRY_BGR = (255, 90, 40)
 ID_COUNTED_BGR = (40, 220, 40)
 
 
@@ -783,9 +785,11 @@ def _halo_text(
 
 
 def _id_label_color(state: _TrackState | None) -> tuple[int, int, int]:
-    if state is not None and state.had_gate_trip:
+    if state is None or not state.entry_origin:
+        return ID_LIVE_BGR
+    if state.exit_bound:
         return ID_COUNTED_BGR
-    return ID_LIVE_BGR
+    return ID_ENTRY_BGR
 
 
 def _route_label(state: _TrackState | None) -> str:

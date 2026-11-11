@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
@@ -50,6 +51,7 @@ from traffic_tracker.config import (
     DETECTOR_PATH_JUMP_MAX,
     DETECTOR_PATH_JUMP_MIN,
     DETECTOR_STRIDE_MAX,
+    EXPORT_PATTERN_PRESETS,
     PREVIEW_EVERY_CHOICES,
     PREDICTION_REACH_MAX,
     PREDICTION_REACH_MIN,
@@ -100,11 +102,13 @@ from traffic_tracker.core.settings import (
     clamp_detector_conf,
     clamp_detector_imgsz,
     clamp_detector_iou,
+    clamp_export_pattern,
     clamp_link_speed,
     clamp_parked_radius,
     clamp_path_jump,
     clamp_preview_every,
     load_settings,
+    resolve_export_folder,
     save_settings,
 )
 from traffic_tracker.core.detector import (
@@ -351,6 +355,7 @@ class MainWindow(QMainWindow):
         theme_row.addWidget(self.theme_combo, 1)
         form.addLayout(theme_row)
 
+        form.addWidget(self._section("Export"))
         export_row = QHBoxLayout()
         self.settings_export_label = QLabel(f"Export folder: {self.export_dir}")
         self.settings_export_label.setObjectName("hint")
@@ -360,6 +365,40 @@ class MainWindow(QMainWindow):
         export_row.addWidget(self.settings_export_label, 1)
         export_row.addWidget(choose)
         form.addLayout(export_row)
+
+        pattern_row = QHBoxLayout()
+        pattern_row.addWidget(QLabel("Subfolder"))
+        self.export_pattern_combo = QComboBox()
+        for pattern, label in EXPORT_PATTERN_PRESETS:
+            self.export_pattern_combo.addItem(label, pattern)
+        self.export_pattern_combo.addItem("Custom pattern", "custom")
+        pattern_row.addWidget(self.export_pattern_combo, 1)
+        form.addLayout(pattern_row)
+
+        self.export_pattern_edit = QLineEdit()
+        self.export_pattern_edit.setPlaceholderText("{video}/{date}_{time}")
+        self.export_pattern_edit.setText(self.settings.export_pattern)
+        self.export_pattern_edit.setToolTip(
+            "Creates a new folder for each run. Tokens: {video} {date} {time} {datetime}. "
+            "Leave blank to save directly in the export folder."
+        )
+        form.addWidget(self.export_pattern_edit)
+        pattern_hint = QLabel(
+            "Each process run writes the spreadsheet and path images into a new folder. "
+            "Use {video} for the clip name, {date} and {time} for the run stamp. "
+            "Blank saves into the export folder with no extra subfolder."
+        )
+        pattern_hint.setObjectName("hint")
+        pattern_hint.setWordWrap(True)
+        form.addWidget(pattern_hint)
+        self.export_pattern_preview = QLabel("")
+        self.export_pattern_preview.setObjectName("hint")
+        self.export_pattern_preview.setWordWrap(True)
+        form.addWidget(self.export_pattern_preview)
+        self._sync_export_pattern_combo()
+        self._refresh_export_preview()
+        self.export_pattern_combo.currentIndexChanged.connect(self._export_pattern_preset_changed)
+        self.export_pattern_edit.textChanged.connect(self._export_pattern_edited)
 
         self.warn_onedrive_check = QCheckBox("Warn when videos are on OneDrive")
         self.warn_onedrive_check.setChecked(self.settings.warn_onedrive)
@@ -661,6 +700,11 @@ class MainWindow(QMainWindow):
         export_row.addWidget(self.export_label, 1)
         export_row.addWidget(choose_export)
         left_layout.addLayout(export_row)
+        self.setup_export_preview = QLabel("")
+        self.setup_export_preview.setObjectName("hint")
+        self.setup_export_preview.setWordWrap(True)
+        left_layout.addWidget(self.setup_export_preview)
+        self._refresh_export_preview()
 
         proj = QHBoxLayout()
         load_proj = QPushButton("Load project")
@@ -1092,6 +1136,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self.onedrive_warn.setText("")
+        if hasattr(self, "setup_export_preview"):
+            self._refresh_export_preview()
 
     def _add_videos(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -1129,10 +1175,66 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Choose export folder")
         if folder:
             self.export_dir = Path(folder)
-            self.export_label.setText(f"Export folder: {self.export_dir}")
-            if hasattr(self, "settings_export_label"):
-                self.settings_export_label.setText(f"Export folder: {self.export_dir}")
+            self._refresh_export_preview()
             self._persist_settings()
+
+    def _export_example_stem(self) -> str:
+        if self.videos:
+            return self.videos[0].stem
+        return "clip"
+
+    def _current_export_pattern(self) -> str:
+        if hasattr(self, "export_pattern_edit"):
+            return clamp_export_pattern(self.export_pattern_edit.text())
+        return clamp_export_pattern(self.settings.export_pattern)
+
+    def _sync_export_pattern_combo(self) -> None:
+        if not hasattr(self, "export_pattern_combo"):
+            return
+        pattern = self._current_export_pattern()
+        index = self.export_pattern_combo.findData(pattern)
+        if index < 0:
+            index = self.export_pattern_combo.findData("custom")
+        self.export_pattern_combo.blockSignals(True)
+        self.export_pattern_combo.setCurrentIndex(max(0, index))
+        self.export_pattern_combo.blockSignals(False)
+
+    def _refresh_export_preview(self) -> None:
+        pattern = self._current_export_pattern()
+        example = resolve_export_folder(
+            self.export_dir,
+            pattern,
+            video_stem=self._export_example_stem(),
+            when=datetime.now(),
+        )
+        text = f"Export folder: {self.export_dir}"
+        if hasattr(self, "export_label"):
+            self.export_label.setText(text)
+        if hasattr(self, "settings_export_label"):
+            self.settings_export_label.setText(text)
+        preview = f"Next run saves into: {example}"
+        if hasattr(self, "export_pattern_preview"):
+            self.export_pattern_preview.setText(preview)
+        if hasattr(self, "setup_export_preview"):
+            self.setup_export_preview.setText(preview)
+
+    def _export_pattern_preset_changed(self, *_args) -> None:
+        if not hasattr(self, "export_pattern_combo"):
+            return
+        data = self.export_pattern_combo.currentData()
+        if data == "custom":
+            return
+        if hasattr(self, "export_pattern_edit"):
+            self.export_pattern_edit.blockSignals(True)
+            self.export_pattern_edit.setText(str(data or ""))
+            self.export_pattern_edit.blockSignals(False)
+        self._refresh_export_preview()
+        self._persist_settings()
+
+    def _export_pattern_edited(self, *_args) -> None:
+        self._sync_export_pattern_combo()
+        self._refresh_export_preview()
+        self._persist_settings()
 
     def _go_routes(self) -> None:
         if not self.videos:
@@ -2257,10 +2359,15 @@ class MainWindow(QMainWindow):
             self._append_log(f"Drop zones: {len(self.geometry.occlusions)} (recover a brief gap; detections inside still count)")
         self._append_log(f"Processing {len(jobs)} clip(s); skipped {len(skipped)}")
         self._append_log(f"Movements: {', '.join(self.geometry.movement_names())}")
+        example_stem = Path(jobs[0][0]).stem if jobs else self._export_example_stem()
+        self._append_log(
+            f"Export: {resolve_export_folder(self.export_dir, self._current_export_pattern(), video_stem=example_stem)}"
+        )
 
         self.worker = ProcessWorker(
             jobs=jobs,
             export_dir=self.export_dir,
+            export_pattern=self._current_export_pattern(),
             clock_start=self._clock_start(),
             detector_mode=mode,
             weights_path=str(weights),
@@ -2300,7 +2407,8 @@ class MainWindow(QMainWindow):
         status = result.error or f"{len(result.trips)} trips"
         extra = f"  •  {result.model_label}" if result.model_label else ""
         counts = f"  •  {result.start_crossings} start hits  •  {result.end_crossings} end hits  •  {result.frames_with_tracks} tracked frames"
-        self._append_log(f"{result.video.name}: {status}{extra}{counts}")
+        saved = f"  •  {result.export_path}" if result.export_path else ""
+        self._append_log(f"{result.video.name}: {status}{extra}{counts}{saved}")
 
     def _on_failed(self, message: str) -> None:
         self._append_log(f"Error: {message}")
@@ -2319,9 +2427,12 @@ class MainWindow(QMainWindow):
         ok_results = [result for result in self.results if not result.error]
         total_trips = sum(len(result.trips) for result in ok_results)
         skipped = len(self.project.clips) - len(ok_results)
+        export_folders = [result.export_path.parent for result in ok_results if result.export_path]
+        unique_folders = list(dict.fromkeys(export_folders))
+        saved = unique_folders[0] if len(unique_folders) == 1 else self.export_dir
         self.report_summary.setText(
             f"{len(ok_results)} video(s) processed  •  {total_trips} trips  •  "
-            f"{max(0, skipped)} skipped  •  Spreadsheets saved in {self.export_dir}"
+            f"{max(0, skipped)} skipped  •  Spreadsheets saved in {saved}"
         )
         self.report_clip.blockSignals(True)
         self.report_clip.clear()
@@ -2465,8 +2576,11 @@ class MainWindow(QMainWindow):
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
 
-        self.export_dir.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.export_dir.resolve())))
+        folders = [Path(result.export_path).parent for result in self.results if result.export_path]
+        unique = list(dict.fromkeys(folders))
+        folder = unique[0] if len(unique) == 1 else self.export_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
     def _reset_flow(self) -> None:
         self.stack.setCurrentIndex(PAGE_SETUP)
@@ -2545,6 +2659,7 @@ class MainWindow(QMainWindow):
             infer_trips = self.process_infer_trips_check.isChecked()
         self.settings = AppSettings(
             export_dir=str(self.export_dir),
+            export_pattern=self._current_export_pattern(),
             warn_onedrive=warn,
             detector_mode=mode,
             detector_weights=str(visdrone_weights_path()),
@@ -2692,7 +2807,12 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
     def _refresh_settings_page(self) -> None:
-        self.settings_export_label.setText(f"Export folder: {self.export_dir}")
+        if hasattr(self, "export_pattern_edit"):
+            self.export_pattern_edit.blockSignals(True)
+            self.export_pattern_edit.setText(self.settings.export_pattern)
+            self.export_pattern_edit.blockSignals(False)
+            self._sync_export_pattern_combo()
+        self._refresh_export_preview()
         self.warn_onedrive_check.blockSignals(True)
         self.warn_onedrive_check.setChecked(self.settings.warn_onedrive)
         self.warn_onedrive_check.blockSignals(False)

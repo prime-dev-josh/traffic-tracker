@@ -16,11 +16,13 @@ from traffic_tracker.config import (
     DETECTOR_PARKED_RADIUS,
     DETECTOR_PATH_JUMP,
     DETECTOR_STRIDE,
+    EXPORT_SUBFOLDER_PATTERN,
     PREVIEW_EVERY,
 )
 from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
 from traffic_tracker.core.report import Trip, export_tmc_workbook
+from traffic_tracker.core.settings import export_workbook_path
 from traffic_tracker.core.trainer import train_visdrone_detector
 
 
@@ -47,12 +49,14 @@ class ProcessWorker(QThread):
         detector_imgsz: int = DETECTOR_IMGSZ,
         detect_stride: int = DETECTOR_STRIDE,
         preview_every: int = PREVIEW_EVERY,
+        export_pattern: str = EXPORT_SUBFOLDER_PATTERN,
         theme: str = "dark",
         infer_trips_from_traces: bool | None = None,
     ) -> None:
         super().__init__(parent)
         self._jobs = jobs
         self._export_dir = export_dir
+        self._export_pattern = export_pattern
         self._clock_start = clock_start
         self._detector_mode = detector_mode
         self._weights_path = weights_path
@@ -73,6 +77,7 @@ class ProcessWorker(QThread):
 
     def run(self) -> None:
         results: list[ProcessResult] = []
+        started_at = datetime.now()
         try:
             for video, geometry in self._jobs:
                 if self._cancel:
@@ -106,7 +111,12 @@ class ProcessWorker(QThread):
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")
                 elif not result.error:
-                    export_path = self._export_dir / f"{video.stem}_tmc.xlsx"
+                    export_path = export_workbook_path(
+                        self._export_dir,
+                        self._export_pattern,
+                        video.stem,
+                        when=started_at,
+                    )
                     export_tmc_workbook(
                         export_path,
                         result.trips,
@@ -118,6 +128,7 @@ class ProcessWorker(QThread):
                         path_image=result.trace_image,
                         route_images=result.route_images,
                     )
+                    result.export_path = export_path
                 results.append(result)
                 self.video_done.emit(result)
             self.all_done.emit(results)

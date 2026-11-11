@@ -100,6 +100,14 @@ TRAIN_PATIENCE = 15
 TRAIN_VAL_FRACTION = 0.2
 TRAIN_SPLIT_SEED = 42
 SETTINGS_FILE_NAME = "app_settings.json"
+# Subfolder under the export folder. Tokens: {video} {date} {time} {datetime}.
+EXPORT_SUBFOLDER_PATTERN = "{video}/{date}_{time}"
+EXPORT_PATTERN_PRESETS = (
+    ("{video}/{date}_{time}", "Video / date-time"),
+    ("{date}_{time}/{video}", "Date-time / video"),
+    ("{video}", "Video name"),
+    ("", "Export folder only"),
+)
 
 # Trained detector inference. Balanced preset is the default.
 DETECTOR_CONF = 0.35

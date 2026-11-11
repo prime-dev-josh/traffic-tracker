@@ -135,6 +135,40 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("S (Entry)", gates.columns)
         self.assertIn("SB (Exit)", gates.columns)
 
+    def test_export_two_way_gates_does_not_require_uturns(self) -> None:
+        geom = Geometry(
+            200,
+            200,
+            north=Line(100, 100, 100, 20),
+            starts=[
+                NamedLine("N", Line(80, 20, 120, 20)),
+                NamedLine("S", Line(80, 180, 120, 180)),
+            ],
+        )
+        trips = [
+            Trip("a.mp4", 1, "N", 10, "SB", 20, "car"),
+            Trip("a.mp4", 2, "S", 30, "NB", 40, "car"),
+        ]
+        table = build_tmc_summary_table(trips, geom, duration_s=900)
+        self.assertEqual(list(table.columns), ["Period", "N-SB", "N Total", "S-NB", "S Total"])
+        self.assertNotIn("N-NB", table.columns)
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "out.xlsx"
+            export_tmc_workbook(
+                path,
+                trips,
+                geom,
+                video_name="a.mp4",
+                duration_s=900,
+                clock_start=None,
+                device_label="CPU",
+            )
+            wb = load_workbook(path)
+            self.assertEqual(wb["TMC Summary"]["C3"].value, "ENTRY N")
+            self.assertEqual(wb["TMC Summary"]["C4"].value, "SB")
+            self.assertEqual(wb["TMC Summary"]["F3"].value, "ENTRY S")
+            self.assertEqual(wb["TMC Summary"]["F4"].value, "NB")
+
     def test_export_has_las_olas_sheets(self) -> None:
         geom = Geometry(
             100,
