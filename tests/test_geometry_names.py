@@ -6,6 +6,7 @@ from traffic_tracker.core.geometry import (
     Line,
     NamedLine,
     all_movement_names,
+    gate_origin_name,
     movement_name,
     side_from_point,
 )
@@ -53,6 +54,40 @@ class NamingTests(unittest.TestCase):
         geom.ends = [NamedLine("SB", Line(0, 1, 1, 1))]
         self.assertTrue(geom.is_ready())
         self.assertEqual(geom.movement_names(), ["N-SB"])
+
+    def test_two_origin_gates_are_ready_without_exits(self) -> None:
+        geom = Geometry(200, 200, north=Line(100, 100, 100, 20))
+        self.assertFalse(geom.is_ready())
+        self.assertEqual(geom.add_gate("start", Line(80, 20, 120, 20)).name, "N")
+        self.assertFalse(geom.is_ready())
+        self.assertEqual(geom.add_gate("start", Line(80, 180, 120, 180)).name, "S")
+        self.assertTrue(geom.is_ready())
+        self.assertEqual(set(geom.origin_names()), {"N", "S"})
+        self.assertEqual(set(geom.bound_names()), {"NB", "SB"})
+        self.assertEqual(set(geom.movement_names()), {"N-SB", "S-NB"})
+        self.assertEqual(gate_origin_name("SB"), "S")
+        self.assertEqual(gate_origin_name("N"), "N")
+
+    def test_one_way_out_gate_omits_origin_movements(self) -> None:
+        geom = Geometry(200, 200, north=Line(100, 100, 100, 20))
+        geom.add_gate("start", Line(80, 20, 120, 20))
+        south = geom.add_gate("start", Line(80, 180, 120, 180))
+        south.flow = "out"
+        self.assertEqual(geom.origin_names(), ["N"])
+        self.assertEqual(geom.bound_names(), ["NB", "SB"])
+        self.assertEqual(geom.movement_names(), ["N-SB"])
+        loaded = Geometry.from_dict(geom.to_dict())
+        self.assertEqual(loaded.starts[1].flow, "out")
+        self.assertEqual(loaded.movement_names(), ["N-SB"])
+
+    def test_one_way_in_gate_omits_exit_bound(self) -> None:
+        geom = Geometry(200, 200, north=Line(100, 100, 100, 20))
+        geom.add_gate("start", Line(80, 20, 120, 20))
+        south = geom.add_gate("start", Line(80, 180, 120, 180))
+        south.flow = "in"
+        self.assertEqual(geom.origin_names(), ["N", "S"])
+        self.assertEqual(geom.bound_names(), ["NB"])
+        self.assertEqual(geom.movement_names(), ["S-NB"])
 
     def test_assign_two_opposite_starts(self) -> None:
         geom = Geometry(

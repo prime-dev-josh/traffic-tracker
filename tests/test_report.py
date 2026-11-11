@@ -112,6 +112,29 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(table.iloc[-1]["Period"], "Total (whole sequence)")
         self.assertEqual(int(table.iloc[-1]["N Total"]), 2)
 
+    def test_tmc_summary_hides_one_way_out_origin(self) -> None:
+        geom = Geometry(
+            200,
+            200,
+            north=Line(100, 100, 100, 20),
+            starts=[
+                NamedLine("N", Line(80, 20, 120, 20), "both"),
+                NamedLine("S", Line(80, 180, 120, 180), "out"),
+            ],
+        )
+        trips = [
+            Trip("a.mp4", 1, "N", 10, "SB", 20, "car"),
+            Trip("a.mp4", 2, "S", 30, "NB", 40, "car"),
+        ]
+        table = build_tmc_summary_table(trips, geom, duration_s=900)
+        self.assertEqual(list(table.columns), ["Period", "N-SB", "N Total"])
+        self.assertNotIn("S-NB", table.columns)
+        self.assertEqual(int(table.iloc[0]["N-SB"]), 1)
+        gates = build_gate_statistics_table(trips, geom)
+        self.assertIn("N (Entry)", gates.columns)
+        self.assertNotIn("S (Entry)", gates.columns)
+        self.assertIn("SB (Exit)", gates.columns)
+
     def test_export_has_las_olas_sheets(self) -> None:
         geom = Geometry(
             100,

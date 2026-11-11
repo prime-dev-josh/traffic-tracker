@@ -32,6 +32,8 @@ from traffic_tracker.config import (
     SETTINGS_FILE_NAME,
 )
 
+DETECTOR_SOURCES = ("visdrone",)
+
 
 def _clamp(value: object, default: float, low: float, high: float) -> float:
     try:
@@ -91,7 +93,7 @@ class AppSettings:
     warn_onedrive: bool = True
     detector_mode: str = "motion"
     detector_weights: str = ""
-    detector_source: str = "site"
+    detector_source: str = "visdrone"
     theme: str = "dark"
     precision_preset: str = "balanced"
     detector_conf: float = DETECTOR_CONF
@@ -102,6 +104,7 @@ class AppSettings:
     detector_imgsz: int = DETECTOR_IMGSZ
     detect_stride: int = DETECTOR_STRIDE
     preview_every: int = PREVIEW_EVERY
+    infer_trips_from_traces: bool = True
 
 
 def apply_precision_preset(settings: AppSettings, name: str) -> AppSettings:
@@ -134,18 +137,22 @@ def load_settings(base: Path | None = None) -> AppSettings:
         return AppSettings(export_dir=str((base or Path.cwd()) / "outputs"))
     mode = str(data.get("detector_mode", "motion"))
     theme = str(data.get("theme", "dark"))
-    source = str(data.get("detector_source", "site"))
+    source = "visdrone"
     preset = str(data.get("precision_preset", "balanced"))
     if preset not in ("strict", "balanced", "sensitive", "custom"):
         preset = "balanced"
     if "precision_preset" not in data:
         preset = "custom"
+    if "infer_trips_from_traces" in data:
+        infer_trips = bool(data.get("infer_trips_from_traces"))
+    else:
+        infer_trips = mode != "trained"
     return AppSettings(
         export_dir=str(data.get("export_dir") or (base or Path.cwd()) / "outputs"),
         warn_onedrive=bool(data.get("warn_onedrive", True)),
         detector_mode=mode if mode in ("motion", "trained") else "motion",
         detector_weights=str(data.get("detector_weights") or ""),
-        detector_source=source if source in ("site", "visdrone", "custom") else "site",
+        detector_source=source,
         theme=theme if theme in ("dark", "light") else "dark",
         precision_preset=preset,
         detector_conf=clamp_detector_conf(data.get("detector_conf", DETECTOR_CONF)),
@@ -156,6 +163,7 @@ def load_settings(base: Path | None = None) -> AppSettings:
         detector_imgsz=clamp_detector_imgsz(data.get("detector_imgsz", DETECTOR_IMGSZ)),
         detect_stride=clamp_detect_stride(data.get("detect_stride", DETECTOR_STRIDE)),
         preview_every=clamp_preview_every(data.get("preview_every", PREVIEW_EVERY)),
+        infer_trips_from_traces=infer_trips,
     )
 
 

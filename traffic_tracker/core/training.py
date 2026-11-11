@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 from traffic_tracker.config import (
+    DRONE_VEHICLES_WEIGHTS_REL,
     SIZE_PRIOR_NAME,
     TRAIN_DATASET_REL,
     TRAIN_MIN_BOXES,
@@ -27,6 +28,8 @@ from traffic_tracker.config import (
     TRAINING_DIR_NAME,
     VEHICLE_REF_MAX_FACTOR,
     VEHICLE_REF_MIN_FACTOR,
+    drone_vehicle_class_id,
+    drone_vehicles_data_yaml,
 )
 from traffic_tracker.core.geometry import Box, area_limits_from_areas
 
@@ -68,6 +71,10 @@ def visdrone_weights_path(base: Path | None = None) -> Path:
     return training_root(base) / VISDRONE_WEIGHTS_REL
 
 
+def drone_vehicles_weights_path(base: Path | None = None) -> Path:
+    return training_root(base) / DRONE_VEHICLES_WEIGHTS_REL
+
+
 def site_weights_path(base: Path | None = None) -> Path:
     return training_root(base) / SITE_WEIGHTS_REL
 
@@ -103,7 +110,7 @@ def load_session(video_stem: str, base: Path | None = None) -> TrainingSession:
             image_name=str(item["image_name"]),
             width=int(item["width"]),
             height=int(item["height"]),
-            boxes=[Box(**box).normalized() for box in item.get("boxes", [])],
+            boxes=[_box_from_payload(box).normalized() for box in item.get("boxes", [])],
             time_s=float(item.get("time_s", 0.0)),
         )
         for item in data.get("frames", [])
@@ -313,16 +320,7 @@ def build_yolo_dataset(base: Path | None = None) -> dict:
             dest_label.write_text(item["label_text"], encoding="utf-8")
 
     yaml_path = root / "data.yaml"
-    yaml_path.write_text(
-        (
-            f"path: {root.resolve().as_posix()}\n"
-            "train: images/train\n"
-            "val: images/val\n"
-            "names:\n"
-            "  0: vehicle\n"
-        ),
-        encoding="utf-8",
-    )
+    yaml_path.write_text(drone_vehicles_data_yaml(root), encoding="utf-8")
     return {
         "root": root,
         "yaml_path": yaml_path,
@@ -453,8 +451,20 @@ def _yolo_label_text(frame: LabeledFrame) -> str:
         cy = ((norm.y1 + norm.y2) / 2.0) / height
         bw = norm.width() / width
         bh = norm.height() / height
-        lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        class_id = drone_vehicle_class_id(getattr(norm, "label", "car"))
+        lines.append(f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _box_from_payload(raw: object) -> Box:
+    data = raw if isinstance(raw, dict) else {}
+    return Box(
+        x1=float(data.get("x1", 0.0)),
+        y1=float(data.get("y1", 0.0)),
+        x2=float(data.get("x2", 0.0)),
+        y2=float(data.get("y2", 0.0)),
+        label=str(data.get("label") or data.get("cls") or "car"),
+    )
 
 
 def _write_yolo_label(path: Path, frame: LabeledFrame) -> None:

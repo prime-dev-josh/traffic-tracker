@@ -22,10 +22,8 @@ from traffic_tracker.core.settings import (
     load_settings,
     save_settings,
 )
-from traffic_tracker.core.trainer import train_site_detector
-from traffic_tracker.core.training import site_weights_path, visdrone_weights_path
 from traffic_tracker.core.geometry import Box, Geometry, area_limits_from_areas, merge_area_limits
-from traffic_tracker.core.trainer import yolo_train_device
+from traffic_tracker.core.trainer import train_visdrone_detector, yolo_train_device
 from traffic_tracker.core.training import (
     LabeledFrame,
     TrainingSession,
@@ -43,6 +41,7 @@ from traffic_tracker.core.training import (
     save_session,
     trained_weights_path,
     training_inventory,
+    visdrone_weights_path,
 )
 
 
@@ -141,11 +140,13 @@ class SettingsTests(unittest.TestCase):
                     export_dir=str(base / "out"),
                     warn_onedrive=False,
                     detector_mode="trained",
+                    detector_source="visdrone",
                     theme="light",
                     detector_conf=0.4,
                     detector_imgsz=640,
                     detect_stride=2,
                     preview_every=0,
+                    infer_trips_from_traces=False,
                 ),
                 base=base,
             )
@@ -153,11 +154,24 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.export_dir, str(base / "out"))
             self.assertFalse(loaded.warn_onedrive)
             self.assertEqual(loaded.detector_mode, "trained")
+            self.assertEqual(loaded.detector_source, "visdrone")
             self.assertEqual(loaded.theme, "light")
             self.assertAlmostEqual(loaded.detector_conf, 0.4)
             self.assertEqual(loaded.detector_imgsz, 640)
             self.assertEqual(loaded.detect_stride, 2)
             self.assertEqual(loaded.preview_every, 0)
+            self.assertFalse(loaded.infer_trips_from_traces)
+
+    def test_legacy_infer_trips_follows_detector_mode(self) -> None:
+        from traffic_tracker.config import SETTINGS_FILE_NAME
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            path = base / SETTINGS_FILE_NAME
+            path.write_text('{"detector_mode": "trained", "export_dir": "out"}', encoding="utf-8")
+            self.assertFalse(load_settings(base).infer_trips_from_traces)
+            path.write_text('{"detector_mode": "motion", "export_dir": "out"}', encoding="utf-8")
+            self.assertTrue(load_settings(base).infer_trips_from_traces)
 
     def test_detector_conf_clamps(self) -> None:
         self.assertEqual(clamp_detector_conf(0.4), 0.4)
@@ -181,7 +195,7 @@ class SettingsTests(unittest.TestCase):
         tuned = apply_precision_preset(AppSettings(), "strict")
         self.assertEqual(tuned.precision_preset, "strict")
         self.assertAlmostEqual(tuned.detector_conf, 0.45)
-        self.assertAlmostEqual(tuned.detector_iou, 0.50)
+        self.assertAlmostEqual(tuned.detector_iou, 0.28)
         self.assertGreater(tuned.parked_radius, AppSettings().parked_radius)
         self.assertLess(tuned.link_speed, AppSettings().link_speed)
         custom = apply_precision_preset(tuned, "nope")
@@ -202,32 +216,37 @@ class DetectorWeightsTests(unittest.TestCase):
             weights.write_bytes(b"pt")
             self.assertEqual(resolve_detector_weights(str(weights), Path(tmp)), weights)
 
-    def test_source_picks_visdrone_or_site(self) -> None:
+    def test_trained_mode_uses_visdrone_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             vis = visdrone_weights_path(base)
-            site = site_weights_path(base)
+            best = trained_weights_path(base)
             vis.parent.mkdir(parents=True, exist_ok=True)
             vis.write_bytes(b"vis")
-            site.write_bytes(b"site")
+            best.write_bytes(b"best")
             self.assertEqual(weights_for_source("visdrone", None, base), vis)
-            self.assertEqual(weights_for_source("site", None, base), site)
+            self.assertEqual(weights_for_source("site", None, base), vis)
+            self.assertEqual(weights_for_source("drone", None, base), vis)
+            self.assertEqual(resolve_detector_weights(None, base), vis)
 
-    def test_site_train_starts_from_visdrone(self) -> None:
-        import inspect
-
-        source = inspect.getsource(train_site_detector)
-        self.assertIn("visdrone_weights_path", source)
-        self.assertIn("site_weights_path", source)
-        self.assertEqual(inspect.signature(train_site_detector).parameters["epochs"].default, 40)
-
-    def test_site_best_pt_is_used(self) -> None:
+    def test_legacy_sources_are_loaded_as_visdrone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            dest = trained_weights_path(base)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"pt")
-            self.assertEqual(resolve_detector_weights(None, base), dest)
+            save_settings(
+                AppSettings(detector_mode="trained", detector_source="site"),
+                base=base,
+            )
+            loaded = load_settings(base)
+            self.assertEqual(loaded.detector_source, "visdrone")
+
+    def test_trainer_exposes_visdrone_only(self) -> None:
+        import inspect
+        import traffic_tracker.core.trainer as trainer
+
+        self.assertTrue(hasattr(trainer, "train_visdrone_detector"))
+        self.assertFalse(hasattr(trainer, "train_site_detector"))
+        self.assertFalse(hasattr(trainer, "train_drone_vehicles_detector"))
+        self.assertIn("VisDrone.yaml", inspect.getsource(train_visdrone_detector))
 
     def test_predict_uses_detector_image_size(self) -> None:
         self.assertEqual(TRAIN_IMGSZ, 1280)
@@ -235,14 +254,14 @@ class DetectorWeightsTests(unittest.TestCase):
         self.assertIn("DETECTOR_IMGSZ", boxes_from_detector.__code__.co_names)
         self.assertNotIn("TRAIN_IMGSZ", boxes_from_detector.__code__.co_names)
 
-    def test_predict_passes_device_half_and_imgsz(self) -> None:
+    def test_predict_passes_device_quantize_and_imgsz(self) -> None:
         model = MagicMock()
         model.names = {2: "car"}
         result = MagicMock()
         result.boxes = None
         model.predict.return_value = [result]
         frame = np.zeros((80, 80, 3), dtype=np.uint8)
-        with patch("traffic_tracker.core.detector.yolo_runtime", return_value=(0, True)) as runtime:
+        with patch("traffic_tracker.core.detector.yolo_runtime", return_value=(0, 16)) as runtime:
             boxes_from_detector(
                 model,
                 frame,
@@ -255,7 +274,8 @@ class DetectorWeightsTests(unittest.TestCase):
         kwargs = model.predict.call_args.kwargs
         self.assertEqual(kwargs["imgsz"], 640)
         self.assertEqual(kwargs["device"], 0)
-        self.assertTrue(kwargs["half"])
+        self.assertEqual(kwargs["quantize"], 16)
+        self.assertNotIn("half", kwargs)
 
     def test_visdrone_keeps_vehicles_drops_people(self) -> None:
         names = {
@@ -322,7 +342,9 @@ class YoloDatasetTests(unittest.TestCase):
             result = build_yolo_dataset(base)
             self.assertTrue(result["yaml_path"].is_file())
             yaml_text = result["yaml_path"].read_text(encoding="utf-8")
-            self.assertIn("0: vehicle", yaml_text)
+            self.assertIn("0: car", yaml_text)
+            self.assertIn("4: motorcycle", yaml_text)
+            self.assertNotIn("0: vehicle", yaml_text)
             self.assertIn("images/train", yaml_text)
             self.assertEqual(result["frame_count"], TRAIN_MIN_FRAMES + 4)
             self.assertEqual(result["box_count"], (TRAIN_MIN_FRAMES + 4) * 2)

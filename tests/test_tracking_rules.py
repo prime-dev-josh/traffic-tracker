@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from traffic_tracker.config import DETECTOR_STATIC_EXPIRE_S, MOTION_COAST_S
+from traffic_tracker.config import DETECTOR_STATIC_EXPIRE_S, MOTION_COAST_S, PATH_SMOOTH_ALPHA
 from traffic_tracker.core.geometry import (
     Box,
     Geometry,
@@ -12,13 +12,21 @@ from traffic_tracker.core.geometry import (
     NamedLine,
     Polygon,
     Transform,
+    drop_zone_too_wide,
     polygon_is_valid,
     roadway_approach_warnings,
 )
 from traffic_tracker.core.processor import (
+    ID_COUNTED_BGR,
+    ID_LIVE_BGR,
+    TrackIssue,
     _Pending,
+    _TrackState,
     _expire_tracks,
+    _id_label_color,
     _record_crossings,
+    _route_label,
+    draw_issue_overlay,
     should_emit_preview,
     should_run_detector,
 )
@@ -72,14 +80,119 @@ class TrackingRuleTests(unittest.TestCase):
         self.assertEqual(trips, [])
         self.assertGreater(state.last_observed_s, 12.0)
 
-    def test_queued_vehicle_keeps_id_when_it_starts_moving(self) -> None:
+    def test_three_stacked_boxes_yield_one_id(self) -> None:
         geom = _geom()
+        pending = _Pending(link_speed=180.0)
+        trips: list[Trip] = []
+        boxes = [
+            _box(200, 120, 40, 24),
+            _box(202, 121, 38, 22),
+            _box(198, 119, 44, 28),
+        ]
+        _record_crossings(
+            boxes,
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            1.0,
+            moving_only=False,
+            classes=["car", "truck", "van"],
+            confidences=[0.91, 0.62, 0.55],
+        )
+        self.assertEqual(len(pending.live), 1)
+        self.assertEqual(next(iter(pending.live.values())).tid, 1)
+        stack = next(issue for issue in pending.issues if issue.kind == "duplicate_stack")
+        self.assertIsNotNone(stack.xy)
+        self.assertIsNotNone(stack.xyxy)
+
+    def test_issue_overlay_marks_location(self) -> None:
+        import numpy as np
+
+        frame = np.zeros((80, 120, 3), dtype=np.uint8)
+        issue = TrackIssue(
+            kind="drop_zone_attach",
+            time_s=1.5,
+            tid=3,
+            message="#3 reattached",
+            xy=(40.0, 40.0),
+            from_xy=(10.0, 40.0),
+            xyxy=(30.0, 30.0, 50.0, 50.0),
+        )
+        marked = draw_issue_overlay(frame, [issue], highlight=issue)
+        self.assertGreater(int(marked.sum()), 0)
+        self.assertGreater(int(marked[40, 40].sum()), 0)
+
+    def test_new_track_refused_when_box_overlaps_live(self) -> None:
+        geom = _geom()
+        pending = _Pending(link_speed=80.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        _record_crossings(
+            [_box(200, 200, 40, 24)],
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            1.0,
+            moving_only=False,
+            classes=["car"],
+        )
+        _record_crossings(
+            [_box(201, 201, 36, 22)],
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            8.0,
+            moving_only=False,
+            classes=["truck"],
+        )
+        self.assertEqual(len(pending.live), 1)
+        self.assertEqual(next(iter(pending.live.values())).tid, 1)
+
+    def test_path_uses_smoothed_center(self) -> None:
+        geom = _geom()
+        pending = _Pending(link_speed=400.0)
+        trips: list[Trip] = []
+        _record_crossings([_box(200, 200)], geom, pending, trips, "a.mp4", 1.0, moving_only=False, classes=["car"])
+        _record_crossings([_box(206, 200)], geom, pending, trips, "a.mp4", 1.1, moving_only=False, classes=["car"])
+        path = next(iter(pending.live.values())).path
+        self.assertGreaterEqual(len(path), 2)
+        expected = PATH_SMOOTH_ALPHA * 206.0 + (1.0 - PATH_SMOOTH_ALPHA) * 200.0
+        self.assertAlmostEqual(path[-1][0], expected, places=1)
+        self.assertLess(path[-1][0], 206.0)
+
+    def test_drop_zone_too_wide_needs_vehicle_size(self) -> None:
+        geom = _geom(vehicle_refs=[Box(0, 0, 20, 12)])
+        self.assertFalse(drop_zone_too_wide(Box(0, 0, 40, 12), geom))
+        self.assertTrue(drop_zone_too_wide(Box(0, 0, 80, 12), geom))
+        self.assertFalse(drop_zone_too_wide(Box(0, 0, 80, 12), _geom()))
+
+    def test_roadway_standstill_keeps_id_after_one_detection(self) -> None:
+        road = Polygon([(0.0, 0.0), (400.0, 0.0), (400.0, 400.0), (0.0, 400.0)])
+        geom = _geom(roadways=[road])
         pending = _Pending(parked_radius=40.0, link_speed=180.0)
         trips: list[Trip] = []
-        samples = [(1.0 + step * 0.2, [_box(200, 80)], ["car"]) for step in range(6)]
+        _record_crossings([_box(200, 200)], geom, pending, trips, "a.mp4", 1.0, moving_only=True, classes=["car"])
+        tid = next(iter(pending.live))
+        self.assertFalse(pending.live[tid].active)
+        for when in (1.5, 2.5, 4.0, 6.0):
+            _record_crossings([], geom, pending, trips, "a.mp4", when, moving_only=True)
+            _expire_tracks(pending, geom, trips, "a.mp4", when, infer_path=False)
+        self.assertIn(tid, pending.live)
+        _record_crossings([_box(202, 198)], geom, pending, trips, "a.mp4", 6.4, moving_only=True, classes=["car"])
+        self.assertEqual(list(pending.live), [tid])
+        self.assertFalse(pending.live[tid].active)
+        self.assertEqual(trips, [])
+
+    def test_queued_vehicle_keeps_id_when_it_starts_moving(self) -> None:
+        geom = _geom(starts=[NamedLine("N", Line(0, 90, 400, 90))], ends=[NamedLine("SB", Line(0, 300, 400, 300))])
+        pending = _Pending(parked_radius=40.0, link_speed=180.0)
+        trips: list[Trip] = []
+        samples = [(1.0 + step * 0.2, [_box(200, 20)], ["car"]) for step in range(6)]
         samples += [
-            (2.4 + step * 0.2, [_box(200, 80 + (step + 1) * 18)], ["truck"])
-            for step in range(14)
+            (2.4 + step * 0.2, [_box(200, 20 + (step + 1) * 18)], ["truck"])
+            for step in range(18)
         ]
         _feed(pending, geom, samples, trips)
         self.assertEqual(list(pending.live), [1])
@@ -161,6 +274,27 @@ class TrackingRuleTests(unittest.TestCase):
         self.assertLess(max(steps), 40.0)
         self.assertGreater(path[-1][0], last_x)
         self.assertEqual(trips, [])
+        attach = next(issue for issue in pending.issues if issue.kind == "drop_zone_attach")
+        self.assertIsNotNone(attach.xy)
+        self.assertIsNotNone(attach.from_xy)
+
+    def test_trace_continues_through_exit_gate(self) -> None:
+        geom = _geom()
+        pending = _Pending(link_speed=180.0, parked_radius=24.0)
+        trips: list[Trip] = []
+        samples = []
+        y = 20.0
+        when = 1.0
+        while y < 360:
+            samples.append((when, [_box(200, y)], ["car"]))
+            y += 24.0
+            when += 0.2
+        _feed(pending, geom, samples, trips, expire=False)
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(list(pending.live), [1])
+        self.assertGreater(pending.live[1].path[-1][1], 300.0)
+        self.assertGreater(pending.live[1].xy[1], 300.0)
+        self.assertEqual(trips[0].track_id, 1)
 
     def test_drop_zone_flicker_does_not_spike_through_lead(self) -> None:
         geom = _geom(
@@ -245,7 +379,8 @@ class TrackingRuleTests(unittest.TestCase):
         self.assertEqual(trips[0].track_id, 1)
         self.assertEqual(trips[0].start_destination, "N")
         self.assertEqual(trips[0].end_destination, "SB")
-        self.assertEqual(pending.live, {})
+        self.assertEqual(list(pending.live), [1])
+        self.assertGreater(pending.live[1].path[-1][1], 300.0)
 
     def test_prediction_across_a_gate_does_not_count(self) -> None:
         geom = _geom()
@@ -410,6 +545,59 @@ class TrackingRuleTests(unittest.TestCase):
         _expire_tracks(pending, geom, trips, "a.mp4", 20.0, coast_s=0.0, infer_path=False)
         self.assertEqual(trips, [])
         self.assertLess(DETECTOR_STATIC_EXPIRE_S, MOTION_COAST_S)
+
+
+class IdLabelTests(unittest.TestCase):
+    def test_id_is_red_until_counted_then_green(self) -> None:
+        live = _TrackState(tid=1, xy=(0.0, 0.0), first_xy=(0.0, 0.0), first_time_s=0.0, last_time_s=0.0)
+        self.assertEqual(_id_label_color(None), ID_LIVE_BGR)
+        self.assertEqual(_id_label_color(live), ID_LIVE_BGR)
+        live.had_gate_trip = True
+        self.assertEqual(_id_label_color(live), ID_COUNTED_BGR)
+
+    def test_id_labels_are_drawn_after_traces(self) -> None:
+        import inspect
+
+        from traffic_tracker.core.processor import _draw_motion_preview
+
+        source = inspect.getsource(_draw_motion_preview)
+        self.assertGreater(source.rfind("_draw_id_label"), source.rfind("_draw_paths"))
+
+    def test_counted_word_is_not_drawn(self) -> None:
+        import inspect
+
+        from traffic_tracker.core.processor import _draw_id_label
+
+        self.assertNotIn('"counted"', inspect.getsource(_draw_id_label))
+
+    def test_route_label_shows_entry_then_exit(self) -> None:
+        live = _TrackState(tid=1, xy=(0.0, 0.0), first_xy=(0.0, 0.0), first_time_s=0.0, last_time_s=0.0)
+        self.assertEqual(_route_label(live), "")
+        live.entry_origin = "N"
+        self.assertEqual(_route_label(live), "N→")
+        live.exit_bound = "SB"
+        self.assertEqual(_route_label(live), "N→SB")
+
+    def test_live_id_keeps_route_after_trip(self) -> None:
+        geom = Geometry(
+            100,
+            100,
+            north=Line(50, 55, 50, 10),
+            starts=[NamedLine("N", Line(0, 40, 100, 40))],
+            ends=[NamedLine("SB", Line(0, 70, 100, 70))],
+        )
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings([_box(50, 10, 20, 20)], geom, pending, trips, "a.mp4", 1.0, moving_only=False)
+        _record_crossings([_box(50, 55, 20, 20)], geom, pending, trips, "a.mp4", 1.5, moving_only=False)
+        state = pending.live[1]
+        self.assertEqual(_route_label(state), "N→")
+        self.assertEqual(trips, [])
+        _record_crossings([_box(50, 90, 20, 20)], geom, pending, trips, "a.mp4", 2.0, moving_only=False)
+        self.assertEqual(len(trips), 1)
+        state = pending.live[1]
+        self.assertEqual(_route_label(state), "N→SB")
+        self.assertTrue(state.had_gate_trip)
 
 
 class ProcessSpeedHelpersTests(unittest.TestCase):

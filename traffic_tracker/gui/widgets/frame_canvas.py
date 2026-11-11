@@ -10,10 +10,9 @@ from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import QWidget
 
-from traffic_tracker.core.geometry import Box, Geometry, Line
+from traffic_tracker.core.geometry import Box, Geometry, Line, gate_origin_name
 
-START_COLOR = QColor(0, 230, 120)
-END_COLOR = QColor(255, 56, 56)
+GATE_COLOR = QColor(0, 230, 120)
 NORTH_COLOR = QColor(40, 200, 255)
 VEHICLE_COLOR = QColor(255, 20, 220)
 OCCLUSION_COLOR = QColor(255, 170, 0)
@@ -310,10 +309,8 @@ class FrameCanvas(QWidget):
         geom = self._geometry
         if geom.north is not None:
             draw_north(geom.north)
-        for item in geom.starts:
-            draw_labeled_line(item.line, START_COLOR, item.name or "Start")
-        for item in geom.ends:
-            draw_labeled_line(item.line, END_COLOR, item.name or "End")
+        for item in geom.all_gates():
+            draw_labeled_line(item.line, GATE_COLOR, gate_origin_name(item.name) or "Gate")
         for index, raw in enumerate(geom.vehicle_refs, start=1):
             box = raw.normalized()
             p1 = self._image_to_widget(box.x1, box.y1)

@@ -217,11 +217,11 @@ def build_tmc_summary_table(
     clock_start: datetime | None = None,
 ) -> pd.DataFrame:
     origins = geometry.origin_names()
-    bounds = geometry.bound_names()
+    moves = geometry.movement_names()
     bin_count = _bin_count(duration_s, trips)
     columns = ["Period"]
     for origin in origins:
-        columns.extend([f"{origin}-{bound}" for bound in bounds])
+        columns.extend([name for name in moves if name.startswith(f"{origin}-")])
         columns.append(f"{origin} Total")
 
     def empty_counts() -> dict[str, int]:

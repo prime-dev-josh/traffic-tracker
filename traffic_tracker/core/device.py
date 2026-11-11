@@ -80,15 +80,15 @@ def detect_device(timeout_s: float = 30.0) -> str:
     return _cached_device
 
 
-def yolo_runtime(device: str | None = None) -> tuple[str | int, bool]:
-    """Ultralytics predict device and whether FP16 is safe.
+def yolo_runtime(device: str | None = None) -> tuple[str | int, int | None]:
+    """Ultralytics predict device and quantize bits.
 
-    CUDA uses device index 0 and half precision. CPU/MPS stay full precision.
+    CUDA uses device index 0 and FP16 (quantize=16). CPU/MPS stay FP32.
     """
     chosen = device or detect_device()
     if chosen == "cuda":
-        return 0, True
-    return chosen, False
+        return 0, 16
+    return chosen, None
 
 
 def describe_device(device: str) -> str:

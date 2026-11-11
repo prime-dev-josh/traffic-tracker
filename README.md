@@ -10,7 +10,7 @@ Motion mask counts every moving blob in the vehicle-size band. Trained detector 
 
 - **Hold stopped vehicles.** After a car is seen twice, its last box stays for up to 90 s at a red light. The background subtractor does not learn that box away. Preview labels held IDs as `hold`.
 - **Home dashboard.** Process, Training, and Settings are separate features. The 1–5 step strip only appears inside Process.
-- **Training.** Box every vehicle on sample frames. That tightens the size band immediately. **Train detector** fine-tunes YOLO11 and writes `training/weights/best.pt`.
+- **Training.** New installs do not include detector weights. Open **Training** and run **Train VisDrone** once (or `python -m traffic_tracker.train_visdrone`) to write `training/weights/visdrone.pt`.
 - **Motion mask instead of YOLO.** Nadir drone cars were missed or labeled boat/airplane. Counts now come from MOG2 foreground blobs.
 - **Size, not class.** Drawn route masks plus Training boxes decide the size band. Pedestrians and flicker fall below the min; lighting washes fall above the max.
 - **Vehicle reference masks** on the drawing step. Drag one or more boxes around typical vehicles. Processing keeps blobs from 35% of the smallest sample to 350% of the largest.
@@ -47,7 +47,7 @@ pip install -r requirements.txt
 pip install -r requirements-cuda.txt
 ```
 
-`pip install torch` from PyPI is CPU-only on Windows, even if the machine has an NVIDIA GPU. `requirements-cuda.txt` installs the CUDA 12.8 wheels so **Train detector** can use the card.
+`pip install torch` from PyPI is CPU-only on Windows, even if the machine has an NVIDIA GPU. `requirements-cuda.txt` installs the CUDA 12.8 wheels so **Train VisDrone** can use the card.
 
 No model download is required for motion counting.
 
@@ -58,6 +58,14 @@ No model download is required for motion counting.
 ```
 
 Or activate the venv (`%LOCALAPPDATA%\traffic-tracker\venv` on OneDrive, otherwise `.venv`) then `python run.py`.
+
+Before processing with the trained detector (or after any manual `pip install`), run:
+
+```powershell
+.\pre-init-run.ps1
+```
+
+Use `.\pre-init-run.ps1 -Quick` to skip loading `training/weights/best.pt`. The script fails fast on mixed PyTorch installs (the usual `is_fake_tensor` error).
 
 ## Workflow
 
@@ -75,7 +83,7 @@ The app starts on a dashboard. Open one of the three cards.
    - **Add roadway**: click around the intersection and the approaches, then Finish roadway. Leave the marina, parking lots, buildings, and sidewalks outside. No roadway means the full frame is used. Keep pavement on both sides of each gate.
    - **Add vehicle mask**: drag a box around a typical vehicle. Repeat for other sizes. That size band is the processing filter.
    - **Add drop zone**: drag a box over a dark patch where cars briefly disappear. Detections inside the box still count. The zone only helps reconnect a track across a short gap.
-   - **Set prediction reach**: drag a short line on the photo (about one car-length through that shadow). When a car is lost in a drop zone, a pickup stays that far ahead so the same ID and trace reconnect if the detector finds it again nearby. Nudge the slider under Drop zones if you need a small change.
+   - **Set prediction reach**: drag a short line on the photo (about one car-length through that shadow). That is the auto-attach window after a lost ID. A longer line stitches traces across the intersection. Nudge the slider under Drop zones for a small change.
 4. **Align** later clips: drag/scale/rotate the overlay (or match 2–4 landmarks). Confirm each clip. Unconfirmed clips are skipped.
 5. Process confirmed clips. Each writes `{video_name}_tmc.xlsx`.
 
@@ -85,39 +93,28 @@ Draw each gate so vehicles **cross** it (a tripwire across the lanes, not along 
 
 A trip is recorded when a moving blob crosses any start side and later any other side. Start destination is `N/S/E/W`; end destination is `NB/SB/EB/WB`.
 
-If you skip route masks **and** Training boxes, a default size band from the frame size is used. Add a smaller mask if people or leaves count; add a larger mask if trucks are missed.
+If you skip route masks, a default size band from the frame size is used. Add a smaller mask if people or leaves count; add a larger mask if trucks are missed.
 
 ### Training
 
-Boxing vehicles does two things:
+Weights are **not** bundled with a new install. Open **Training** and click **Train VisDrone** (or run `python -m traffic_tracker.train_visdrone`). That downloads VisDrone2019-DET (~2 GB) and fine-tunes YOLO11n. The result is `training/weights/visdrone.pt`. Then set Detection mode to **Trained detector**. CPU training is allowed but slow; a GPU is much faster.
 
-1. Updates `training/size_prior.json` so Motion mask keeps blobs in that size band even if you drew no route masks.
-2. Saves each frame JPEG plus JSON and YOLO `.txt` labels under `training/sessions/{video_stem}/`.
-
-Open a clip, box **every** vehicle you can see (including stopped queue cars), then **Next frame**. Repeat. **Save session** writes the labels. Aim for **150+ frames / 400+ boxes** across clips and times of day. The hard minimum to train is 20 frames and 40 boxes.
-
-**Train detector** flattens those sessions into `training/dataset/` and fine-tunes **on top of** `training/weights/visdrone.pt` for 40 epochs at image size 1280. It writes `training/weights/site.pt` and copies that to `best.pt`. `visdrone.pt` is left in place. Process then switches to **Trained detector** with the site weights. CPU training is allowed but slow; a GPU is much faster.
-
-Stock COCO weights miss nadir drone cars. Use a fine-tuned `best.pt`, not `yolo11n.pt` alone.
-
-**Train on VisDrone** (or `python -m traffic_tracker.train_visdrone`) fine-tunes the same YOLO11n on VisDrone2019-DET (~2 GB download). Weights go to `training/weights/visdrone.pt` and are copied to `training/weights/best.pt`. Boxed sessions stay so we can compare. If VisDrone counts better, the site Training feature can be removed later.
-
-Trained detector keeps **moving cars, vans, trucks, motorcycles, and buses**. Settings has a **Strict / Balanced / Sensitive** preset plus sliders for confidence (default 0.35), NMS IoU (default 0.40), parked radius, track link speed, and trace jump split. Weights can be **VisDrone**, a **site fine-tune** started from those weights (`training/weights/site.pt`), or a custom `.pt`. People, bicycles, boats, tricycles, and parked boxes stay out of the preview, traces, and counts. Motion mask still counts every moving blob in the size band.
+Trained detector keeps **moving cars, vans, trucks, motorcycles, and buses**. Settings has a **Strict / Balanced / Sensitive** preset plus sliders for confidence (default 0.35), NMS IoU (default 0.40), parked radius, track link speed, and trace jump split. People, bicycles, boats, tricycles, and parked boxes stay out of the preview, traces, and counts. Motion mask still counts every moving blob in the size band.
 
 ### Settings
 
 - Dark / Light theme using the Prime AE navy, white, and orange palette.
 - Default export folder (also on the Process videos page).
 - OneDrive warning on/off.
-- Detection mode: Motion (default) or Trained detector (YOLO). After **Train detector**, the app selects the site weights. You can still choose another `.pt` or switch back to Motion on Align before Process.
+- Detection mode: Motion (default) or Trained detector (VisDrone `visdrone.pt`). Train those weights on the Training page first. You can switch back to Motion on Align before Process.
+- **Infer trips from traces**: when on, a path that crosses a gate still counts if two detector boxes did not straddle the drawn tripwire. Trained detector starts with this off.
 - Detector confidence (trained mode only). Raise it if the count is still high.
 - Speed (trained mode unless noted): CUDA + FP16 is used automatically when a GPU is available. **Detect size** 640 / 960 / 1280 (training stays 1280; smaller is faster and can miss distant cars). **Detect every** 1 / 2 / 3 frames (skipped frames keep the last ID via hold and drop-zone pickup). **Live preview** Off / every 15 / 30 / 60 frames (Off is fastest; counts do not use the live picture).
-- Training data: view sessions, export a zip, import a zip or folder, open the `training/` folder.
 
 ## Tests
 
 ```powershell
-& "$env:LOCALAPPDATA\traffic-tracker\venv\Scripts\python.exe" -m unittest tests.test_crossings tests.test_motion tests.test_geometry_names tests.test_report tests.test_transform tests.test_models tests.test_training tests.test_device tests.test_tracking_rules -q
+& "$env:LOCALAPPDATA\traffic-tracker\venv\Scripts\python.exe" -m unittest tests.test_crossings tests.test_motion tests.test_geometry_names tests.test_report tests.test_transform tests.test_models tests.test_training tests.test_drone_datasets tests.test_device tests.test_tracking_rules -q
 ```
 
 ## Build a Windows `.exe`

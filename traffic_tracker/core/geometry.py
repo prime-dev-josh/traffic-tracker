@@ -1,4 +1,4 @@
-"""Entry/exit lines named from a user-set North heading."""
+"""Count gates named N, S, E, W from a user-set North heading."""
 
 from __future__ import annotations
 
@@ -19,7 +19,10 @@ from traffic_tracker.config import (
 ORIGINS = ("N", "S", "E", "W")
 BOUNDS = ("NB", "SB", "EB", "WB")
 ORIGIN_TO_BOUND = {"N": "NB", "S": "SB", "E": "EB", "W": "WB"}
+BOUND_TO_ORIGIN = {bound: origin for origin, bound in ORIGIN_TO_BOUND.items()}
 MAX_GATES = 4
+GATE_FLOWS = ("both", "in", "out")
+GATE_FLOW_LABELS = {"both": "Two-way", "in": "One-way in", "out": "One-way out"}
 MAX_VEHICLE_REFS = 12
 MAX_OCCLUSIONS = 12
 MAX_ROADWAYS = 8
@@ -70,6 +73,21 @@ def ordered_bounds(names: list[str]) -> list[str]:
     return [name for name in BOUNDS if name in names]
 
 
+def gate_origin_name(name: str) -> str:
+    """N/S/E/W for a count gate, including legacy Exit names like SB."""
+    if name in ORIGINS:
+        return name
+    if name in BOUND_TO_ORIGIN:
+        return BOUND_TO_ORIGIN[name]
+    return name or "N"
+
+
+def normalize_gate_flow(value: str | None) -> str:
+    if value in GATE_FLOWS:
+        return value
+    return "both"
+
+
 def image_heading_deg(dx: float, dy: float) -> float:
     """Heading in image space: 0 = up, clockwise, 0–360."""
     return math.degrees(math.atan2(dx, -dy)) % 360.0
@@ -107,9 +125,16 @@ class Box:
     y1: float
     x2: float
     y2: float
+    label: str = "car"
 
     def normalized(self) -> "Box":
-        return Box(min(self.x1, self.x2), min(self.y1, self.y2), max(self.x1, self.x2), max(self.y1, self.y2))
+        return Box(
+            min(self.x1, self.x2),
+            min(self.y1, self.y2),
+            max(self.x1, self.x2),
+            max(self.y1, self.y2),
+            label=self.label,
+        )
 
     def width(self) -> float:
         return abs(self.x2 - self.x1)
@@ -121,7 +146,7 @@ class Box:
         return max(self.width() * self.height(), 0.0)
 
     def scaled(self, sx: float, sy: float) -> "Box":
-        return Box(self.x1 * sx, self.y1 * sy, self.x2 * sx, self.y2 * sy)
+        return Box(self.x1 * sx, self.y1 * sy, self.x2 * sx, self.y2 * sy, label=self.label)
 
     @classmethod
     def from_line(cls, line: Line) -> "Box":
@@ -232,7 +257,7 @@ def roadway_approach_warnings(geometry: "Geometry", probe_px: float = 48.0) -> l
     if not geometry.roadways:
         return []
     warnings: list[str] = []
-    labeled = [("Entry", item) for item in geometry.starts] + [("Exit", item) for item in geometry.ends]
+    labeled = [("Gate", item) for item in geometry.all_gates()]
     for kind, item in labeled:
         dx = item.line.x2 - item.line.x1
         dy = item.line.y2 - item.line.y1
@@ -249,10 +274,42 @@ def roadway_approach_warnings(geometry: "Geometry", probe_px: float = 48.0) -> l
     return warnings
 
 
+DROP_ZONE_MAX_CAR_LENGTHS = 3.0
+
+
+def typical_vehicle_length_px(geometry: "Geometry") -> float | None:
+    if not geometry.vehicle_refs:
+        return None
+    return max(max(box.width(), box.height()) for box in geometry.vehicle_refs)
+
+
+def drop_zone_too_wide(
+    box: Box,
+    geometry: "Geometry",
+    *,
+    car_lengths: float = DROP_ZONE_MAX_CAR_LENGTHS,
+) -> bool:
+    """True when a drop zone is many typical-vehicle lengths across."""
+    typical = typical_vehicle_length_px(geometry)
+    if typical is None or typical <= 1.0:
+        return False
+    return max(box.width(), box.height()) > car_lengths * typical
+
+
 @dataclass
 class NamedLine:
     name: str
     line: Line
+    flow: str = "both"
+
+    def __post_init__(self) -> None:
+        self.flow = normalize_gate_flow(self.flow)
+
+    def allows_entry(self) -> bool:
+        return self.flow in ("both", "in")
+
+    def allows_exit(self) -> bool:
+        return self.flow in ("both", "out")
 
 
 @dataclass
@@ -333,8 +390,8 @@ class Transform:
             frame_width=geom.frame_width,
             frame_height=geom.frame_height,
             north=north,
-            starts=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.starts],
-            ends=[NamedLine(item.name, self.apply_line(item.line, cx, cy)) for item in geom.ends],
+            starts=[NamedLine(item.name, self.apply_line(item.line, cx, cy), item.flow) for item in geom.starts],
+            ends=[NamedLine(item.name, self.apply_line(item.line, cx, cy), item.flow) for item in geom.ends],
             vehicle_refs=[self.apply_box(box, cx, cy) for box in geom.vehicle_refs],
             occlusions=[self.apply_box(box, cx, cy) for box in geom.occlusions],
             roadways=[self.apply_polygon(poly, cx, cy) for poly in geom.roadways],
@@ -477,7 +534,7 @@ def _assign_by_north(lines: list[Line], names: tuple[str, ...], north: Line, fra
 
 @dataclass
 class Geometry:
-    """North heading plus four entry lines and four exit lines."""
+    """North heading plus up to four count gates (N, S, E, W)."""
 
     frame_width: int
     frame_height: int
@@ -514,26 +571,67 @@ class Geometry:
             return Line(box.x2 + 8.0, y, box.x2 + 8.0 + d, y)
         return None
 
+    def all_gates(self) -> list[NamedLine]:
+        return list(self.starts) + list(self.ends)
+
+    def gate_count(self) -> int:
+        return len(self.starts) + len(self.ends)
+
     @property
     def routes(self) -> list[Route]:
         """Synthetic pairs for overlays that still expect Route objects."""
         pairs: list[Route] = []
-        for start in self.starts:
-            for end in self.ends:
-                pairs.append(Route(movement_name(start.name, end.name), start.line, end.line))
+        if self.starts and self.ends:
+            for start in self.starts:
+                for end in self.ends:
+                    pairs.append(Route(movement_name(start.name, end.name), start.line, end.line))
+            return pairs
+        gates = self.all_gates()
+        for start in gates:
+            oa = gate_origin_name(start.name)
+            if oa not in ORIGIN_TO_BOUND:
+                continue
+            for end in gates:
+                if start is end:
+                    continue
+                ob = gate_origin_name(end.name)
+                if ob not in ORIGIN_TO_BOUND or oa == ob:
+                    continue
+                pairs.append(Route(movement_name(oa, ORIGIN_TO_BOUND[ob]), start.line, end.line))
         return pairs
 
     def is_ready(self) -> bool:
-        return self.north is not None and len(self.starts) >= 1 and len(self.ends) >= 1
+        return self.north is not None and self.gate_count() >= 2
 
     def origin_names(self) -> list[str]:
-        return ordered_origins([item.name for item in self.starts if item.name])
+        if self.starts and self.ends:
+            return ordered_origins([item.name for item in self.starts if item.name and item.allows_entry()])
+        return ordered_origins(
+            [gate_origin_name(item.name) for item in self.all_gates() if item.name and item.allows_entry()]
+        )
 
     def bound_names(self) -> list[str]:
-        return ordered_bounds([item.name for item in self.ends if item.name])
+        if self.ends:
+            return ordered_bounds([item.name for item in self.ends if item.name and item.allows_exit()])
+        return ordered_bounds(
+            [
+                ORIGIN_TO_BOUND[gate_origin_name(item.name)]
+                for item in self.all_gates()
+                if item.name and item.allows_exit() and gate_origin_name(item.name) in ORIGIN_TO_BOUND
+            ]
+        )
 
     def movement_names(self) -> list[str]:
-        return [movement_name(origin, bound) for origin in self.origin_names() for bound in self.bound_names()]
+        origins = self.origin_names()
+        bounds = self.bound_names()
+        if self.starts and self.ends:
+            return [movement_name(origin, bound) for origin in origins for bound in bounds]
+        return [
+            movement_name(origin, bound)
+            for origin in origins
+            for bound in bounds
+            if ORIGIN_TO_BOUND.get(origin) != bound
+        ]
 
     def vehicle_area_limits(self, extra_areas: list[float] | None = None) -> tuple[int, int] | None:
         """Min/max blob area from drawn masks plus optional training-box areas."""
@@ -545,15 +643,21 @@ class Geometry:
     def assign_names(self) -> None:
         if self.north is None:
             return
+        start_flows = [item.flow for item in self.starts]
+        end_flows = [item.flow for item in self.ends]
         start_lines = [item.line for item in self.starts]
         end_lines = [item.line for item in self.ends]
         if start_lines:
             self.starts = _assign_by_north(start_lines, ORIGINS, self.north, self.frame_width, self.frame_height)
+            for item, flow in zip(self.starts, start_flows):
+                item.flow = flow
         if end_lines:
             self.ends = _assign_by_north(end_lines, BOUNDS, self.north, self.frame_width, self.frame_height)
+            for item, flow in zip(self.ends, end_flows):
+                item.flow = flow
 
     def add_gate(self, kind: str, line: Line, name: str | None = None) -> NamedLine | None:
-        """Add one entry or exit. ``name`` is used as-is; otherwise derive from North."""
+        """Add one count gate. New drawings use N/S/E/W; ``end`` keeps legacy NB/SB names."""
         if kind not in ("start", "end") or self.north is None:
             return None
         pool = self.starts if kind == "start" else self.ends
@@ -561,6 +665,8 @@ class Geometry:
         if len(pool) >= MAX_GATES:
             return None
         taken = {item.name for item in pool if item.name}
+        if kind == "start":
+            taken |= {gate_origin_name(item.name) for item in self.ends if item.name}
         chosen = name if name in names else name_from_north(
             line, names, self.north, self.frame_width, self.frame_height, taken
         )
@@ -587,8 +693,8 @@ class Geometry:
             frame_width=width,
             frame_height=height,
             north=north,
-            starts=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.starts],
-            ends=[NamedLine(item.name, item.line.scaled(sx, sy)) for item in self.ends],
+            starts=[NamedLine(item.name, item.line.scaled(sx, sy), item.flow) for item in self.starts],
+            ends=[NamedLine(item.name, item.line.scaled(sx, sy), item.flow) for item in self.ends],
             vehicle_refs=[box.scaled(sx, sy) for box in self.vehicle_refs],
             occlusions=[box.scaled(sx, sy) for box in self.occlusions],
             roadways=[poly.scaled(sx, sy) for poly in self.roadways],
@@ -601,8 +707,8 @@ class Geometry:
             "frame_width": self.frame_width,
             "frame_height": self.frame_height,
             "north": asdict(self.north) if self.north else None,
-            "starts": [{"name": item.name, "line": asdict(item.line)} for item in self.starts],
-            "ends": [{"name": item.name, "line": asdict(item.line)} for item in self.ends],
+            "starts": [{"name": item.name, "line": asdict(item.line), "flow": item.flow} for item in self.starts],
+            "ends": [{"name": item.name, "line": asdict(item.line), "flow": item.flow} for item in self.ends],
             "vehicle_refs": [asdict(box) for box in self.vehicle_refs],
             "occlusions": [asdict(box) for box in self.occlusions],
             "roadways": [{"points": [[x, y] for x, y in poly.points]} for poly in self.roadways],
@@ -613,8 +719,14 @@ class Geometry:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Geometry":
         north = Line(**data["north"]) if data.get("north") else None
-        starts = [NamedLine(str(item["name"]), Line(**item["line"])) for item in data.get("starts", [])]
-        ends = [NamedLine(str(item["name"]), Line(**item["line"])) for item in data.get("ends", [])]
+        starts = [
+            NamedLine(str(item["name"]), Line(**item["line"]), normalize_gate_flow(item.get("flow")))
+            for item in data.get("starts", [])
+        ]
+        ends = [
+            NamedLine(str(item["name"]), Line(**item["line"]), normalize_gate_flow(item.get("flow")))
+            for item in data.get("ends", [])
+        ]
         refs = [Box(**item).normalized() for item in data.get("vehicle_refs") or []]
         if not refs and data.get("vehicle_ref"):
             refs = [Box(**data["vehicle_ref"]).normalized()]

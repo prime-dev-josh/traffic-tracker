@@ -1,4 +1,4 @@
-"""Fine-tune YOLO11 on boxed Training sessions and write site weights."""
+"""Fine-tune YOLO11n on VisDrone and write visdrone.pt."""
 
 from __future__ import annotations
 
@@ -11,14 +11,11 @@ from traffic_tracker.config import (
     TRAIN_IMGSZ,
     TRAIN_PATIENCE,
     TRAIN_RUNS_REL,
-    TRAIN_SITE_EPOCHS,
     YOLO_PT_NAME,
 )
 from traffic_tracker.core.device import describe_device, detect_device
 from traffic_tracker.core.models import resolve_model_source
 from traffic_tracker.core.training import (
-    build_yolo_dataset,
-    site_weights_path,
     trained_weights_path,
     training_root,
     visdrone_weights_path,
@@ -69,6 +66,7 @@ def _fine_tune_yolo(
     start_message: str,
     start_weights: Path | None = None,
     batch: int = TRAIN_BATCH,
+    update_best_pt: bool = False,
 ) -> Path:
     device = detect_device()
     start = start_weights if start_weights and start_weights.is_file() else base_train_weights()
@@ -112,62 +110,14 @@ def _fine_tune_yolo(
         raise RuntimeError("Training cancelled.")
     fallback = training_root(base) / TRAIN_RUNS_REL / run_name
     _copy_best_weights(results, dest, fallback)
-    if dest != trained_weights_path(base):
-        site = trained_weights_path(base)
-        site.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(dest, site)
+    if update_best_pt:
+        best = trained_weights_path(base)
+        if dest.resolve() != best.resolve():
+            best.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest, best)
     if progress_cb:
         progress_cb(epochs, epochs, f"Saved weights to {dest}")
     return dest
-
-
-def train_site_detector(
-    base: Path | None = None,
-    *,
-    epochs: int = TRAIN_SITE_EPOCHS,
-    imgsz: int = TRAIN_IMGSZ,
-    progress_cb=None,
-    log_cb=None,
-    cancel_flag=None,
-) -> Path:
-    """Fine-tune from visdrone.pt when it exists, otherwise yolo11n. Writes site.pt and best.pt."""
-
-    def log(message: str) -> None:
-        if log_cb:
-            log_cb(message)
-
-    def progress(current: int, total: int, message: str) -> None:
-        if progress_cb:
-            progress_cb(current, total, message)
-
-    if cancel_flag and cancel_flag():
-        raise RuntimeError("Training cancelled.")
-
-    progress(0, epochs, "Building YOLO dataset from boxed frames…")
-    dataset = build_yolo_dataset(base)
-    log(
-        f"{dataset['frame_count']} frames ({dataset['train_count']} train / "
-        f"{dataset['val_count']} val), {dataset['box_count']} boxes."
-    )
-    if cancel_flag and cancel_flag():
-        raise RuntimeError("Training cancelled.")
-
-    start = visdrone_weights_path(base)
-    from_visdrone = start.is_file()
-    if log_cb and from_visdrone:
-        log_cb(f"Starting from VisDrone weights: {start}")
-    return _fine_tune_yolo(
-        data=str(dataset["yaml_path"]),
-        run_name="site",
-        dest=site_weights_path(base),
-        base=base,
-        epochs=epochs,
-        imgsz=imgsz,
-        progress_cb=progress,
-        cancel_flag=cancel_flag,
-        start_message="Fine-tuning site boxes on top of" if from_visdrone else "Fine-tuning",
-        start_weights=start if from_visdrone else None,
-    )
 
 
 def train_visdrone_detector(
@@ -208,5 +158,4 @@ def train_visdrone_detector(
     )
     if log_cb:
         log_cb(f"VisDrone weights: {path}")
-        log_cb(f"Also copied to {trained_weights_path(base)} for Process → Trained detector.")
     return path

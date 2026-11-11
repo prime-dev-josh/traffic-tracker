@@ -28,6 +28,16 @@ MUTED_DARK = "#C5C0DC"
 MUTED_LIGHT = "#6B73A1"
 
 
+def path_color_bgr(theme: str = "dark") -> tuple[int, int, int]:
+    """OpenCV BGR for movement traces (primary orange)."""
+    hex_color = ORANGE_LIGHT if theme == "light" else ORANGE
+    value = hex_color.lstrip("#")
+    r = int(value[0:2], 16)
+    g = int(value[2:4], 16)
+    b = int(value[4:6], 16)
+    return (b, g, r)
+
+
 def brand_logo_path(theme: str) -> Path:
     name = "prime_ae_light.png" if theme == "light" else "prime_ae_dark.png"
     return BRAND_DIR / name
@@ -127,6 +137,17 @@ QPushButton#danger {
     background-color: #7A2436;
     border: 1px solid #A33B4C;
     color: #FFFFFF;
+}
+QPushButton#quiet {
+    background-color: transparent;
+    border: none;
+    color: #C8C4E0;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+QPushButton#quiet:hover {
+    color: #FFFFFF;
+    background-color: #3A3272;
 }
 QPushButton#rowAction, QPushButton#rowDanger {
     padding: 4px 8px;
@@ -376,6 +397,17 @@ QPushButton#danger {
     background-color: #F8D6D6;
     border: 1px solid #D48A8A;
     color: #7A1F1F;
+}
+QPushButton#quiet {
+    background-color: transparent;
+    border: none;
+    color: #5C6490;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+QPushButton#quiet:hover {
+    color: #24328A;
+    background-color: #EEF0F8;
 }
 QPushButton#rowAction, QPushButton#rowDanger {
     padding: 4px 8px;

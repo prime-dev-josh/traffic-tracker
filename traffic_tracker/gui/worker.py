@@ -21,7 +21,7 @@ from traffic_tracker.config import (
 from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
 from traffic_tracker.core.report import Trip, export_tmc_workbook
-from traffic_tracker.core.trainer import train_site_detector, train_visdrone_detector
+from traffic_tracker.core.trainer import train_visdrone_detector
 
 
 class ProcessWorker(QThread):
@@ -47,6 +47,8 @@ class ProcessWorker(QThread):
         detector_imgsz: int = DETECTOR_IMGSZ,
         detect_stride: int = DETECTOR_STRIDE,
         preview_every: int = PREVIEW_EVERY,
+        theme: str = "dark",
+        infer_trips_from_traces: bool | None = None,
     ) -> None:
         super().__init__(parent)
         self._jobs = jobs
@@ -62,6 +64,8 @@ class ProcessWorker(QThread):
         self._detector_imgsz = detector_imgsz
         self._detect_stride = detect_stride
         self._preview_every = preview_every
+        self._theme = theme if theme in ("dark", "light") else "dark"
+        self._infer_trips_from_traces = infer_trips_from_traces
         self._cancel = False
 
     def cancel(self) -> None:
@@ -96,6 +100,8 @@ class ProcessWorker(QThread):
                     path_jump=self._path_jump,
                     detector_imgsz=self._detector_imgsz,
                     detect_stride=self._detect_stride,
+                    theme=self._theme,
+                    infer_trips_from_traces=self._infer_trips_from_traces,
                 )
                 if result.error and result.error != "Cancelled":
                     self.failed.emit(f"{video.name}: {result.error}")
@@ -126,18 +132,17 @@ class TrainWorker(QThread):
     failed = pyqtSignal(str)
     train_done = pyqtSignal(str)
 
-    def __init__(self, parent: QObject | None = None, source: str = "site") -> None:
+    def __init__(self, parent: QObject | None = None, source: str = "visdrone") -> None:
         super().__init__(parent)
         self._cancel = False
-        self._source = source if source in ("site", "visdrone") else "site"
+        _ = source
 
     def cancel(self) -> None:
         self._cancel = True
 
     def run(self) -> None:
         try:
-            train_fn = train_visdrone_detector if self._source == "visdrone" else train_site_detector
-            path = train_fn(
+            path = train_visdrone_detector(
                 progress_cb=self.progress.emit,
                 log_cb=self.log_line.emit,
                 cancel_flag=lambda: self._cancel,

@@ -96,8 +96,39 @@ def path_cross_t(
     return _segment_t(prev, curr, (gated.x1, gated.y1), (gated.x2, gated.y2))
 
 
-def box_hits_line(xyxy, line: Line, *, pad_px: float = 24.0) -> bool:
-    """True when the bounding box sits on or straddles the (padded) gate."""
+def box_cross_t(
+    prev_xyxy: tuple[float, float, float, float] | None,
+    curr_xyxy: tuple[float, float, float, float],
+    line: Line,
+    *,
+    pad_px: float = 24.0,
+    clearance_px: float = 8.0,
+) -> float | None:
+    """When the gate cuts the box, or the box swept through the gate this step.
+
+    Duplicate prevention lives on the track ID, not on a center side-change.
+    ``clearance_px`` is accepted for callers and ignored.
+    """
+    del clearance_px
+    curr_hit = box_overlaps_line(curr_xyxy, line, pad_px=pad_px)
+    if prev_xyxy is None:
+        return 0.0 if curr_hit else None
+    prev_hit = box_overlaps_line(prev_xyxy, line, pad_px=pad_px)
+    if curr_hit:
+        return 0.0 if prev_hit else 1.0
+    prev_c = bbox_center(prev_xyxy)
+    curr_c = bbox_center(curr_xyxy)
+    prev_pts = (prev_c, *bbox_corners(prev_xyxy))
+    curr_pts = (curr_c, *bbox_corners(curr_xyxy))
+    for prev_pt, curr_pt in zip(prev_pts, curr_pts):
+        t = path_cross_t(prev_pt, curr_pt, line, pad_px=pad_px)
+        if t is not None:
+            return t
+    return None
+
+
+def box_overlaps_line(xyxy, line: Line, *, pad_px: float = 24.0) -> bool:
+    """True when the rectangle itself intersects the (length-padded) gate."""
     x1, y1, x2, y2 = (float(v) for v in xyxy)
     left, right = min(x1, x2), max(x1, x2)
     top, bottom = min(y1, y2), max(y1, y2)
@@ -115,8 +146,16 @@ def box_hits_line(xyxy, line: Line, *, pad_px: float = 24.0) -> bool:
         return True
     if left <= gated.x2 <= right and top <= gated.y2 <= bottom:
         return True
-    cx, cy = (left + right) / 2.0, (top + bottom) / 2.0
-    return _point_near_segment((cx, cy), gated, pad_px)
+    return False
+
+
+def box_hits_line(xyxy, line: Line, *, pad_px: float = 24.0) -> bool:
+    """True when the bounding box sits on or straddles the (padded) gate."""
+    if box_overlaps_line(xyxy, line, pad_px=pad_px):
+        return True
+    x1, y1, x2, y2 = (float(v) for v in xyxy)
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    return _point_near_segment((cx, cy), pad_line(line, pad_px), pad_px)
 
 
 def _point_near_segment(point: tuple[float, float], line: Line, pad_px: float) -> bool:
@@ -163,6 +202,37 @@ def confirmed_cross_t(
     if step < 2.0 and abs(after - before) < clearance_px:
         return None
     return path_cross_t(prev, curr, line, pad_px=pad_px)
+
+
+def trace_cross_t(
+    prev: tuple[float, float],
+    curr: tuple[float, float],
+    line: Line,
+    *,
+    pad_px: float = 24.0,
+    clearance_px: float = 8.0,
+) -> float | None:
+    """Confirmed gate hit, else a path/infinite-line crossing from the trace."""
+    hit = confirmed_cross_t(prev, curr, line, pad_px=pad_px, clearance_px=clearance_px)
+    if hit is not None:
+        return hit
+    hit = path_cross_t(prev, curr, line, pad_px=pad_px)
+    if hit is not None:
+        return hit
+    step = ((curr[0] - prev[0]) ** 2 + (curr[1] - prev[1]) ** 2) ** 0.5
+    if step < max(8.0, clearance_px):
+        return None
+    before = signed_offset(prev, line)
+    after = signed_offset(curr, line)
+    if before * after > 0.0:
+        return None
+    denom = after - before
+    if abs(denom) < 1e-9:
+        return None
+    t = -before / denom
+    if 0.0 <= t <= 1.0:
+        return t
+    return None
 
 
 def path_crosses_line(

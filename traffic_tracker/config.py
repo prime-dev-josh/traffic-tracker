@@ -45,9 +45,44 @@ TRAINING_DIR_NAME = "training"
 SIZE_PRIOR_NAME = "size_prior.json"
 TRAINED_WEIGHTS_REL = "weights/best.pt"
 VISDRONE_WEIGHTS_REL = "weights/visdrone.pt"
+DRONE_VEHICLES_WEIGHTS_REL = "weights/drone_vehicles.pt"
 SITE_WEIGHTS_REL = "weights/site.pt"
 TRAIN_DATASET_REL = "dataset"
 TRAIN_RUNS_REL = "runs"
+DRONE_DATASETS_REL = "datasets"
+DRONE_VEHICLES_DATASET_REL = "datasets/drone_vehicles"
+UAVDT_RAW_REL = "datasets/uavdt_raw"
+UAVDT_ENV = "TRAFFIC_TRACKER_UAVDT_ROOT"
+UAVDT_FRAME_STRIDE = 30
+TRAIN_DRONE_VEHICLES_EPOCHS = 60
+# Shared YOLO schema for drone-base and site fine-tunes.
+DRONE_VEHICLE_NAMES = ("car", "van", "truck", "bus", "motorcycle")
+DRONE_VEHICLE_NAME_TO_ID = {
+    "car": 0,
+    "van": 1,
+    "truck": 2,
+    "bus": 3,
+    "motorcycle": 4,
+    "motor": 4,
+    "motorbike": 4,
+}
+
+
+def drone_vehicle_class_id(name: object) -> int:
+    raw = str(name or "car").strip().lower().replace("_", "-").replace(" ", "-")
+    return DRONE_VEHICLE_NAME_TO_ID.get(raw, 0)
+
+
+def drone_vehicles_data_yaml(root) -> str:
+    from pathlib import Path
+
+    names = "\n".join(f"  {index}: {name}" for index, name in enumerate(DRONE_VEHICLE_NAMES))
+    return (
+        f"path: {Path(root).resolve().as_posix()}\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        f"names:\n{names}\n"
+    )
 TRAIN_MIN_FRAMES = 20
 TRAIN_MIN_BOXES = 40
 TRAIN_EPOCHS = 60
@@ -74,6 +109,10 @@ DETECTOR_IOU = 0.40
 DETECTOR_IOU_MIN = 0.20
 DETECTOR_IOU_MAX = 0.70
 DETECTOR_MATCH_IOU_MIN = 0.10
+# Same-vehicle stack: class-agnostic NMS plus this IoU/containment merge.
+DETECTOR_STACK_IOU = 0.50
+DETECTOR_CONTAIN_FRAC = 0.75
+PATH_SMOOTH_ALPHA = 0.35
 # Parked cars / boats stay inside this radius; the settle point creeps with hover drift.
 DETECTOR_STATIC_RADIUS_MIN = 56.0
 DETECTOR_STATIC_RADIUS_FRAC = 0.07
@@ -102,7 +141,7 @@ PREDICTION_REACH_MAX = 160.0
 PRECISION_PRESETS = {
     "strict": {
         "detector_conf": 0.45,
-        "detector_iou": 0.50,
+        "detector_iou": 0.28,
         "parked_radius": 96.0,
         "link_speed": 100.0,
         "path_jump": 60.0,
@@ -121,4 +160,10 @@ PRECISION_PRESETS = {
         "link_speed": 260.0,
         "path_jump": 140.0,
     },
+}
+PRECISION_MODE_LABELS = {
+    "strict": "One box per car",
+    "balanced": "Through shadows",
+    "sensitive": "Keep queued cars",
+    "custom": "Custom",
 }

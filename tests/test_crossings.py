@@ -1,7 +1,17 @@
 import unittest
 
-from traffic_tracker.core.crossings import bbox_center, bbox_corners, box_hits_line, box_iou, path_crosses_line, segments_intersect
-from traffic_tracker.core.geometry import Box, Geometry, Line, NamedLine
+from traffic_tracker.core.crossings import (
+    bbox_center,
+    bbox_corners,
+    box_cross_t,
+    box_hits_line,
+    box_iou,
+    confirmed_cross_t,
+    path_crosses_line,
+    segments_intersect,
+    trace_cross_t,
+)
+from traffic_tracker.core.geometry import Box, Geometry, Line, NamedLine, Polygon
 from traffic_tracker.core.processor import (
     _Pending,
     _draw_paths,
@@ -41,10 +51,32 @@ class CrossingGeometryTests(unittest.TestCase):
         gate = Line(20, 50, 80, 50)
         self.assertTrue(path_crosses_line((10, 10), (10, 90), gate, pad_px=24))
 
+    def test_trace_cross_accepts_infinite_line_when_finite_gate_is_missed(self) -> None:
+        gate = Line(80, 50, 100, 50)
+        prev, curr = (20.0, 10.0), (20.0, 90.0)
+        self.assertIsNone(confirmed_cross_t(prev, curr, gate, pad_px=32.0))
+        self.assertIsNotNone(trace_cross_t(prev, curr, gate, pad_px=32.0))
+
     def test_box_sitting_on_gate_counts(self) -> None:
         gate = Line(0, 50, 100, 50)
         self.assertTrue(box_hits_line((40, 30, 60, 70), gate))
         self.assertFalse(box_hits_line((40, 10, 60, 25), gate, pad_px=8))
+
+    def test_box_arriving_on_gate_counts_when_center_has_not_crossed(self) -> None:
+        gate = Line(0, 50, 100, 50)
+        prev = (30.0, 5.0, 70.0, 40.0)
+        curr = (30.0, 25.0, 70.0, 60.0)
+        self.assertFalse(box_hits_line(prev, gate, pad_px=8))
+        self.assertTrue(box_hits_line(curr, gate, pad_px=8))
+        self.assertIsNone(confirmed_cross_t(bbox_center(prev), bbox_center(curr), gate, pad_px=8))
+        self.assertIsNotNone(box_cross_t(prev, curr, gate, pad_px=8))
+
+    def test_stationary_box_on_gate_still_cuts(self) -> None:
+        gate = Line(0, 50, 100, 50)
+        box = (40.0, 30.0, 60.0, 70.0)
+        self.assertIsNotNone(box_cross_t(box, box, gate, pad_px=8))
+        away = (40.0, 5.0, 60.0, 20.0)
+        self.assertIsNone(box_cross_t(away, away, gate, pad_px=8))
 
 
 class RecordCrossingTests(unittest.TestCase):
@@ -65,8 +97,80 @@ class RecordCrossingTests(unittest.TestCase):
         self.assertEqual(trips[0].end_destination, "SB")
         self.assertEqual(trips[0].vehicle_class, "vehicle")
 
+    def test_two_moving_boxes_both_get_entry(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        left = (5, 5, 25, 25)
+        right = (75, 5, 95, 25)
+        _record_crossings([left, right], geom, pending, trips, "a.mp4", 1.0)
+        # Both boxes land on the entry; centers are still on the approach side.
+        left2 = (5, 25, 25, 45)
+        right2 = (75, 25, 95, 45)
+        _record_crossings([left2, right2], geom, pending, trips, "a.mp4", 1.5)
+        self.assertEqual(len(pending.live), 2)
+        self.assertEqual({state.entry_origin for state in pending.live.values()}, {"N"})
+        self.assertEqual(trips, [])
+        left3 = (5, 80, 25, 100)
+        right3 = (75, 80, 95, 100)
+        _record_crossings([left3, right3], geom, pending, trips, "a.mp4", 2.0)
+        self.assertEqual(len(trips), 2)
+        self.assertEqual({trip.start_destination for trip in trips}, {"N"})
+        self.assertEqual({trip.end_destination for trip in trips}, {"SB"})
+
+    def test_trace_infer_labels_entry_when_boxes_miss_the_tripwire(self) -> None:
+        geom = self._geom(
+            [NamedLine("N", Line(75, 12, 95, 12))],
+            [NamedLine("SB", Line(75, 88, 95, 88))],
+        )
+
+        def boxes(y: float):
+            return [(10, y - 10, 30, y + 10)]
+
+        strict = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(boxes(10), geom, strict, trips, "a.mp4", 1.0, infer_trips_from_traces=False)
+        _record_crossings(boxes(90), geom, strict, trips, "a.mp4", 2.0, infer_trips_from_traces=False)
+        state = next(iter(strict.live.values()))
+        self.assertIsNone(state.entry_origin)
+        self.assertEqual(trips, [])
+
+        inferred = _Pending()
+        inferred_trips: list[Trip] = []
+        _record_crossings(boxes(10), geom, inferred, inferred_trips, "a.mp4", 1.0, infer_trips_from_traces=True)
+        _record_crossings(boxes(90), geom, inferred, inferred_trips, "a.mp4", 2.0, infer_trips_from_traces=True)
+        state = next(iter(inferred.live.values()))
+        self.assertIsNotNone(state.entry_origin)
+        self.assertIsNotNone(state.exit_bound)
+        self.assertEqual(len(inferred_trips), 1)
+        self.assertEqual(inferred_trips[0].start_destination, state.entry_origin)
+
+    def test_first_gate_cut_is_entry_regardless_of_color(self) -> None:
+        """The first line that cuts the box is entry, even if it was drawn as Exit."""
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        _record_crossings(self._box(55), geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0)
+        state = next(iter(pending.live.values()))
+        self.assertEqual(state.entry_origin, "S")
+        self.assertEqual(trips, [])
+
+    def test_sitting_on_a_gate_does_not_double_count(self) -> None:
+        geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
+        pending = _Pending()
+        trips: list[Trip] = []
+        on_entry = [(40, 30, 60, 50)]
+        _record_crossings(on_entry, geom, pending, trips, "a.mp4", 1.0)
+        _record_crossings(on_entry, geom, pending, trips, "a.mp4", 1.2)
+        _record_crossings(on_entry, geom, pending, trips, "a.mp4", 1.4)
+        state = next(iter(pending.live.values()))
+        self.assertEqual(state.entry_origin, "N")
+        self.assertEqual(trips, [])
+        self.assertEqual(len(state.counted_gates), 1)
+
     def test_swapped_start_end_colors_still_counts_n_sb(self) -> None:
-        """Green start drawn on the south, red end on the north — still N-SB."""
+        """Green/red labels are ignored; first cut is entry, second is exit."""
         geom = self._geom([NamedLine("N", Line(0, 70, 100, 70))], [NamedLine("SB", Line(0, 40, 100, 40))])
         pending = _Pending()
         trips: list[Trip] = []
@@ -89,7 +193,7 @@ class RecordCrossingTests(unittest.TestCase):
         pending = _Pending()
         trips: list[Trip] = []
         starts_hit, _ = _record_crossings([(30, 20, 70, 60)], geom, pending, trips, "a.mp4", 1.0)
-        self.assertEqual(starts_hit, 0)
+        self.assertEqual(starts_hit, 1)
         self.assertEqual(trips, [])
         _record_crossings([(30, 50, 70, 90)], geom, pending, trips, "a.mp4", 2.0)
         self.assertGreaterEqual(len(trips), 1)
@@ -142,7 +246,9 @@ class RecordCrossingTests(unittest.TestCase):
         self.assertTrue(pending.live[tid].holding)
         _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 21.0)
         self.assertEqual(len(trips), 1)
-        self.assertNotIn(tid, pending.live)
+        self.assertIn(tid, pending.live)
+        self.assertFalse(pending.live[tid].holding)
+        self.assertIsNotNone(pending.live[tid].last_xyxy)
 
     def test_fast_vanish_expires_on_coast(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
@@ -376,6 +482,48 @@ class RecordCrossingTests(unittest.TestCase):
         chunks = _path_chunks(pending.live[tid].path, 60.0, geom)
         self.assertEqual(len(chunks), 1)
 
+    def test_drop_zone_does_not_attach_across_the_map(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+            prediction_reach_px=64.0,
+        )
+        pending = _Pending(link_speed=180.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210)],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car"],
+            )
+        a_tid = next(iter(pending.live))
+        _record_crossings([], geom, pending, trips, "a.mp4", 1.48, moving_only=True)
+        _record_crossings([], geom, pending, trips, "a.mp4", 2.20, moving_only=True)
+        _record_crossings(
+            [(340, 180, 370, 210)],
+            geom,
+            pending,
+            trips,
+            "a.mp4",
+            3.40,
+            moving_only=True,
+            classes=["car"],
+        )
+        self.assertIn(a_tid, pending.live)
+        far = [state for tid, state in pending.live.items() if tid != a_tid]
+        self.assertEqual(len(far), 1)
+        self.assertLess(pending.live[a_tid].xy[0], 160.0)
+        self.assertGreater(far[0].xy[0], 320.0)
+
     def test_drop_zone_does_not_jump_to_far_car(self) -> None:
         geom = Geometry(
             400,
@@ -435,6 +583,43 @@ class RecordCrossingTests(unittest.TestCase):
         state = next(iter(pending.live.values()))
         self.assertFalse(state.active)
         self.assertEqual(state.path, [])
+
+    def test_lost_id_does_not_attach_to_stoplight_car(self) -> None:
+        geom = Geometry(
+            400,
+            400,
+            north=Line(200, 220, 200, 40),
+            starts=[NamedLine("N", Line(0, 8, 400, 8))],
+            ends=[NamedLine("SB", Line(0, 392, 400, 392))],
+            occlusions=[Box(70, 160, 200, 230)],
+            roadways=[Polygon([(0.0, 0.0), (400.0, 0.0), (400.0, 400.0), (0.0, 400.0)])],
+            prediction_reach_px=64.0,
+        )
+        parked = (210, 180, 240, 210)
+        pending = _Pending(link_speed=180.0, parked_radius=40.0)
+        trips: list[Trip] = []
+        for step, x in enumerate((20.0, 36.0, 52.0, 68.0)):
+            _record_crossings(
+                [(x, 180, x + 30, 210), parked],
+                geom,
+                pending,
+                trips,
+                "a.mp4",
+                1.00 + step * 0.12,
+                moving_only=True,
+                classes=["car", "car"],
+            )
+        mover = next(state for state in pending.live.values() if state.active)
+        parked_state = next(state for state in pending.live.values() if not state.active)
+        mover_tid, parked_tid = mover.tid, parked_state.tid
+        for when in (1.48, 1.72, 2.10, 2.50):
+            _record_crossings([parked], geom, pending, trips, "a.mp4", when, moving_only=True, classes=["car"])
+            _expire_tracks(pending, geom, trips, "a.mp4", when, infer_path=False)
+        self.assertIn(parked_tid, pending.live)
+        self.assertFalse(pending.live[parked_tid].active)
+        self.assertLess(abs(pending.live[parked_tid].xy[0] - 225.0), 16.0)
+        if mover_tid in pending.live:
+            self.assertGreater(abs(pending.live[mover_tid].xy[0] - pending.live[parked_tid].xy[0]), 20.0)
 
     def test_drop_zone_does_not_jump_to_parked_car(self) -> None:
         geom = Geometry(
@@ -613,16 +798,17 @@ class RecordCrossingTests(unittest.TestCase):
         lit = int((frame[38:43] > 0).any(axis=2).sum())
         self.assertGreater(lit, 90)
 
-    def test_unlinked_path_is_not_drawn(self) -> None:
+    def test_unlinked_path_is_drawn(self) -> None:
         import numpy as np
 
         frame = np.zeros((80, 120, 3), dtype=np.uint8)
         pending = _Pending()
         pending.finished_paths.append(("car", [(10.0, 40.0), (40.0, 40.0), (70.0, 40.0), (110.0, 40.0)]))
         _draw_paths(frame, pending, trips=[])
-        self.assertEqual(int(frame.sum()), 0)
+        lit = int((frame[38:43] > 0).any(axis=2).sum())
+        self.assertGreater(lit, 90)
 
-    def test_expired_path_without_a_trip_is_dropped(self) -> None:
+    def test_expired_path_without_a_trip_is_kept(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
         pending = _Pending()
         trips: list[Trip] = []
@@ -633,7 +819,7 @@ class RecordCrossingTests(unittest.TestCase):
         self.assertEqual(inferred, 0)
         self.assertEqual(trips, [])
         self.assertEqual(pending.live, {})
-        self.assertEqual(pending.finished_paths, [])
+        self.assertTrue(pending.finished_paths)
 
     def test_completed_trip_keeps_its_path(self) -> None:
         geom = self._geom([NamedLine("N", Line(0, 40, 100, 40))], [NamedLine("SB", Line(0, 70, 100, 70))])
@@ -642,8 +828,9 @@ class RecordCrossingTests(unittest.TestCase):
         _record_crossings(self._box(10), geom, pending, trips, "a.mp4", 1.0, classes=["car"])
         _record_crossings(self._box(90), geom, pending, trips, "a.mp4", 2.0, classes=["car"])
         self.assertEqual(len(trips), 1)
-        self.assertTrue(pending.finished_paths)
+        self.assertIn(1, pending.live)
         self.assertGreaterEqual(len(trips[0].path), 2)
+        self.assertGreaterEqual(len(pending.live[1].path), len(trips[0].path))
 
     def test_route_overlays_split_by_movement(self) -> None:
         import numpy as np

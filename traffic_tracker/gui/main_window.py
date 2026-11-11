@@ -53,14 +53,14 @@ from traffic_tracker.config import (
     PREVIEW_EVERY_CHOICES,
     PREDICTION_REACH_MAX,
     PREDICTION_REACH_MIN,
+    PRECISION_MODE_LABELS,
     PREDICTION_REACH_PX,
-    TRAIN_MIN_BOXES,
-    TRAIN_MIN_FRAMES,
-    TRAIN_SITE_EPOCHS,
 )
 from traffic_tracker.core.geometry import (
-    BOUNDS,
+    GATE_FLOW_LABELS,
+    GATE_FLOWS,
     MAX_GATES,
+    ORIGIN_TO_BOUND,
     ORIGINS,
     MAX_OCCLUSIONS,
     MAX_ROADWAYS,
@@ -70,8 +70,10 @@ from traffic_tracker.core.geometry import (
     Line,
     NamedLine,
     Polygon,
+    gate_origin_name,
     Transform,
     polygon_is_valid,
+    drop_zone_too_wide,
     roadway_approach_warnings,
     transform_from_matches,
 )
@@ -84,7 +86,7 @@ def bind_row_action(callback):
         callback()
 
     return _run
-from traffic_tracker.core.processor import ProcessResult
+from traffic_tracker.core.processor import ProcessResult, draw_issue_overlay
 from traffic_tracker.core.project import BundleProject, ClipRecord
 from traffic_tracker.core.report import (
     build_gate_statistics_table,
@@ -105,25 +107,14 @@ from traffic_tracker.core.settings import (
     load_settings,
     save_settings,
 )
-from traffic_tracker.core.detector import reset_detector_cache, weights_for_source
-from traffic_tracker.core.device import device_report
-from traffic_tracker.core.training import (
-    LabeledFrame,
-    TrainingSession,
-    delete_session,
-    export_training_archive,
-    has_trained_weights,
-    import_training_archive,
-    list_sessions,
-    load_session,
-    prior_areas,
-    save_session,
-    site_weights_path,
-    trained_weights_path,
-    training_inventory,
-    training_root,
-    visdrone_weights_path,
+from traffic_tracker.core.detector import (
+    boxes_from_detector,
+    draw_detection_preview,
+    load_detector,
+    reset_detector_cache,
 )
+from traffic_tracker.core.device import device_report
+from traffic_tracker.core.training import visdrone_weights_path
 from traffic_tracker.gui.style import load_brand_pixmap, stylesheet_for
 from traffic_tracker.core.video import (
     file_size_gb,
@@ -179,13 +170,6 @@ class MainWindow(QMainWindow):
         self._match_clip: list[tuple[float, float]] = []
         self._match_side = "ref"
         self._redrawing = False
-        self._train_video: Path | None = None
-        self._train_session: TrainingSession | None = None
-        self._train_frame = None
-        self._train_frame_index = 0
-        self._train_time_s = 0.0
-        self._train_boxes: list[Box] = []
-        self._train_frames_bgr: dict[int, np.ndarray] = {}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -203,7 +187,7 @@ class MainWindow(QMainWindow):
         header = QVBoxLayout()
         title = QLabel(APP_NAME)
         title.setObjectName("title")
-        subtitle = QLabel("Count vehicles across user-drawn start and end lines, then export a 15-minute TMC.")
+        subtitle = QLabel("Count vehicles across N, S, E, and W gates, then export a 15-minute TMC.")
         subtitle.setObjectName("subtitle")
         header.addWidget(title)
         header.addWidget(subtitle)
@@ -254,16 +238,19 @@ class MainWindow(QMainWindow):
         *,
         primary: bool = False,
         danger: bool = False,
+        quiet: bool = False,
         tooltip: str = "",
     ) -> QPushButton:
         button = QPushButton(text)
         if primary:
             button.setObjectName("primary")
-        if danger:
+        elif danger:
             button.setObjectName("danger")
+        elif quiet:
+            button.setObjectName("quiet")
         if tooltip:
             button.setToolTip(tooltip)
-        button.setMinimumHeight(36)
+        button.setMinimumHeight(28 if quiet else 36)
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         return button
 
@@ -279,13 +266,13 @@ class MainWindow(QMainWindow):
                 (
                     "02",
                     "Training",
-                    "Box every vehicle on sample frames, then Train detector for site weights.",
+                    "Train VisDrone once. New installs need this; weights are not bundled.",
                     self._go_training,
                 ),
                 (
                     "03",
                     "Settings",
-                    "Export folder, OneDrive warning, and detector mode. Motion stays on until site weights exist.",
+                    "Export folder, OneDrive warning, and Motion vs Trained detector.",
                     self._go_settings,
                 ),
             ]
@@ -297,98 +284,46 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout(page)
         row.setSpacing(16)
 
-        left = self._card()
-        left_layout = QVBoxLayout(left)
-        left_layout.addWidget(self._step_title("Training"))
+        card = self._card()
+        layout = QVBoxLayout(card)
+        layout.addWidget(self._step_title("Train VisDrone"))
         hint = QLabel(
-            "Box every vehicle you can see, including parked and queued cars. "
-            "Do not box people, bikes, or boats. "
-            "Aim for 150+ frames and 400+ boxes across clips. "
-            f"{TRAIN_MIN_FRAMES} frames and {TRAIN_MIN_BOXES} boxes is the minimum. "
-            "Train detector fine-tunes those boxes on top of the VisDrone weights."
+            "Weights are not bundled with a new install. Train once to download VisDrone2019-DET "
+            "(~2 GB) and fine-tune YOLO11n. The result is training/weights/visdrone.pt. "
+            "Then set Detection mode to Trained detector. This can take hours; a GPU is much faster."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
-        left_layout.addWidget(hint)
+        layout.addWidget(hint)
 
-        pick = QPushButton("Open video")
-        pick.clicked.connect(self._training_pick_video)
-        left_layout.addWidget(pick)
-
-        self.train_video_label = QLabel("No video selected.")
-        self.train_video_label.setObjectName("hint")
-        self.train_video_label.setWordWrap(True)
-        left_layout.addWidget(self.train_video_label)
-
-        self.train_status = QLabel("Open a clip, then box every vehicle you can see.")
+        self.train_status = QLabel("")
         self.train_status.setObjectName("hint")
         self.train_status.setWordWrap(True)
-        left_layout.addWidget(self.train_status)
+        layout.addWidget(self.train_status)
 
-        left_layout.addWidget(self._section("Saved sessions"))
-        self.train_sessions = QListWidget()
-        self.train_sessions.itemSelectionChanged.connect(self._training_select_session)
-        left_layout.addWidget(self.train_sessions, 1)
-
-        session_btns = QHBoxLayout()
-        load_sess = QPushButton("Load")
-        load_sess.clicked.connect(self._training_load_selected)
-        delete_sess = QPushButton("Delete session")
-        delete_sess.setObjectName("danger")
-        delete_sess.clicked.connect(self._training_delete_selected)
-        session_btns.addWidget(load_sess)
-        session_btns.addWidget(delete_sess)
-        left_layout.addLayout(session_btns)
-
-        actions = QHBoxLayout()
-        next_frame = QPushButton("Next frame")
-        next_frame.clicked.connect(self._training_next_frame)
-        undo_box = QPushButton("Undo box")
-        undo_box.clicked.connect(self._training_undo_box)
-        save_sess = QPushButton("Save session")
-        save_sess.setObjectName("primary")
-        save_sess.clicked.connect(self._training_save)
-        actions.addWidget(next_frame)
-        actions.addWidget(undo_box)
-        actions.addWidget(save_sess)
-        left_layout.addLayout(actions)
-
-        left_layout.addWidget(self._section("Site detector"))
-        self.train_ready_label = QLabel("No labeled frames yet.")
-        self.train_ready_label.setObjectName("hint")
-        self.train_ready_label.setWordWrap(True)
-        left_layout.addWidget(self.train_ready_label)
         train_row = QHBoxLayout()
-        self.train_detector_btn = QPushButton("Train detector")
-        self.train_detector_btn.setObjectName("primary")
-        self.train_detector_btn.clicked.connect(self._start_detector_train)
-        self.train_visdrone_btn = QPushButton("Train on VisDrone")
+        self.train_visdrone_btn = QPushButton("Train VisDrone")
+        self.train_visdrone_btn.setObjectName("primary")
         self.train_visdrone_btn.clicked.connect(self._start_visdrone_train)
-        self.cancel_train_btn = QPushButton("Cancel train")
+        self.cancel_train_btn = QPushButton("Cancel")
         self.cancel_train_btn.setEnabled(False)
         self.cancel_train_btn.clicked.connect(self._cancel_detector_train)
-        train_row.addWidget(self.train_detector_btn)
+        open_folder = QPushButton("Open weights folder")
+        open_folder.clicked.connect(self._open_training_folder)
         train_row.addWidget(self.train_visdrone_btn)
         train_row.addWidget(self.cancel_train_btn)
-        left_layout.addLayout(train_row)
+        train_row.addWidget(open_folder)
+        layout.addLayout(train_row)
+
         self.train_progress = QProgressBar()
         self.train_progress.setValue(0)
-        left_layout.addWidget(self.train_progress)
+        layout.addWidget(self.train_progress)
         self.train_log = QPlainTextEdit()
         self.train_log.setReadOnly(True)
-        self.train_log.setMaximumHeight(120)
         self.train_log.setPlaceholderText("Training log")
-        left_layout.addWidget(self.train_log)
+        layout.addWidget(self.train_log, 1)
 
-        right = self._card()
-        right_layout = QVBoxLayout(right)
-        right_layout.addWidget(self._step_title("Box every vehicle on this frame"))
-        self.train_canvas = FrameCanvas()
-        self.train_canvas.on_box_drawn = self._training_box_drawn
-        right_layout.addWidget(self.train_canvas, 1)
-
-        row.addWidget(left, 0)
-        row.addWidget(right, 1)
+        row.addWidget(card, 1)
         return page
 
     def _build_settings_page(self) -> QWidget:
@@ -433,9 +368,9 @@ class MainWindow(QMainWindow):
 
         form.addWidget(self._section("Detection mode"))
         mode_hint = QLabel(
-            "Motion mask is the default. Trained detector uses VisDrone weights, "
-            "a site fine-tune started from those weights, or a .pt file you choose. "
-            "You can also change Motion vs Trained on the Align step before Process."
+            "Motion mask is the default. Trained detector uses VisDrone weights at "
+            "training/weights/visdrone.pt. Train those on the Training page — they are "
+            "not shipped with a new install. You can also switch Motion vs Trained on Align."
         )
         mode_hint.setObjectName("hint")
         mode_hint.setWordWrap(True)
@@ -445,47 +380,57 @@ class MainWindow(QMainWindow):
         self.detector_combo.addItem("Trained detector", "trained")
         self.detector_combo.currentIndexChanged.connect(self._detector_mode_changed)
         form.addWidget(self.detector_combo)
-        weights_row = QHBoxLayout()
         self.detector_status = QLabel("")
         self.detector_status.setObjectName("hint")
         self.detector_status.setWordWrap(True)
-        choose_weights = QPushButton("Choose weights…")
-        choose_weights.clicked.connect(self._choose_detector_weights)
-        weights_row.addWidget(self.detector_status, 1)
-        weights_row.addWidget(choose_weights)
-        form.addLayout(weights_row)
-        source_row = QHBoxLayout()
-        source_row.addWidget(QLabel("Weights"))
-        self.detector_source_combo = QComboBox()
-        self.detector_source_combo.addItem("Site fine-tune", "site")
-        self.detector_source_combo.addItem("VisDrone", "visdrone")
-        self.detector_source_combo.addItem("Custom file", "custom")
-        self.detector_source_combo.setCurrentIndex(
-            max(0, self.detector_source_combo.findData(self.settings.detector_source))
+        form.addWidget(self.detector_status)
+        self.infer_trips_check = QCheckBox("Infer trips from traces")
+        self.infer_trips_check.setChecked(self.settings.infer_trips_from_traces)
+        self.infer_trips_check.setToolTip(
+            "When on, a path that crosses a gate still counts if two detector boxes "
+            "did not straddle the drawn line cleanly. Off only counts a confirmed box-to-box crossing. "
+            "Trained detector starts off so parked or predicted IDs do not invent trips."
         )
-        self.detector_source_combo.currentIndexChanged.connect(self._detector_source_changed)
-        source_row.addWidget(self.detector_source_combo, 1)
-        form.addLayout(source_row)
+        self.infer_trips_check.toggled.connect(self._infer_trips_changed)
+        form.addWidget(self.infer_trips_check)
+        infer_hint = QLabel(
+            "An ID can survive a gate without showing N→ when the boxes never cleanly straddle "
+            "the tripwire (detect-every-N, a short gate, or a hold/predict across the line). "
+            "Turn this on to take the entry/exit from the trace instead."
+        )
+        infer_hint.setObjectName("hint")
+        infer_hint.setWordWrap(True)
+        form.addWidget(infer_hint)
 
-        form.addWidget(self._section("Precision"))
+        form.addWidget(self._section("Tracking mode"))
         preset_hint = QLabel(
-            "Strict drops weak boxes and short hops. Sensitive keeps queued cars and longer traces. "
-            "Moving a slider switches the preset to Custom. These apply to Trained detector."
+            "One box per car hides weak extra boxes. Through shadows keeps IDs across drop zones. "
+            "Keep queued cars is looser when cars sit in a line. "
+            "Numeric sliders are under Advanced. These apply to Trained detector."
         )
         preset_hint.setObjectName("hint")
         preset_hint.setWordWrap(True)
         form.addWidget(preset_hint)
         self.precision_combo = QComboBox()
-        self.precision_combo.addItem("Strict", "strict")
-        self.precision_combo.addItem("Balanced", "balanced")
-        self.precision_combo.addItem("Sensitive", "sensitive")
-        self.precision_combo.addItem("Custom", "custom")
+        for key in ("strict", "balanced", "sensitive", "custom"):
+            self.precision_combo.addItem(PRECISION_MODE_LABELS[key], key)
         self.precision_combo.setCurrentIndex(max(0, self.precision_combo.findData(self.settings.precision_preset)))
         self.precision_combo.currentIndexChanged.connect(self._precision_preset_changed)
         form.addWidget(self.precision_combo)
 
+        self.advanced_btn = QPushButton("Show advanced sliders")
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.setChecked(False)
+        self.advanced_btn.toggled.connect(self._toggle_advanced_sliders)
+        form.addWidget(self.advanced_btn)
+        self.advanced_panel = QWidget()
+        self.advanced_panel.setVisible(False)
+        adv = QVBoxLayout(self.advanced_panel)
+        adv.setContentsMargins(0, 8, 0, 0)
+        adv.setSpacing(8)
+
         self.detector_conf_label, self.detector_conf_slider = self._add_setting_slider(
-            form,
+            adv,
             "Detector confidence: {value:.2f}",
             int(DETECTOR_CONF_MIN * 100),
             int(DETECTOR_CONF_MAX * 100),
@@ -496,18 +441,18 @@ class MainWindow(QMainWindow):
             "Lower if small moving cars disappear.",
         )
         self.detector_iou_label, self.detector_iou_slider = self._add_setting_slider(
-            form,
+            adv,
             "Overlap (NMS IoU): {value:.2f}",
             int(DETECTOR_IOU_MIN * 100),
             int(DETECTOR_IOU_MAX * 100),
             int(round(self.settings.detector_iou * 100)),
             100.0,
             "How much two boxes can overlap before one is removed. "
-            "Raise to keep queued cars as separate boxes. "
-            "Lower if one vehicle is boxed twice.",
+            "Lower means fewer double boxes on the same car. "
+            "Raise to keep queued cars as separate boxes.",
         )
         self.parked_radius_label, self.parked_radius_slider = self._add_setting_slider(
-            form,
+            adv,
             "Parked ignore radius: {value:.0f} px",
             int(DETECTOR_PARKED_RADIUS_MIN),
             int(DETECTOR_PARKED_RADIUS_MAX),
@@ -518,7 +463,7 @@ class MainWindow(QMainWindow):
             "Lower if a car that just pulled out is ignored.",
         )
         self.link_speed_label, self.link_speed_slider = self._add_setting_slider(
-            form,
+            adv,
             "Track link speed: {value:.0f} px/s",
             int(DETECTOR_LINK_SPEED_MIN),
             int(DETECTOR_LINK_SPEED_MAX),
@@ -529,7 +474,7 @@ class MainWindow(QMainWindow):
             "Lower if two nearby cars share an ID.",
         )
         self.path_jump_label, self.path_jump_slider = self._add_setting_slider(
-            form,
+            adv,
             "Trace jump split: {value:.0f} px",
             int(DETECTOR_PATH_JUMP_MIN),
             int(DETECTOR_PATH_JUMP_MAX),
@@ -539,6 +484,7 @@ class MainWindow(QMainWindow):
             "Raise to keep one stroke through a gap. "
             "Lower to stop lot-spanning teleport lines.",
         )
+        form.addWidget(self.advanced_panel)
 
         form.addWidget(self._section("Speed"))
         speed_hint = QLabel(
@@ -596,39 +542,35 @@ class MainWindow(QMainWindow):
         preview_row.addWidget(self.preview_every_combo, 1)
         form.addLayout(preview_row)
 
-        form.addWidget(self._section("Training data"))
-        train_hint = QLabel(
-            "Boxed frames live under training/sessions. Train detector fine-tunes "
-            f"on top of VisDrone for {TRAIN_SITE_EPOCHS} epochs and writes training/weights/site.pt. "
-            "VisDrone weights stay at training/weights/visdrone.pt. Export a zip to share or back up."
-        )
-        train_hint.setObjectName("hint")
-        train_hint.setWordWrap(True)
-        form.addWidget(train_hint)
-        self.training_summary = QLabel("No training data yet.")
-        self.training_summary.setObjectName("hint")
-        self.training_summary.setWordWrap(True)
-        form.addWidget(self.training_summary)
-        self.settings_train_list = QListWidget()
-        self.settings_train_list.setMinimumHeight(140)
-        form.addWidget(self.settings_train_list)
-        train_btns = QHBoxLayout()
-        export_data = QPushButton("Export…")
-        export_data.clicked.connect(self._export_training_data)
-        import_data = QPushButton("Import…")
-        import_data.clicked.connect(self._import_training_data)
-        open_train = QPushButton("Open folder")
-        open_train.clicked.connect(self._open_training_folder)
-        train_btns.addWidget(export_data)
-        train_btns.addWidget(import_data)
-        train_btns.addWidget(open_train)
-        train_btns.addStretch(1)
-        form.addLayout(train_btns)
-
         form.addStretch(1)
         layout.addWidget(card, 1)
         scroll.setWidget(body)
-        outer.addWidget(scroll)
+
+        split = QHBoxLayout()
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(16)
+        split.addWidget(scroll, 1)
+
+        preview_card = self._card()
+        preview = QVBoxLayout(preview_card)
+        preview.addWidget(self._step_title("Frame check"))
+        self.frame_check_status = QLabel(
+            "Freeze this still and rerun the detector when confidence, overlap, or weights change. Not a full clip."
+        )
+        self.frame_check_status.setObjectName("hint")
+        self.frame_check_status.setWordWrap(True)
+        preview.addWidget(self.frame_check_status)
+        self.check_canvas = FrameCanvas()
+        self.check_canvas.set_mode("view")
+        self.check_canvas.setMinimumSize(360, 240)
+        preview.addWidget(self.check_canvas, 1)
+        split.addWidget(preview_card, 1)
+        outer.addLayout(split)
+
+        self._frame_check_timer = QTimer(self)
+        self._frame_check_timer.setSingleShot(True)
+        self._frame_check_timer.setInterval(350)
+        self._frame_check_timer.timeout.connect(self._run_frame_check)
         return page
 
     def _add_setting_slider(
@@ -739,7 +681,7 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.addWidget(self._step_title("How a count works"))
         help_text = QLabel(
-            "Draw start and end lines once on the first clip (the reference).\n\n"
+            "Draw North, then up to four gates (N, S, E, W) on the first clip (the reference).\n\n"
             "Later clips from the same camera often shift (pan, zoom, remount). "
             "On the Align step, drag the overlay to match poles and curbs, then confirm. "
             "Unconfirmed clips are not processed.\n\n"
@@ -763,10 +705,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(self._step_title("2. Draw on the reference frame"))
         self.route_hint = QLabel(
-            "Set North, then add the entry and exit lines that exist. "
-            "Outline the roadway so boats and parking lots are ignored. "
-            "Box a typical vehicle for size. Optionally box dark patches where cars briefly disappear, "
-            "then set how far ahead to look when a car is lost there."
+            "Set North, then click Gate and drag one line per approach (N, S, E, W)."
         )
         self.route_hint.setObjectName("hint")
         self.route_hint.setWordWrap(True)
@@ -783,67 +722,94 @@ class MainWindow(QMainWindow):
         scroll.setWidget(host)
         left_layout.addWidget(scroll, 1)
 
-        actions = QGridLayout()
-        actions.setContentsMargins(0, 8, 0, 0)
-        actions.setHorizontalSpacing(8)
-        actions.setVerticalSpacing(8)
-        set_north = self._wide_button("Set North", primary=True)
+        left_layout.addWidget(self._section_label("DRAW"))
+        draw = QGridLayout()
+        draw.setContentsMargins(0, 0, 0, 0)
+        draw.setHorizontalSpacing(8)
+        draw.setVerticalSpacing(8)
+        set_north = self._wide_button("North", tooltip="Drag from the intersection toward geographic North.")
         set_north.clicked.connect(self._start_set_north)
-        add_entry = self._wide_button("Add entry")
-        add_entry.clicked.connect(lambda: self._start_draw_lines("start"))
-        add_exit = self._wide_button("Add exit")
-        add_exit.clicked.connect(lambda: self._start_draw_lines("end"))
-        add_mask = self._wide_button(
-            "Add vehicle",
-            tooltip="Drag a box around one typical vehicle. Add several sizes if needed.",
+        add_gate = self._wide_button(
+            "Gate",
+            tooltip="Drag one line per approach. Named N, S, E, or W from North. First hit is entry, next is exit.",
         )
-        add_mask.clicked.connect(self._start_mask_vehicle)
-        add_shadow = self._wide_button(
-            "Add drop zone",
-            tooltip="Drag a box over a dark patch, joint, or pole shadow that hides cars.",
-        )
-        add_shadow.clicked.connect(self._start_mask_occlusion)
-        add_reach = self._wide_button(
-            "Set prediction reach",
-            tooltip="Drag a short line on the photo: how far a car should travel through a drop zone.",
-        )
-        add_reach.clicked.connect(self._start_set_reach)
+        add_gate.clicked.connect(self._start_draw_gate)
         add_road = self._wide_button(
-            "Add roadway",
-            tooltip="Click around the intersection and approaches. Exclude marina, parking, buildings, and sidewalks.",
+            "Roadway",
+            tooltip="Outline pavement only. Boats, parking, and sidewalks stay outside.",
         )
         add_road.clicked.connect(self._start_roadway)
+        draw.addWidget(set_north, 0, 0)
+        draw.addWidget(add_gate, 0, 1)
+        draw.addWidget(add_road, 1, 0, 1, 2)
+        left_layout.addLayout(draw)
+
         self.finish_road_btn = self._wide_button("Finish roadway", primary=True)
         self.finish_road_btn.clicked.connect(self._finish_roadway)
         self.finish_road_btn.setVisible(False)
         self.cancel_road_btn = self._wide_button("Cancel roadway")
         self.cancel_road_btn.clicked.connect(self._cancel_roadway)
         self.cancel_road_btn.setVisible(False)
-        save_geom = self._wide_button("Save")
+        road_actions = QHBoxLayout()
+        road_actions.setContentsMargins(0, 8, 0, 0)
+        road_actions.addWidget(self.cancel_road_btn)
+        road_actions.addWidget(self.finish_road_btn)
+        left_layout.addLayout(road_actions)
+
+        self.more_tools_btn = QPushButton("Vehicle size and drop zones")
+        self.more_tools_btn.setCheckable(True)
+        self.more_tools_btn.setChecked(False)
+        self.more_tools_btn.toggled.connect(self._toggle_more_route_tools)
+        left_layout.addWidget(self.more_tools_btn)
+        self.more_tools = QWidget()
+        self.more_tools.setVisible(False)
+        more = QGridLayout(self.more_tools)
+        more.setContentsMargins(0, 8, 0, 0)
+        more.setHorizontalSpacing(8)
+        more.setVerticalSpacing(8)
+        add_mask = self._wide_button(
+            "Vehicle size",
+            tooltip="Box one typical car so processing knows the size band.",
+        )
+        add_mask.clicked.connect(self._start_mask_vehicle)
+        add_shadow = self._wide_button(
+            "Drop zone",
+            tooltip="Box only the shadow or joint that hides cars, not the whole approach.",
+        )
+        add_shadow.clicked.connect(self._start_mask_occlusion)
+        add_reach = self._wide_button(
+            "Reach on photo",
+            tooltip="Drag about one car-length through a drop zone. Or use the slider above.",
+        )
+        add_reach.clicked.connect(self._start_set_reach)
+        more.addWidget(add_mask, 0, 0)
+        more.addWidget(add_shadow, 0, 1)
+        more.addWidget(add_reach, 1, 0, 1, 2)
+        left_layout.addWidget(self.more_tools)
+
+        files = QHBoxLayout()
+        files.setContentsMargins(0, 4, 0, 0)
+        save_geom = self._wide_button("Save", quiet=True, tooltip="Save this drawing to a file.")
         save_geom.clicked.connect(self._save_geometry)
-        load_geom = self._wide_button("Load")
+        load_geom = self._wide_button("Load", quiet=True, tooltip="Load a saved drawing.")
         load_geom.clicked.connect(self._load_geometry)
-        clear_geom = self._wide_button("Clear all", danger=True)
+        clear_geom = self._wide_button("Clear all", quiet=True, tooltip="Remove North, lines, roadway, and drop zones.")
         clear_geom.clicked.connect(self._clear_geometry_lines)
+        files.addWidget(save_geom)
+        files.addWidget(load_geom)
+        files.addStretch(1)
+        files.addWidget(clear_geom)
+        left_layout.addLayout(files)
+
+        nav = QHBoxLayout()
+        nav.setContentsMargins(0, 8, 0, 0)
         back = self._wide_button("Back")
         back.clicked.connect(lambda: self.stack.setCurrentIndex(PAGE_SETUP))
         nxt = self._wide_button("Next: align clips", primary=True)
         nxt.clicked.connect(self._go_align)
-        actions.addWidget(set_north, 0, 0, 1, 2)
-        actions.addWidget(add_entry, 1, 0)
-        actions.addWidget(add_exit, 1, 1)
-        actions.addWidget(add_mask, 2, 0)
-        actions.addWidget(add_shadow, 2, 1)
-        actions.addWidget(add_reach, 3, 0, 1, 2)
-        actions.addWidget(add_road, 4, 0)
-        actions.addWidget(self.finish_road_btn, 4, 1)
-        actions.addWidget(self.cancel_road_btn, 5, 0, 1, 2)
-        actions.addWidget(save_geom, 6, 0)
-        actions.addWidget(load_geom, 6, 1)
-        actions.addWidget(clear_geom, 7, 0, 1, 2)
-        actions.addWidget(back, 8, 0)
-        actions.addWidget(nxt, 8, 1)
-        left_layout.addLayout(actions)
+        nav.addWidget(back)
+        nav.addWidget(nxt)
+        left_layout.addLayout(nav)
 
         right = self._card()
         right_layout = QVBoxLayout(right)
@@ -910,7 +876,7 @@ class MainWindow(QMainWindow):
         extra.addWidget(redraw)
         left_layout.addLayout(extra)
 
-        self.finish_gates_btn = QPushButton("Finish start lines")
+        self.finish_gates_btn = QPushButton("Finish gates")
         self.finish_gates_btn.clicked.connect(self._finish_redraw_phase)
         self.finish_gates_btn.setVisible(False)
         left_layout.addWidget(self.finish_gates_btn)
@@ -929,6 +895,14 @@ class MainWindow(QMainWindow):
         self.process_detector_status.setObjectName("hint")
         self.process_detector_status.setWordWrap(True)
         left_layout.addWidget(self.process_detector_status)
+        self.process_infer_trips_check = QCheckBox("Infer trips from traces")
+        self.process_infer_trips_check.setChecked(self.settings.infer_trips_from_traces)
+        self.process_infer_trips_check.setToolTip(
+            "When on, a path that crosses a gate still counts if two detector boxes "
+            "did not straddle the drawn line. Off only counts a confirmed box-to-box crossing."
+        )
+        self.process_infer_trips_check.toggled.connect(self._infer_trips_changed)
+        left_layout.addWidget(self.process_infer_trips_check)
 
         nav = QHBoxLayout()
         back = QPushButton("Back")
@@ -1047,6 +1021,31 @@ class MainWindow(QMainWindow):
         self.report_tabs.addTab(self.overview_table, "Overview")
         self.report_tabs.addTab(gates_page, "Gate Statistics")
         self.report_tabs.addTab(self.tmc_table, "TMC Summary")
+        review_page = QWidget()
+        review_layout = QHBoxLayout(review_page)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        review_col = QVBoxLayout()
+        review_hint = QLabel(
+            "Dots mark every drop, jump, and stacked box. Click a row to seek that still and highlight the event."
+        )
+        review_hint.setObjectName("hint")
+        review_hint.setWordWrap(True)
+        review_col.addWidget(review_hint)
+        self.issue_list = QListWidget()
+        self.issue_list.itemClicked.connect(self._seek_review_issue)
+        review_col.addWidget(self.issue_list, 1)
+        review_layout.addLayout(review_col, 1)
+        review_still = QVBoxLayout()
+        self.review_status = QLabel("All issues on this clip.")
+        self.review_status.setObjectName("hint")
+        self.review_status.setWordWrap(True)
+        review_still.addWidget(self.review_status)
+        self.review_canvas = FrameCanvas()
+        self.review_canvas.set_mode("view")
+        self.review_canvas.setMinimumSize(360, 220)
+        review_still.addWidget(self.review_canvas, 1)
+        review_layout.addLayout(review_still, 2)
+        self.report_tabs.addTab(review_page, "Review")
         layout.addWidget(self.report_tabs, 1)
         nav = QHBoxLayout()
         again = QPushButton("New batch")
@@ -1159,7 +1158,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_geometry(self.geometry)
             self._refresh_route_list()
             self.route_hint.setText(
-                f"Frame {index} from {self.videos[0].name}. Set North, then add entry and exit lines across the lanes."
+                f"Frame {index} from {self.videos[0].name}. Set North, then drag a gate on each approach (N, S, E, W)."
             )
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, str(exc))
@@ -1188,6 +1187,9 @@ class MainWindow(QMainWindow):
         name_options: tuple[str, ...] | None = None,
         current_name: str | None = None,
         on_name=None,
+        flow_options: tuple[str, ...] | None = None,
+        current_flow: str | None = None,
+        on_flow=None,
         on_redraw=None,
         on_delete=None,
         redraw_label: str = "Redraw",
@@ -1208,6 +1210,16 @@ class MainWindow(QMainWindow):
                 combo.setCurrentText(current_name)
             combo.activated.connect(lambda _idx, box=combo: on_name(box.currentData()))
             layout.addWidget(combo)
+        if flow_options and on_flow:
+            flow = QComboBox()
+            for value in flow_options:
+                flow.addItem(GATE_FLOW_LABELS.get(value, value), value)
+            if current_flow:
+                index = flow.findData(current_flow)
+                if index >= 0:
+                    flow.setCurrentIndex(index)
+            flow.activated.connect(lambda _idx, box=flow: on_flow(box.currentData()))
+            layout.addWidget(flow)
         if on_redraw:
             redraw = QPushButton(redraw_label)
             redraw.setObjectName("rowAction")
@@ -1237,45 +1249,42 @@ class MainWindow(QMainWindow):
                 self._item_row("North not set yet", on_redraw=self._start_set_north, redraw_label="Set")
             )
 
-        self.route_items.addWidget(self._section_label("ENTRIES  (vehicles enter here)"))
-        if not self.geometry.starts:
-            empty = QLabel("No entry lines. Click Add entry, then drag across the inbound lanes.")
+        missing = [name for name in ORIGINS if name not in {gate_origin_name(item.name) for item in self.geometry.all_gates()}]
+        gate_heading = "GATES  (N, S, E, W — first hit is entry, next is exit)"
+        self.route_items.addWidget(self._section_label(gate_heading))
+        if not self.geometry.all_gates():
+            empty = QLabel("None yet. Click Gate, then drag a line across each approach. Up to four: N, S, E, W.")
             empty.setObjectName("hint")
             empty.setWordWrap(True)
             self.route_items.addWidget(empty)
-        for item in self.geometry.starts:
+        else:
+            hint = QLabel("Two-way, one-way in, or one-way out. The export hides unused entry/exit columns.")
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            self.route_items.addWidget(hint)
+        for item in self.geometry.all_gates():
             self.route_items.addWidget(
                 self._item_row(
-                    "Entry",
+                    "Gate",
                     name_options=ORIGINS,
-                    current_name=item.name,
+                    current_name=gate_origin_name(item.name),
                     on_name=lambda name, gate=item: self._rename_gate_item(gate, name),
+                    flow_options=GATE_FLOWS,
+                    current_flow=item.flow,
+                    on_flow=lambda flow, gate=item: self._set_gate_flow(gate, flow),
                     on_redraw=lambda gate=item: self._redraw_gate_item(gate),
                     on_delete=lambda gate=item: self._delete_gate_item(gate),
                 )
             )
-
-        self.route_items.addWidget(self._section_label("EXITS  (vehicles leave here)"))
-        if not self.geometry.ends:
-            empty = QLabel("No exit lines. Click Add exit, then drag across the outbound lanes.")
-            empty.setObjectName("hint")
-            empty.setWordWrap(True)
-            self.route_items.addWidget(empty)
-        for item in self.geometry.ends:
-            self.route_items.addWidget(
-                self._item_row(
-                    "Exit",
-                    name_options=BOUNDS,
-                    current_name=item.name,
-                    on_name=lambda name, gate=item: self._rename_gate_item(gate, name),
-                    on_redraw=lambda gate=item: self._redraw_gate_item(gate),
-                    on_delete=lambda gate=item: self._delete_gate_item(gate),
-                )
-            )
+        if missing and self.geometry.all_gates():
+            left = QLabel(f"Still open: {', '.join(missing)}. Draw those sides if they exist.")
+            left.setObjectName("hint")
+            left.setWordWrap(True)
+            self.route_items.addWidget(left)
 
         self.route_items.addWidget(self._section_label("VEHICLE SIZE"))
         if not self.geometry.vehicle_refs:
-            empty = QLabel("No size masks. Click Add vehicle and box a typical car or truck.")
+            empty = QLabel("Optional. Open Vehicle size and drop zones, then box one car.")
             empty.setObjectName("hint")
             empty.setWordWrap(True)
             self.route_items.addWidget(empty)
@@ -1287,21 +1296,16 @@ class MainWindow(QMainWindow):
                     on_delete=lambda mask=box: self._delete_vehicle_item(mask),
                 )
             )
-        limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
+        limits = self.geometry.vehicle_area_limits()
         if limits:
-            extra = "masks plus Training boxes" if prior_areas() else "these masks"
-            band = QLabel(f"Keeping blobs {limits[0]}–{limits[1]} px² from {extra}.")
+            band = QLabel(f"Keeping blobs {limits[0]}–{limits[1]} px² from these masks.")
             band.setObjectName("hint")
             band.setWordWrap(True)
             self.route_items.addWidget(band)
 
         self.route_items.addWidget(self._section_label("ROADWAY"))
         if not self.geometry.roadways:
-            empty = QLabel(
-                "Optional. Click Add roadway and outline the intersection plus approaches. "
-                "Leave the marina, parking lots, buildings, and sidewalks outside. "
-                "With none drawn, the full frame is used."
-            )
+            empty = QLabel("Optional. Use Roadway to leave boats and parking outside. Otherwise the full frame is used.")
             empty.setObjectName("hint")
             empty.setWordWrap(True)
             self.route_items.addWidget(empty)
@@ -1321,46 +1325,42 @@ class MainWindow(QMainWindow):
 
         self.route_items.addWidget(self._section_label("DROP ZONES"))
         if not self.geometry.occlusions:
-            empty = QLabel("Optional. Click Add drop zone and box a dark patch or joint that hides cars.")
+            empty = QLabel("Optional. Open Vehicle size and drop zones to box a shadow that hides cars.")
             empty.setObjectName("hint")
             empty.setWordWrap(True)
             self.route_items.addWidget(empty)
         for index, box in enumerate(self.geometry.occlusions, start=1):
+            label = f"Drop zone {index}  {int(box.width())}×{int(box.height())}"
+            if drop_zone_too_wide(box, self.geometry):
+                label += "  — too wide (many car-lengths); auto-attach will stretch"
             self.route_items.addWidget(
                 self._item_row(
-                    f"Drop zone {index}  {int(box.width())}×{int(box.height())}",
+                    label,
                     on_redraw=lambda mask=box: self._redraw_occlusion_item(mask),
                     on_delete=lambda mask=box: self._delete_occlusion_item(mask),
                 )
             )
-        reach_px = int(round(self.geometry.prediction_reach_px))
-        reach_label = QLabel(f"Prediction reach: {reach_px} px")
-        reach_label.setObjectName("hint")
-        self.route_items.addWidget(reach_label)
-        reach_slider = QSlider(Qt.Orientation.Horizontal)
-        reach_slider.setRange(int(PREDICTION_REACH_MIN), int(PREDICTION_REACH_MAX))
-        reach_slider.setValue(reach_px)
-        reach_slider.setToolTip(
-            "How far ahead to freeze a pickup when a car is lost in a drop zone. "
-            "Drag Set prediction reach on the photo to match this footage."
-        )
+        if self.geometry.occlusions:
+            reach_px = int(round(self.geometry.prediction_reach_px))
+            reach_label = QLabel(f"Prediction reach: {reach_px} px")
+            reach_label.setObjectName("hint")
+            self.route_items.addWidget(reach_label)
+            reach_slider = QSlider(Qt.Orientation.Horizontal)
+            reach_slider.setRange(int(PREDICTION_REACH_MIN), int(PREDICTION_REACH_MAX))
+            reach_slider.setValue(reach_px)
+            reach_slider.setToolTip("About one car-length. Lost IDs look this far ahead inside a drop zone.")
 
-        def _on_reach_slider(value: int, label=reach_label) -> None:
-            self.geometry.set_prediction_reach(float(value))
-            label.setText(f"Prediction reach: {int(round(self.geometry.prediction_reach_px))} px")
-            self.canvas.set_geometry(self.geometry)
-            self.project.geometry = self.geometry
+            def _on_reach_slider(value: int, label=reach_label) -> None:
+                self.geometry.set_prediction_reach(float(value))
+                label.setText(f"Prediction reach: {int(round(self.geometry.prediction_reach_px))} px")
+                self.canvas.set_geometry(self.geometry)
+                self.project.geometry = self.geometry
 
-        reach_slider.valueChanged.connect(_on_reach_slider)
-        self.route_items.addWidget(reach_slider)
-        reach_hint = QLabel(
-            "Drag Set prediction reach on the photo (about one car-length through a shadow), or nudge this slider."
-        )
-        reach_hint.setObjectName("hint")
-        reach_hint.setWordWrap(True)
-        self.route_items.addWidget(reach_hint)
+            reach_slider.valueChanged.connect(_on_reach_slider)
+            self.route_items.addWidget(reach_slider)
         if self.geometry.is_ready():
-            ready = QLabel("Movements: " + ", ".join(self.geometry.movement_names()))
+            count = len(self.geometry.movement_names())
+            ready = QLabel(f"{count} movement{'s' if count != 1 else ''} ready.")
             ready.setObjectName("hint")
             ready.setWordWrap(True)
             self.route_items.addWidget(ready)
@@ -1368,14 +1368,18 @@ class MainWindow(QMainWindow):
         self.canvas.set_geometry(self.geometry)
         self.project.geometry = self.geometry
 
+    def _set_active_tool(self, name: str, hint: str) -> None:
+        self.route_hint.setText(f"Active tool: {name}. {hint}")
+
     def _start_set_north(self, *_args) -> None:
         self._draw_step = "north"
         self._redraw_index = None
         self._redraw_target = None
         self.canvas.set_drawing_enabled(True)
-        self.route_hint.setText(
+        self._set_active_tool(
+            "North",
             "On the photo: click the middle of the intersection, drag toward geographic North, release. "
-            "If North is at the bottom of the photo, drag downward."
+            "If North is at the bottom of the photo, drag downward.",
         )
 
     def _start_set_reach(self, *_args) -> None:
@@ -1385,28 +1389,34 @@ class MainWindow(QMainWindow):
         self._redraw_index = None
         self._redraw_target = None
         self.canvas.set_drawing_enabled(True)
-        self.route_hint.setText(
+        self._set_active_tool(
+            "Reach",
             "On the photo: drag a short line the distance a car should travel through a drop zone, then release. "
-            "Use a typical gap on this footage, not a global pixel guess."
+            "Use a typical gap on this footage, not a global pixel guess.",
         )
 
-    def _start_draw_lines(self, kind: str, *, replace=None) -> None:
+    def _start_draw_gate(self, *_args, replace=None) -> None:
         if self.geometry.north is None:
-            QMessageBox.information(self, APP_NAME, "Set North first so entry and exit lines can be named.")
+            QMessageBox.information(self, APP_NAME, "Set North first so gates can be named N, S, E, or W.")
             return
-        existing = self.geometry.starts if kind == "start" else self.geometry.ends
-        if replace is None and len(existing) >= MAX_GATES:
-            QMessageBox.information(self, APP_NAME, f"At most {MAX_GATES} {kind} lines. Delete one to add another.")
+        if replace is None and self.geometry.gate_count() >= MAX_GATES:
+            QMessageBox.information(self, APP_NAME, f"At most {MAX_GATES} gates (N, S, E, W). Delete one to add another.")
             return
         live = self._live_gate(replace) if replace is not None else None
-        if replace is not None and (live is None or live[0] != kind):
+        if replace is not None and live is None:
             return
-        self._draw_step = kind
+        self._draw_step = "gate"
         self._redraw_target = live[1] if live is not None else None
         self._redraw_index = None
         self._draw_gate_name = live[1].name if live is not None else None
-        label = "entry" if kind == "start" else "exit"
-        self.route_hint.setText(f"On the photo: drag a line across the {label} lanes, then release.")
+        remaining = [name for name in ORIGINS if name not in {gate_origin_name(item.name) for item in self.geometry.all_gates()}]
+        if live is not None:
+            hint = f"On the photo: drag a new line for {gate_origin_name(live[1].name)}, then release."
+        elif remaining:
+            hint = f"On the photo: drag a line across an approach, then release. Still open: {', '.join(remaining)}."
+        else:
+            hint = "On the photo: drag a line across an approach, then release."
+        self._set_active_tool("Gate", hint)
         self.canvas.set_drawing_enabled(True)
 
     def _start_mask_vehicle(self, *_args, replace=None) -> None:
@@ -1420,11 +1430,17 @@ class MainWindow(QMainWindow):
         self._redraw_target = live
         self._redraw_index = None
         self.canvas.set_drawing_enabled(True, box=True)
-        self.route_hint.setText("On the photo: drag a box around one typical vehicle, then release.")
+        self._set_active_tool("Vehicle", "On the photo: drag a box around one typical vehicle, then release.")
 
     def _set_roadway_actions(self, drawing: bool) -> None:
         self.finish_road_btn.setVisible(drawing)
         self.cancel_road_btn.setVisible(drawing)
+
+    def _toggle_more_route_tools(self, checked: bool) -> None:
+        self.more_tools.setVisible(bool(checked))
+        self.more_tools_btn.setText(
+            "Hide vehicle size and drop zones" if checked else "Vehicle size and drop zones"
+        )
 
     def _start_roadway(self, *_args, replace=None) -> None:
         if replace is None and len(self.geometry.roadways) >= MAX_ROADWAYS:
@@ -1437,11 +1453,12 @@ class MainWindow(QMainWindow):
         self._redraw_target = None
         self.canvas.begin_polygon()
         self._set_roadway_actions(True)
-        self.route_hint.setText(
+        self._set_active_tool(
+            "Roadway",
             "Click around the intersection and its approaches. Include pavement on both sides of each gate. "
             "Exclude the marina, parking lots, buildings, and sidewalks. "
             "Finish roadway, double-click, or click the first point to close. Cancel roadway discards this shape. "
-            "If you draw none, the full frame is used."
+            "If you draw none, the full frame is used.",
         )
 
     def _finish_roadway(self, *_args) -> None:
@@ -1511,9 +1528,10 @@ class MainWindow(QMainWindow):
         self._redraw_target = live
         self._redraw_index = None
         self.canvas.set_drawing_enabled(True, box=True)
-        self.route_hint.setText(
+        self._set_active_tool(
+            "Drop zone",
             "On the photo: drag a box over the dark patch, joint, or pole shadow. "
-            "Cover the full strip that hides cars, not the whole street."
+            "Cover the full strip that hides cars, not the whole street.",
         )
 
     def _live_gate(self, item) -> tuple[str, NamedLine] | None:
@@ -1547,7 +1565,7 @@ class MainWindow(QMainWindow):
         live = self._live_gate(item)
         if live is None:
             return
-        self._start_draw_lines(live[0], replace=live[1])
+        self._start_draw_gate(replace=live[1])
 
     def _redraw_vehicle_item(self, box: Box) -> None:
         live = self._live_vehicle(box)
@@ -1604,22 +1622,38 @@ class MainWindow(QMainWindow):
         live = self._live_gate(item)
         if live is None:
             return
-        _kind, item = live
-        pool = self.geometry.starts if _kind == "start" else self.geometry.ends
-        taken = {other.name for other in pool if other is not item}
+        kind, item = live
+        taken = {
+            gate_origin_name(other.name)
+            for other in self.geometry.all_gates()
+            if other is not item
+        }
+        if name not in ORIGINS:
+            return
         if name in taken:
-            QMessageBox.information(self, APP_NAME, f"{name} is already used on another line.")
+            QMessageBox.information(self, APP_NAME, f"{name} is already used on another gate.")
             self._refresh_route_list()
             return
-        if item.name == name:
+        stored = name if kind == "start" else ORIGIN_TO_BOUND.get(name, name)
+        if item.name == stored:
             return
-        item.name = name
+        item.name = stored
+        self._refresh_route_list()
+
+    def _set_gate_flow(self, item, flow: str | None) -> None:
+        live = self._live_gate(item)
+        if live is None or not flow:
+            return
+        _kind, gate = live
+        if flow not in GATE_FLOWS or gate.flow == flow:
+            return
+        gate.flow = flow
         self._refresh_route_list()
 
     def _clear_north(self, *_args) -> None:
         self.geometry.north = None
         self._refresh_route_list()
-        self.route_hint.setText("North cleared. Set it again before adding entry or exit lines.")
+        self.route_hint.setText("North cleared. Set it again before adding gates.")
 
     def _on_setup_box_drawn(self, box: Box) -> None:
         if self._draw_step == "occlusion":
@@ -1652,7 +1686,16 @@ class MainWindow(QMainWindow):
         self.canvas.set_drawing_enabled(False)
         self.canvas.clear_draft()
         self._refresh_route_list()
-        self.route_hint.setText("Saved drop zone. A car that is lost there keeps its ID and trace through the gap.")
+        saved = "Saved drop zone. A car that is lost there keeps its ID and trace through the gap."
+        if drop_zone_too_wide(box, self.geometry):
+            wide = (
+                "This drop zone is many car-lengths wide; that stretches auto-attach. "
+                "Box only the dark strip that hides cars."
+            )
+            QMessageBox.warning(self, APP_NAME, wide)
+            self.route_hint.setText(f"{saved} {wide}")
+        else:
+            self.route_hint.setText(saved)
 
     def _on_vehicle_mask_drawn(self, box: Box) -> None:
         if self._draw_step != "vehicle":
@@ -1679,7 +1722,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_drawing_enabled(False)
         self.canvas.clear_draft()
         self._refresh_route_list()
-        limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
+        limits = self.geometry.vehicle_area_limits()
         band = f" Keeping blobs {limits[0]}–{limits[1]} px²." if limits else ""
         self.route_hint.setText(f"Saved vehicle {int(box.width())}×{int(box.height())}.{band}")
 
@@ -1687,7 +1730,7 @@ class MainWindow(QMainWindow):
         go = QMessageBox.question(
             self,
             APP_NAME,
-            "Clear North, all entry/exit lines, the roadway, vehicle masks, drop zones, and prediction reach?",
+            "Clear North, all gates, the roadway, vehicle masks, drop zones, and prediction reach?",
         )
         if go != QMessageBox.StandardButton.Yes:
             return
@@ -1705,7 +1748,7 @@ class MainWindow(QMainWindow):
         self._redraw_target = None
         self.canvas.set_drawing_enabled(False)
         self._refresh_route_list()
-        self.route_hint.setText("Cleared. Set North, then add the entry and exit lines that exist.")
+        self.route_hint.setText("Cleared. Set North, then draw a gate on each approach (N, S, E, W).")
 
     def _on_line_drawn(self, line: Line) -> None:
         if self._draw_step == "reach":
@@ -1738,36 +1781,51 @@ class MainWindow(QMainWindow):
             self.canvas.set_drawing_enabled(False)
             self.canvas.clear_draft()
             self._refresh_route_list()
-            self.route_hint.setText("North set. Add entry and exit lines across the lanes.")
+            self.route_hint.setText("North set. Click Gate and drag a line across each approach (N, S, E, W).")
             return
-        if self._draw_step in ("start", "end"):
-            pool = self.geometry.starts if self._draw_step == "start" else self.geometry.ends
+        if self._draw_step == "gate":
+            pool = self.geometry.all_gates()
             if self._redraw_target is not None and any(item is self._redraw_target for item in pool):
                 self._redraw_target.line = line
-                added_name = self._redraw_target.name
-            else:
-                added = self.geometry.add_gate(self._draw_step, line, self._draw_gate_name)
-                if added is None:
-                    QMessageBox.information(self, APP_NAME, "Could not add that gate. It may already exist or the set is full.")
-                    self.canvas.clear_draft()
-                    self.canvas.set_drawing_enabled(False)
-                    self._draw_step = "idle"
-                    self._redraw_index = None
-                    self._redraw_target = None
-                    return
-                added_name = added.name
+                added_name = gate_origin_name(self._redraw_target.name)
+                self.canvas.clear_draft()
+                self.canvas.set_drawing_enabled(False)
+                self._draw_step = "idle"
+                self._redraw_index = None
+                self._redraw_target = None
+                self._refresh_route_list()
+                self.route_hint.setText(f"Updated {added_name} gate.")
+                return
+            added = self.geometry.add_gate("start", line)
+            if added is None:
+                QMessageBox.information(
+                    self,
+                    APP_NAME,
+                    "Could not add that gate. That side may already be drawn, or all four (N, S, E, W) are set.",
+                )
+                self.canvas.clear_draft()
+                return
+            added_name = gate_origin_name(added.name)
             self.canvas.clear_draft()
-            self.canvas.set_drawing_enabled(False)
-            self._draw_step = "idle"
             self._redraw_index = None
             self._redraw_target = None
+            self._draw_gate_name = None
             self._refresh_route_list()
-            kind = "entry" if added_name in ORIGINS else "exit"
-            self.route_hint.setText(f"Saved {added_name} {kind} line. Change the name on that row if needed.")
+            remaining = [name for name in ORIGINS if name not in {gate_origin_name(item.name) for item in self.geometry.all_gates()}]
+            if not remaining or self.geometry.gate_count() >= MAX_GATES:
+                self.canvas.set_drawing_enabled(False)
+                self._draw_step = "idle"
+                self.route_hint.setText(f"Saved {added_name}. All four gates are set.")
+            else:
+                self.canvas.set_drawing_enabled(True)
+                self.route_hint.setText(
+                    f"Saved {added_name}. {self.geometry.gate_count()} of {MAX_GATES}. "
+                    f"Drag the next approach ({', '.join(remaining)})."
+                )
 
     def _save_geometry(self) -> None:
         if not self.geometry.is_ready():
-            QMessageBox.information(self, APP_NAME, "Set North and draw at least one start line and one end line.")
+            QMessageBox.information(self, APP_NAME, "Set North and draw at least two gates (N, S, E, or W).")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Save geometry", "geometry.json", "JSON (*.json)")
         if path:
@@ -1817,7 +1875,7 @@ class MainWindow(QMainWindow):
 
     def _go_align(self) -> None:
         if not self.geometry.is_ready():
-            QMessageBox.information(self, APP_NAME, "Set North and draw at least one start line and one end line.")
+            QMessageBox.information(self, APP_NAME, "Set North and draw at least two gates (N, S, E, or W).")
             return
         self.project.geometry = self.geometry
         self.project.ensure_clips(self.videos)
@@ -1865,7 +1923,7 @@ class MainWindow(QMainWindow):
         self.ref_canvas.set_match_points([])
         if clip.status == "reference":
             self.align_canvas.set_mode("view")
-            self.align_hint.setText("This is the reference clip. Entry and exit lines were drawn here. Other clips need alignment.")
+            self.align_hint.setText("This is the reference clip. Gates were drawn here. Other clips need alignment.")
         else:
             self.align_canvas.set_mode("nudge")
             self.align_hint.setText(
@@ -1947,7 +2005,7 @@ class MainWindow(QMainWindow):
             self._next_unaligned()
             return
         if self._redrawing:
-            QMessageBox.information(self, APP_NAME, "Finish redrawing the entry and exit lines on this clip first.")
+            QMessageBox.information(self, APP_NAME, "Finish redrawing the gates on this clip first.")
             return
         clip.status = "aligned"
         self._refresh_align_list()
@@ -2056,40 +2114,29 @@ class MainWindow(QMainWindow):
         clip.geometry_override = Geometry(width, height, north=fitted.north)
         clip.status = "needs_align"
         self._redrawing = True
-        self._draw_step = "start"
-        self.finish_gates_btn.setText("Finish start lines")
+        self._draw_step = "gate"
+        self.finish_gates_btn.setText("Finish gates")
         self.finish_gates_btn.setVisible(True)
         self.align_canvas.set_geometry(clip.geometry_override)
         self.align_canvas.set_mode("draw")
-        self.align_hint.setText("Redraw entry lines on this clip. Add only the sides that exist, then Finish start lines.")
+        self.align_hint.setText("Redraw gates on this clip (N, S, E, W). Draw the sides that exist, then Finish gates.")
 
     def _finish_redraw_phase(self) -> None:
         clip = self._current_clip()
         if not self._redrawing or clip is None or clip.geometry_override is None:
             return
-        if self._draw_step == "start":
-            if not clip.geometry_override.starts:
-                QMessageBox.information(self, APP_NAME, "Draw at least one start line.")
-                return
-            clip.geometry_override.assign_names()
-            self._draw_step = "end"
-            self.finish_gates_btn.setText("Finish end lines")
-            self.align_canvas.set_geometry(clip.geometry_override)
-            self.align_hint.setText("Now redraw exit lines. Add only the sides that exist, then Finish end lines.")
+        if clip.geometry_override.gate_count() < 2:
+            QMessageBox.information(self, APP_NAME, "Draw at least two gates.")
             return
-        if self._draw_step == "end":
-            if not clip.geometry_override.ends:
-                QMessageBox.information(self, APP_NAME, "Draw at least one end line.")
-                return
-            clip.geometry_override.assign_names()
-            clip.status = "redrawn"
-            self._redrawing = False
-            self._draw_step = "idle"
-            self.finish_gates_btn.setVisible(False)
-            self.align_canvas.set_geometry(clip.geometry_override)
-            self.align_canvas.set_mode("view")
-            self.align_hint.setText("Custom entry and exit lines saved for this clip.")
-            self._refresh_align_list()
+        clip.geometry_override.assign_names()
+        clip.status = "redrawn"
+        self._redrawing = False
+        self._draw_step = "idle"
+        self.finish_gates_btn.setVisible(False)
+        self.align_canvas.set_geometry(clip.geometry_override)
+        self.align_canvas.set_mode("view")
+        self.align_hint.setText("Custom gates saved for this clip.")
+        self._refresh_align_list()
 
     def _on_redraw_line(self, line: Line) -> None:
         if not self._redrawing:
@@ -2097,21 +2144,20 @@ class MainWindow(QMainWindow):
         clip = self._current_clip()
         if clip is None or clip.geometry_override is None:
             return
-        if self._draw_step == "start":
-            added = clip.geometry_override.add_gate("start", line)
-            if added is None:
-                self.align_hint.setText("Could not add that start line. Finish start lines or delete one.")
-                return
-            self.align_canvas.set_geometry(clip.geometry_override)
-            self.align_hint.setText(f"Saved {added.name} start. Draw another, or Finish start lines.")
+        added = clip.geometry_override.add_gate("start", line)
+        if added is None:
+            self.align_hint.setText("Could not add that gate. Finish gates, or that side is already drawn.")
             return
-        if self._draw_step == "end":
-            added = clip.geometry_override.add_gate("end", line)
-            if added is None:
-                self.align_hint.setText("Could not add that end line. Finish end lines or delete one.")
-                return
-            self.align_canvas.set_geometry(clip.geometry_override)
-            self.align_hint.setText(f"Saved {added.name} end. Draw another, or Finish end lines.")
+        self.align_canvas.set_geometry(clip.geometry_override)
+        remaining = [
+            name
+            for name in ORIGINS
+            if name not in {gate_origin_name(item.name) for item in clip.geometry_override.all_gates()}
+        ]
+        if remaining:
+            self.align_hint.setText(f"Saved {added.name}. Draw {', '.join(remaining)}, or Finish gates.")
+        else:
+            self.align_hint.setText(f"Saved {added.name}. All four gates are set. Finish gates.")
 
     def _save_project(self) -> None:
         self.project.geometry = self.geometry
@@ -2143,7 +2189,7 @@ class MainWindow(QMainWindow):
 
     def _go_process(self) -> None:
         if not self.geometry.is_ready():
-            QMessageBox.information(self, APP_NAME, "Set North and draw at least one start line and one end line.")
+            QMessageBox.information(self, APP_NAME, "Set North and draw at least two gates (N, S, E, or W).")
             return
         self.project.geometry = self.geometry
         self.project.ensure_clips(self.videos)
@@ -2166,14 +2212,22 @@ class MainWindow(QMainWindow):
             )
             if go != QMessageBox.StandardButton.Yes:
                 return
+        mode = self.settings.detector_mode
+        weights = visdrone_weights_path()
+        if mode == "trained" and not weights.is_file():
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "Trained detector needs VisDrone weights. Open Training and run Train VisDrone first. "
+                "Weights are not included with a new install.",
+            )
+            return
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.stack.setCurrentIndex(PAGE_PROCESS)
         self.log.clear()
         self.results = []
         self.progress.setValue(0)
         self.cancel_btn.setEnabled(True)
-        mode = self.settings.detector_mode
-        weights = weights_for_source(self.settings.detector_source, self.settings.detector_weights)
         if mode == "trained":
             self._append_log(
                 f"Detection: trained detector  •  {weights}  •  "
@@ -2183,17 +2237,20 @@ class MainWindow(QMainWindow):
             )
         else:
             self._append_log("Detection: motion mask (all vehicles the same)")
+        if self.settings.infer_trips_from_traces:
+            self._append_log("Trips: traces can infer gate hits when boxes miss the tripwire")
+        else:
+            self._append_log("Trips: confirmed box-to-box gate crossings only")
         if self.settings.preview_every <= 0:
             self._append_log("Live preview: off")
-        limits = self.geometry.vehicle_area_limits(extra_areas=prior_areas())
+        limits = self.geometry.vehicle_area_limits()
         if limits:
-            extra = f" + {len(prior_areas())} training box(es)" if prior_areas() else ""
             self._append_log(
-                f"Box size from {len(self.geometry.vehicle_refs)} vehicle mask(s){extra}: "
+                f"Box size from {len(self.geometry.vehicle_refs)} vehicle mask(s): "
                 f"{limits[0]}–{limits[1]} px²"
             )
         else:
-            self._append_log("Box size: default frame band (no vehicle masks or Training boxes)")
+            self._append_log("Box size: default frame band (no vehicle masks)")
         if self.geometry.roadways:
             self._append_log(f"Roadway areas: {len(self.geometry.roadways)} (boats and parking outside are ignored)")
         if self.geometry.occlusions:
@@ -2215,6 +2272,8 @@ class MainWindow(QMainWindow):
             detector_imgsz=self.settings.detector_imgsz,
             detect_stride=self.settings.detect_stride,
             preview_every=self.settings.preview_every,
+            theme=self.settings.theme,
+            infer_trips_from_traces=self.settings.infer_trips_from_traces,
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.preview.connect(self._on_preview)
@@ -2277,6 +2336,7 @@ class MainWindow(QMainWindow):
             self._fill_table(self.table, None)
             self._fill_table(self.tmc_table, None)
             self._set_gate_trace(None)
+            self._fill_review_issues(None)
             return
         self.report_clip.setCurrentIndex(0)
         self._show_report_clip()
@@ -2303,6 +2363,7 @@ class MainWindow(QMainWindow):
         self._fill_table(self.table, gates)
         self._fill_table(self.tmc_table, tmc, left_align_first=True)
         self._set_gate_trace(result.trace_image)
+        self._fill_review_issues(result)
 
     def _fill_table(self, widget: QTableWidget, table, *, left_align_first: bool = False) -> None:
         widget.clear()
@@ -2339,6 +2400,67 @@ class MainWindow(QMainWindow):
         self.gate_trace.setPixmap(QPixmap.fromImage(image))
         self.gate_trace.adjustSize()
 
+    def _review_base_frame(self, result: ProcessResult):
+        if result.trace_image is not None:
+            return result.trace_image
+        try:
+            frame, _ = grab_frame_at(result.video.path, 0.0)
+            return frame
+        except Exception:
+            return None
+
+    def _show_review_still(self, result: ProcessResult, highlight=None) -> None:
+        if highlight is None:
+            frame = self._review_base_frame(result)
+            if frame is None:
+                return
+            marked = draw_issue_overlay(frame, result.issues, result.geometry)
+            self.review_canvas.set_frame(marked)
+            self.review_status.setText(
+                f"{len(result.issues)} event(s) on this clip. Dots show where they happened."
+            )
+            return
+        try:
+            frame, _ = grab_frame_at(result.video.path, highlight.time_s)
+        except Exception:
+            frame = self._review_base_frame(result)
+        if frame is None:
+            return
+        marked = draw_issue_overlay(frame, result.issues, result.geometry, highlight=highlight)
+        self.review_canvas.set_frame(marked)
+        self.preview_canvas.set_frame(marked)
+        minutes = int(highlight.time_s) // 60
+        seconds = int(highlight.time_s) % 60
+        self.review_status.setText(f"{minutes}:{seconds:02d}  {highlight.message}")
+
+    def _fill_review_issues(self, result: ProcessResult | None) -> None:
+        self.issue_list.clear()
+        if result is None or not result.issues:
+            self.issue_list.addItem("No tracking problems listed for this clip.")
+            if result is not None and result.trace_image is not None:
+                self.review_canvas.set_frame(result.trace_image)
+            if hasattr(self, "review_status"):
+                self.review_status.setText("No tracking problems listed for this clip.")
+            return
+        for issue in result.issues:
+            minutes = int(issue.time_s) // 60
+            seconds = int(issue.time_s) % 60
+            self.issue_list.addItem(f"{minutes}:{seconds:02d}  {issue.message}")
+            row = self.issue_list.item(self.issue_list.count() - 1)
+            if row is not None:
+                row.setData(Qt.ItemDataRole.UserRole, issue)
+        self._show_review_still(result)
+
+    def _seek_review_issue(self, item) -> None:
+        issue = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if issue is None:
+            return
+        ok_results = [result for result in self.results if not result.error]
+        if not ok_results:
+            return
+        index = max(0, min(self.report_clip.currentIndex(), len(ok_results) - 1))
+        self._show_review_still(ok_results[index], highlight=issue)
+
     def _open_export_dir(self) -> None:
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
@@ -2362,7 +2484,7 @@ class MainWindow(QMainWindow):
             self.content_layout.setContentsMargins(16, 12, 16, 16)
             self.statusBar().show()
         if index == PAGE_TRAINING:
-            self._refresh_training_sessions()
+            self._refresh_visdrone_status()
         if index == PAGE_SETTINGS:
             self._refresh_settings_page()
         if index == PAGE_ALIGN:
@@ -2376,10 +2498,11 @@ class MainWindow(QMainWindow):
 
     def _go_training(self) -> None:
         self.stack.setCurrentIndex(PAGE_TRAINING)
-        self._refresh_train_ready_status()
+        self._refresh_visdrone_status()
 
     def _go_settings(self) -> None:
         self.stack.setCurrentIndex(PAGE_SETTINGS)
+        self._schedule_frame_check()
 
     def _persist_settings(self) -> None:
         mode = "motion"
@@ -2400,7 +2523,6 @@ class MainWindow(QMainWindow):
         stride = self.settings.detect_stride
         preview_every = self.settings.preview_every
         preset = self.settings.precision_preset
-        source = self.settings.detector_source
         if hasattr(self, "detector_conf_slider"):
             conf = clamp_detector_conf(self.detector_conf_slider.value() / 100.0)
             iou = clamp_detector_iou(self.detector_iou_slider.value() / 100.0)
@@ -2409,18 +2531,24 @@ class MainWindow(QMainWindow):
             jump = clamp_path_jump(self.path_jump_slider.value())
         if hasattr(self, "precision_combo"):
             preset = self.precision_combo.currentData() or preset
-        if hasattr(self, "detector_source_combo"):
-            source = self.detector_source_combo.currentData() or source
         if hasattr(self, "detector_imgsz_combo"):
             imgsz = clamp_detector_imgsz(self.detector_imgsz_combo.currentData())
             stride = clamp_detect_stride(self.detect_stride_combo.currentData())
             preview_every = clamp_preview_every(self.preview_every_combo.currentData())
+        infer_trips = self.settings.infer_trips_from_traces
+        sender = self.sender()
+        if sender is getattr(self, "process_infer_trips_check", None) and sender is not None:
+            infer_trips = sender.isChecked()
+        elif hasattr(self, "infer_trips_check"):
+            infer_trips = self.infer_trips_check.isChecked()
+        elif hasattr(self, "process_infer_trips_check"):
+            infer_trips = self.process_infer_trips_check.isChecked()
         self.settings = AppSettings(
             export_dir=str(self.export_dir),
             warn_onedrive=warn,
             detector_mode=mode,
-            detector_weights=self.settings.detector_weights,
-            detector_source=source if source in ("site", "visdrone", "custom") else "site",
+            detector_weights=str(visdrone_weights_path()),
+            detector_source="visdrone",
             theme=theme if theme in ("dark", "light") else "dark",
             precision_preset=preset if preset in ("strict", "balanced", "sensitive", "custom") else "balanced",
             detector_conf=conf,
@@ -2431,12 +2559,14 @@ class MainWindow(QMainWindow):
             detector_imgsz=imgsz,
             detect_stride=stride,
             preview_every=preview_every,
+            infer_trips_from_traces=infer_trips,
         )
         save_settings(self.settings)
         self._refresh_setup_list()
 
     def _settings_changed(self, *_args) -> None:
         self._persist_settings()
+        self._schedule_frame_check()
 
     def _detection_slider_changed(self, label: QLabel, template: str, raw: int, scale: float) -> None:
         label.setText(template.format(value=raw / scale))
@@ -2447,11 +2577,13 @@ class MainWindow(QMainWindow):
             self.precision_combo.setCurrentIndex(max(0, self.precision_combo.findData("custom")))
             self.precision_combo.blockSignals(False)
         self._persist_settings()
+        self._schedule_frame_check()
 
     def _precision_preset_changed(self, *_args) -> None:
         name = self.precision_combo.currentData() or "custom"
         if name == "custom":
             self._persist_settings()
+            self._schedule_frame_check()
             return
         tuned = apply_precision_preset(self.settings, name)
         self._filling_preset = True
@@ -2462,17 +2594,7 @@ class MainWindow(QMainWindow):
         self.path_jump_slider.setValue(int(round(tuned.path_jump)))
         self._filling_preset = False
         self._persist_settings()
-
-    def _detector_source_changed(self, *_args) -> None:
-        source = self.detector_source_combo.currentData() or "site"
-        if source == "custom":
-            self._choose_detector_weights()
-            return
-        chosen = weights_for_source(source, self.settings.detector_weights)
-        self.settings.detector_weights = str(chosen)
-        self.settings.detector_source = source
-        self._persist_settings()
-        self._refresh_detector_status()
+        self._schedule_frame_check()
 
     def _detector_mode_changed(self, *_args) -> None:
         sender = self.sender()
@@ -2486,38 +2608,20 @@ class MainWindow(QMainWindow):
                 combo.blockSignals(False)
         self._persist_settings()
         self._refresh_detector_status()
+        self._schedule_frame_check()
 
-    def _choose_detector_weights(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Choose detector weights",
-            str(trained_weights_path().parent),
-            "YOLO weights (*.pt *.onnx);;All files (*.*)",
-        )
-        if not path:
-            if hasattr(self, "detector_source_combo"):
-                self.detector_source_combo.blockSignals(True)
-                self.detector_source_combo.setCurrentIndex(
-                    max(0, self.detector_source_combo.findData(self.settings.detector_source))
-                )
-                self.detector_source_combo.blockSignals(False)
-            return
-        self.settings.detector_weights = path
-        self.settings.detector_source = "custom"
-        if hasattr(self, "detector_source_combo"):
-            self.detector_source_combo.blockSignals(True)
-            self.detector_source_combo.setCurrentIndex(max(0, self.detector_source_combo.findData("custom")))
-            self.detector_source_combo.blockSignals(False)
-        if hasattr(self, "detector_combo"):
-            self.detector_combo.blockSignals(True)
-            self.detector_combo.setCurrentIndex(max(0, self.detector_combo.findData("trained")))
-            self.detector_combo.blockSignals(False)
-        if hasattr(self, "process_detector_combo"):
-            self.process_detector_combo.blockSignals(True)
-            self.process_detector_combo.setCurrentIndex(max(0, self.process_detector_combo.findData("trained")))
-            self.process_detector_combo.blockSignals(False)
+    def _infer_trips_changed(self, checked: bool) -> None:
+        sender = self.sender()
+        for box in (
+            getattr(self, "infer_trips_check", None),
+            getattr(self, "process_infer_trips_check", None),
+        ):
+            if box is None or box is sender:
+                continue
+            box.blockSignals(True)
+            box.setChecked(bool(checked))
+            box.blockSignals(False)
         self._persist_settings()
-        self._refresh_detector_status()
 
     def _sync_detector_ui(self) -> None:
         mode = self.settings.detector_mode if self.settings.detector_mode in ("motion", "trained") else "motion"
@@ -2527,26 +2631,27 @@ class MainWindow(QMainWindow):
             combo.blockSignals(True)
             combo.setCurrentIndex(max(0, combo.findData(mode)))
             combo.blockSignals(False)
+        infer = bool(self.settings.infer_trips_from_traces)
+        for box in (
+            getattr(self, "infer_trips_check", None),
+            getattr(self, "process_infer_trips_check", None),
+        ):
+            if box is None:
+                continue
+            box.blockSignals(True)
+            box.setChecked(infer)
+            box.blockSignals(False)
         self._refresh_detector_status()
 
     def _refresh_detector_status(self) -> None:
-        weights = weights_for_source(self.settings.detector_source, self.settings.detector_weights)
-        source = self.settings.detector_source
-        if source == "visdrone":
-            ready = "ready" if visdrone_weights_path().is_file() else "not trained yet"
-            text = f"VisDrone weights ({ready}): {visdrone_weights_path()}"
-        elif source == "site":
-            site = site_weights_path()
-            if site.is_file():
-                text = f"Site fine-tune: {site}"
-            elif has_trained_weights():
-                text = f"Site weights (best.pt until the next fine-tune): {trained_weights_path()}"
-            else:
-                text = f"No site fine-tune yet. Train detector writes {site.name}."
-        elif weights.is_file():
-            text = f"Using {weights}"
+        path = visdrone_weights_path()
+        if path.is_file():
+            text = f"VisDrone weights ready: {path}"
         else:
-            text = f"Will load {weights.name} on process. Choose a .pt file if this is missing."
+            text = (
+                "VisDrone not trained yet. Open Training and run Train VisDrone "
+                f"(writes {path.name}; weights are not shipped)."
+            )
         if hasattr(self, "detector_status"):
             self.detector_status.setText(text)
         if hasattr(self, "process_detector_status"):
@@ -2566,86 +2671,23 @@ class MainWindow(QMainWindow):
             self.header_logo.setPixmap(load_brand_pixmap(theme, 40))
         if hasattr(self, "home_stage"):
             self.home_stage.set_theme(theme)
-        for name in ("canvas", "ref_canvas", "align_canvas", "preview_canvas", "train_canvas"):
+        for name in (
+            "canvas",
+            "ref_canvas",
+            "align_canvas",
+            "preview_canvas",
+            "check_canvas",
+            "review_canvas",
+        ):
             widget = getattr(self, name, None)
             if widget is not None and hasattr(widget, "set_theme"):
                 widget.set_theme(theme)
-
-    def _refresh_training_inventory(self) -> None:
-        info = training_inventory()
-        prior = "size prior on" if info["has_prior"] else "no size prior"
-        weights = "weights present" if info["has_weights"] else "no weights"
-        self.training_summary.setText(
-            f"{info['root']}  •  {info['session_count']} session(s), "
-            f"{info['frame_count']} frame(s), {info['box_count']} box(es)  •  {prior}, {weights}"
-        )
-        self.settings_train_list.clear()
-        for session in info["sessions"]:
-            self.settings_train_list.addItem(self._training_session_label(session))
-        self._refresh_train_ready_status()
-
-    def _export_training_data(self) -> None:
-        info = training_inventory()
-        if info["session_count"] == 0:
-            QMessageBox.information(self, APP_NAME, "No training sessions to export yet.")
-            return
-        dest, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export training data",
-            str(Path.cwd() / "training-data.zip"),
-            "Zip archive (*.zip)",
-        )
-        if not dest:
-            return
-        try:
-            path = export_training_archive(Path(dest))
-        except (OSError, FileNotFoundError) as exc:
-            QMessageBox.warning(self, APP_NAME, str(exc))
-            return
-        self.statusBar().showMessage(f"Exported training data to {path}")
-        QMessageBox.information(self, APP_NAME, f"Saved {path}")
-
-    def _import_training_data(self) -> None:
-        src, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import training data",
-            "",
-            "Zip archive (*.zip);;All files (*.*)",
-        )
-        folder = ""
-        if not src:
-            folder = QFileDialog.getExistingDirectory(self, "Or choose a training folder")
-            if not folder:
-                return
-            src = folder
-        incoming = training_inventory()
-        replace = False
-        if incoming["session_count"]:
-            go = QMessageBox.question(
-                self,
-                APP_NAME,
-                "Replace existing sessions with the same name?\n\n"
-                "Yes replaces matches. No keeps yours and only adds new names.",
-            )
-            replace = go == QMessageBox.StandardButton.Yes
-        try:
-            result = import_training_archive(Path(src), replace=replace)
-        except (OSError, ValueError, FileNotFoundError) as exc:
-            QMessageBox.warning(self, APP_NAME, str(exc))
-            return
-        self._refresh_training_inventory()
-        self._refresh_training_sessions()
-        QMessageBox.information(
-            self,
-            APP_NAME,
-            f"Imported {result['imported']}, replaced {result['replaced']}, skipped {result['skipped']}.",
-        )
 
     def _open_training_folder(self) -> None:
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
 
-        folder = training_root()
+        folder = visdrone_weights_path().parent
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
@@ -2673,80 +2715,97 @@ class MainWindow(QMainWindow):
                 max(0, self.preview_every_combo.findData(self.settings.preview_every))
             )
             self.preview_every_combo.blockSignals(False)
-        self._refresh_training_inventory()
         self._sync_detector_ui()
+        self._schedule_frame_check()
 
-    def _training_session_label(self, session: TrainingSession) -> str:
-        saved = session.saved_at[:19].replace("T", " ") if session.saved_at else "unsaved"
-        return (
-            f"{session.video_stem}  •  {len(session.frames)} frame(s), "
-            f"{session.box_count()} box(es)  •  {saved}"
-        )
+    def _toggle_advanced_sliders(self, checked: bool) -> None:
+        self.advanced_panel.setVisible(bool(checked))
+        self.advanced_btn.setText("Hide advanced sliders" if checked else "Show advanced sliders")
 
-    def _refresh_training_sessions(self) -> None:
-        self.train_sessions.clear()
-        for session in list_sessions():
-            self.train_sessions.addItem(self._training_session_label(session))
-            self.train_sessions.item(self.train_sessions.count() - 1).setData(
-                Qt.ItemDataRole.UserRole, session.video_stem
-            )
-        areas = prior_areas()
-        if areas:
-            limits = self.geometry.vehicle_area_limits(extra_areas=areas)
-            if limits:
-                self.train_status.setText(
-                    f"{len(areas)} training box(es) in the size prior. "
-                    f"Process will keep blobs {limits[0]}–{limits[1]} px²."
-                )
-        self._refresh_train_ready_status()
-
-    def _refresh_train_ready_status(self) -> None:
-        if not hasattr(self, "train_ready_label"):
+    def _schedule_frame_check(self) -> None:
+        timer = getattr(self, "_frame_check_timer", None)
+        if timer is None:
             return
-        info = training_inventory()
+        timer.start()
+
+    def _frame_check_still(self):
+        if self._ref_frame is not None:
+            return self._ref_frame
+        if not self.videos:
+            return None
+        try:
+            frame, _ = grab_frame_at(self.videos[0], 0.0)
+            return frame
+        except Exception:
+            return None
+
+    def _run_frame_check(self) -> None:
+        if not hasattr(self, "check_canvas"):
+            return
+        still = self._frame_check_still()
+        if still is None:
+            self.frame_check_status.setText(
+                "Open a video and draw routes first so this still has a frame to check."
+            )
+            return
+        if self.settings.detector_mode != "trained":
+            self.check_canvas.set_frame(still)
+            self.frame_check_status.setText(
+                "Switch to Trained detector to draw surviving boxes on this still. No full clip."
+            )
+            return
+        weights = visdrone_weights_path()
+        if not weights.is_file():
+            self.check_canvas.set_frame(still)
+            self.frame_check_status.setText(
+                "Train VisDrone first. Weights are not bundled with a new install."
+            )
+            return
+        self.frame_check_status.setText("Running detector on this still…")
+        self.check_canvas.set_frame(still)
+        try:
+            from traffic_tracker.core.motion import default_area_limits
+
+            model = load_detector(weights)
+            height, width = still.shape[:2]
+            limits = self.geometry.vehicle_area_limits()
+            if limits is None:
+                limits = default_area_limits(width, height)
+            detections, _mask = boxes_from_detector(
+                model,
+                still,
+                min_area=limits[0],
+                max_area=limits[1],
+                conf=self.settings.detector_conf,
+                iou=self.settings.detector_iou,
+                imgsz=self.settings.detector_imgsz,
+            )
+            self.check_canvas.set_frame(draw_detection_preview(still, detections))
+            self.frame_check_status.setText(
+                f"{len(detections)} box(es) on this still  •  "
+                f"conf {self.settings.detector_conf:.2f}  •  NMS {self.settings.detector_iou:.2f}"
+            )
+        except Exception as exc:
+            self.check_canvas.set_frame(still)
+            self.frame_check_status.setText(f"Could not run detector: {exc}")
+
+    def _refresh_visdrone_status(self) -> None:
+        path = visdrone_weights_path()
         report = device_report()
         extra = " — this will take a long time" if report.device == "cpu" else ""
-        self.train_ready_label.setText(
-            f"{info['frame_count']} labeled frame(s)  •  {info['box_count']} box(es)  •  "
-            f"{report.label}{extra}"
-        )
+        if path.is_file():
+            text = f"VisDrone weights ready: {path}  •  {report.label}{extra}"
+        else:
+            text = f"Not trained yet. Train VisDrone writes {path}  •  {report.label}{extra}"
+        if hasattr(self, "train_status"):
+            self.train_status.setText(text)
+        self._refresh_detector_status()
 
     def _set_train_busy(self, busy: bool) -> None:
-        if hasattr(self, "train_detector_btn"):
-            self.train_detector_btn.setEnabled(not busy)
         if hasattr(self, "train_visdrone_btn"):
             self.train_visdrone_btn.setEnabled(not busy)
         if hasattr(self, "cancel_train_btn"):
             self.cancel_train_btn.setEnabled(busy)
-
-    def _start_detector_train(self) -> None:
-        if self.train_worker and self.train_worker.isRunning():
-            return
-        info = training_inventory()
-        if info["frame_count"] < TRAIN_MIN_FRAMES or info["box_count"] < TRAIN_MIN_BOXES:
-            QMessageBox.information(
-                self,
-                APP_NAME,
-                f"Need at least {TRAIN_MIN_FRAMES} labeled frames and {TRAIN_MIN_BOXES} boxes. "
-                f"Found {info['frame_count']} frame(s) and {info['box_count']} box(es). "
-                "Box every vehicle on more frames, then try again.",
-            )
-            return
-        report = device_report()
-        if report.device == "cpu":
-            go = QMessageBox.question(
-                self,
-                APP_NAME,
-                report.warning or "Fine-tuning YOLO on CPU can take hours. Continue?",
-            )
-            if go != QMessageBox.StandardButton.Yes:
-                return
-        self._launch_train_worker(
-            "site",
-            "Starting site fine-tune on top of VisDrone…"
-            if visdrone_weights_path().is_file()
-            else "Starting site detector training from YOLO11n (no VisDrone weights yet)…",
-        )
 
     def _start_visdrone_train(self) -> None:
         if self.train_worker and self.train_worker.isRunning():
@@ -2755,7 +2814,7 @@ class MainWindow(QMainWindow):
             self,
             APP_NAME,
             "This downloads VisDrone2019-DET (~2 GB) and fine-tunes YOLO11n. "
-            "It can take hours. Your boxed Training sessions stay in place so we can compare. Continue?",
+            "It can take hours. Continue?",
         )
         if go != QMessageBox.StandardButton.Yes:
             return
@@ -2768,13 +2827,13 @@ class MainWindow(QMainWindow):
             )
             if go != QMessageBox.StandardButton.Yes:
                 return
-        self._launch_train_worker("visdrone", "Starting VisDrone training…")
+        self._launch_train_worker("Starting VisDrone training…")
 
-    def _launch_train_worker(self, source: str, start_message: str) -> None:
+    def _launch_train_worker(self, start_message: str) -> None:
         self.train_log.clear()
         self.train_progress.setValue(0)
         self.train_log.appendPlainText(start_message)
-        self.train_worker = TrainWorker(self, source=source)
+        self.train_worker = TrainWorker(self)
         self.train_worker.progress.connect(self._on_train_progress)
         self.train_worker.log_line.connect(self._on_train_log)
         self.train_worker.failed.connect(self._on_train_failed)
@@ -2807,27 +2866,8 @@ class MainWindow(QMainWindow):
         self.train_progress.setValue(self.train_progress.maximum())
         self.train_log.appendPlainText(f"Saved {path}")
         reset_detector_cache()
-        saved = Path(path)
-        if saved.name == "visdrone.pt":
-            self.settings.detector_source = "visdrone"
-            self.settings.detector_weights = str(visdrone_weights_path())
-            done_text = (
-                "VisDrone weights saved. Switch Weights to VisDrone in Settings to compare. "
-                "Train detector still fine-tunes those weights on your boxes."
-            )
-        else:
-            self.settings.detector_source = "site"
-            self.settings.detector_weights = str(saved if saved.is_file() else site_weights_path())
-            done_text = (
-                "Site fine-tune saved on top of VisDrone. Process will use Trained detector "
-                "with the site weights. VisDrone weights were left in place for comparison."
-            )
-        if hasattr(self, "detector_source_combo"):
-            self.detector_source_combo.blockSignals(True)
-            self.detector_source_combo.setCurrentIndex(
-                max(0, self.detector_source_combo.findData(self.settings.detector_source))
-            )
-            self.detector_source_combo.blockSignals(False)
+        self.settings.detector_source = "visdrone"
+        self.settings.detector_weights = str(visdrone_weights_path())
         for combo in (getattr(self, "detector_combo", None), getattr(self, "process_detector_combo", None)):
             if combo is None:
                 continue
@@ -2835,190 +2875,11 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(max(0, combo.findData("trained")))
             combo.blockSignals(False)
         self._persist_settings()
-        self._refresh_detector_status()
-        self._refresh_training_inventory()
-        self._refresh_train_ready_status()
-        QMessageBox.information(self, APP_NAME, done_text)
-
-    def _training_pick_video(self) -> None:
-        start = str(self.videos[0].parent) if self.videos else ""
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select a training video",
-            start,
-            "Video files (*.mp4 *.mov *.avi *.mkv *.m4v *.wmv);;All files (*.*)",
-        )
-        if not path:
-            return
-        video = Path(path)
-        self._train_video = video
-        self.train_video_label.setText(self._video_label(video))
-        try:
-            self._train_session = load_session(video.stem)
-        except (OSError, ValueError, KeyError, TypeError):
-            self._train_session = TrainingSession(video_path=str(video), video_stem=video.stem)
-        else:
-            self._train_session.video_path = str(video)
-        self._train_frames_bgr = {}
-        self._training_next_frame()
-
-    def _training_select_session(self) -> None:
-        return None
-
-    def _training_load_selected(self) -> None:
-        items = self.train_sessions.selectedItems()
-        if not items:
-            return
-        stem = items[0].data(Qt.ItemDataRole.UserRole)
-        if not stem:
-            return
-        try:
-            session = load_session(str(stem))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            QMessageBox.warning(self, APP_NAME, f"Could not load session: {exc}")
-            return
-        self._train_session = session
-        video = Path(session.video_path)
-        if video.is_file():
-            self._train_video = video
-            self.train_video_label.setText(self._video_label(video))
-        else:
-            self._train_video = None
-            self.train_video_label.setText(f"{session.video_stem} (video missing — pick the file to continue)")
-        self._train_frames_bgr = {}
-        if session.frames:
-            last = session.frames[-1]
-            self._train_boxes = list(last.boxes)
-            self._train_frame_index = last.frame_index
-            self._train_time_s = last.time_s
-            if video.is_file():
-                try:
-                    frame, index = grab_frame_at(video, last.time_s)
-                    self._train_frame = frame
-                    self._train_frame_index = index
-                    self._train_frames_bgr[index] = frame
-                    self._show_training_frame()
-                    return
-                except Exception:
-                    pass
-        if video.is_file():
-            self._training_next_frame()
-        else:
-            self._show_training_frame()
-
-    def _training_delete_selected(self) -> None:
-        items = self.train_sessions.selectedItems()
-        if not items:
-            return
-        stem = items[0].data(Qt.ItemDataRole.UserRole)
-        if not stem:
-            return
-        go = QMessageBox.question(self, APP_NAME, f"Delete training session {stem}?")
-        if go != QMessageBox.StandardButton.Yes:
-            return
-        delete_session(str(stem))
-        if self._train_session and self._train_session.video_stem == stem:
-            self._train_session = None
-            self._train_boxes = []
-            self._train_frame = None
-        self._refresh_training_sessions()
-
-    def _stash_training_frame(self) -> None:
-        if self._train_session is None or self._train_frame is None:
-            return
-        height, width = self._train_frame.shape[:2]
-        image_name = f"frame_{self._train_frame_index:06d}.jpg"
-        labeled = LabeledFrame(
-            frame_index=self._train_frame_index,
-            image_name=image_name,
-            width=width,
-            height=height,
-            boxes=list(self._train_boxes),
-            time_s=self._train_time_s,
-        )
-        existing = [f for f in self._train_session.frames if f.frame_index != self._train_frame_index]
-        if self._train_boxes:
-            existing.append(labeled)
-            self._train_frames_bgr[self._train_frame_index] = self._train_frame
-        self._train_session.frames = sorted(existing, key=lambda item: item.frame_index)
-
-    def _training_next_frame(self) -> None:
-        if self._train_video is None:
-            if self.videos:
-                self._train_video = self.videos[0]
-                self.train_video_label.setText(self._video_label(self._train_video))
-                if self._train_session is None:
-                    try:
-                        self._train_session = load_session(self._train_video.stem)
-                    except (OSError, ValueError, KeyError, TypeError):
-                        self._train_session = TrainingSession(
-                            video_path=str(self._train_video),
-                            video_stem=self._train_video.stem,
-                        )
-            else:
-                QMessageBox.information(self, APP_NAME, "Open a video first.")
-                return
-        self._stash_training_frame()
-        try:
-            frame, index = grab_random_frame(self._train_video)
-        except Exception as exc:
-            QMessageBox.warning(self, APP_NAME, f"Could not read a frame: {exc}")
-            return
-        self._train_frame = frame
-        self._train_frame_index = index
-        info = probe_video(self._train_video)
-        self._train_time_s = index / info.fps if info.fps else 0.0
-        reused = None
-        if self._train_session:
-            reused = next((f for f in self._train_session.frames if f.frame_index == index), None)
-        self._train_boxes = list(reused.boxes) if reused else []
-        self._train_frames_bgr[index] = frame
-        self._show_training_frame()
-
-    def _show_training_frame(self) -> None:
-        if self._train_frame is None:
-            self.train_canvas.set_geometry(None)
-            return
-        self.train_canvas.set_frame(self._train_frame)
-        height, width = self._train_frame.shape[:2]
-        geom = Geometry(width, height, vehicle_refs=list(self._train_boxes))
-        self.train_canvas.set_geometry(geom)
-        self.train_canvas.set_drawing_enabled(True, box=True)
-        boxed = len(self._train_boxes)
-        labeled = len(self._train_session.frames) if self._train_session else 0
-        self.train_status.setText(
-            f"Frame {self._train_frame_index}  •  {boxed} box(es) on this frame  •  "
-            f"{labeled} labeled frame(s) in the session. Drag a box around each vehicle."
-        )
-
-    def _training_box_drawn(self, box: Box) -> None:
-        if box.area() < 4:
-            return
-        self._train_boxes.append(box.normalized())
-        self._show_training_frame()
-
-    def _training_undo_box(self) -> None:
-        if self._train_boxes:
-            self._train_boxes.pop()
-            self._show_training_frame()
-
-    def _training_save(self) -> None:
-        if self._train_session is None:
-            QMessageBox.information(self, APP_NAME, "Open a video and box vehicles first.")
-            return
-        self._stash_training_frame()
-        if not self._train_session.frames:
-            QMessageBox.information(self, APP_NAME, "Box at least one vehicle before saving.")
-            return
-        folder = save_session(self._train_session, self._train_frames_bgr)
-        self._refresh_training_sessions()
-        if hasattr(self, "settings_train_list"):
-            self._refresh_training_inventory()
-        self.statusBar().showMessage(f"Saved training session to {folder}")
+        self._refresh_visdrone_status()
         QMessageBox.information(
             self,
             APP_NAME,
-            "Session saved. Process will use these box sizes even if you drew no route masks.",
+            "VisDrone weights saved. Process will use Trained detector with visdrone.pt.",
         )
 
     def _append_log(self, text: str) -> None:
