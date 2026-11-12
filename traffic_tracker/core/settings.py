@@ -156,7 +156,7 @@ class AppSettings:
     detector_mode: str = "motion"
     detector_weights: str = ""
     detector_source: str = "visdrone"
-    theme: str = "dark"
+    theme: str = "light"
     precision_preset: str = "balanced"
     detector_conf: float = DETECTOR_CONF
     detector_iou: float = DETECTOR_IOU
@@ -198,7 +198,7 @@ def load_settings(base: Path | None = None) -> AppSettings:
     except (OSError, json.JSONDecodeError):
         return AppSettings(export_dir=str((base or Path.cwd()) / "outputs"))
     mode = str(data.get("detector_mode", "motion"))
-    theme = str(data.get("theme", "dark"))
+    theme = str(data.get("theme", "light"))
     source = "visdrone"
     preset = str(data.get("precision_preset", "balanced"))
     if preset not in ("strict", "balanced", "sensitive", "custom"):
@@ -216,7 +216,7 @@ def load_settings(base: Path | None = None) -> AppSettings:
         detector_mode=mode if mode in ("motion", "trained") else "motion",
         detector_weights=str(data.get("detector_weights") or ""),
         detector_source=source,
-        theme=theme if theme in ("dark", "light") else "dark",
+        theme=theme if theme in ("dark", "light") else "light",
         precision_preset=preset,
         detector_conf=clamp_detector_conf(data.get("detector_conf", DETECTOR_CONF)),
         detector_iou=clamp_detector_iou(data.get("detector_iou", DETECTOR_IOU)),

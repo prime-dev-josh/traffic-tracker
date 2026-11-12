@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -59,7 +59,7 @@ from traffic_tracker.core.detector import (
     resolve_detector_weights,
     suppress_duplicate_boxes,
 )
-from traffic_tracker.core.device import describe_device, detect_device
+from traffic_tracker.core.device import detect_device, inference_device_label
 from traffic_tracker.core.motion import (
     blobs_from_frame,
     create_subtractor,
@@ -67,7 +67,7 @@ from traffic_tracker.core.motion import (
     process_scale,
 )
 from traffic_tracker.core.report import Trip
-from traffic_tracker.core.video import VideoInfo, probe_video
+from traffic_tracker.core.video import VideoInfo, clamp_clip_window, probe_video
 from traffic_tracker.gui.style import path_color_bgr
 
 
@@ -213,9 +213,18 @@ def should_run_detector(frame_idx: int, stride: int) -> bool:
     return (max(int(frame_idx), 1) - 1) % step == 0
 
 
-def should_emit_preview(frame_idx: int, preview_every: int) -> bool:
+def preview_interval(preview_every: int | Callable[[], int]) -> int:
+    """Resolve a live preview interval. 0 means off. A callable is read each frame."""
+    value = preview_every() if callable(preview_every) else preview_every
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return PREVIEW_EVERY
+
+
+def should_emit_preview(frame_idx: int, preview_every: int | Callable[[], int]) -> bool:
     """False when preview_every is 0 (live preview off)."""
-    every = int(preview_every)
+    every = preview_interval(preview_every)
     if every <= 0:
         return False
     return frame_idx == 1 or frame_idx % every == 0
@@ -229,7 +238,7 @@ def process_video(
     cancel_flag: Callable[[], bool] | None = None,
     progress_cb: ProgressCb | None = None,
     preview_cb: PreviewCb | None = None,
-    preview_every: int = PREVIEW_EVERY,
+    preview_every: int | Callable[[], int] = PREVIEW_EVERY,
     min_area: int | None = None,
     max_area: int | None = None,
     overhead_drone: bool = True,
@@ -246,10 +255,15 @@ def process_video(
     detect_stride: int = DETECTOR_STRIDE,
     theme: str = "dark",
     infer_trips_from_traces: bool | None = None,
+    start_s: float = 0.0,
+    end_s: float | None = None,
 ) -> ProcessResult:
     """Process one video. Moving blobs or YOLO boxes in the size band are vehicles."""
     del overhead_drone
     info = probe_video(video_path)
+    start_s, end_s = clamp_clip_window(start_s, end_s, info.duration_s)
+    window_s = max(0.0, end_s - start_s)
+    window_frames = max(1, int(round(window_s * info.fps)) if info.fps else 1)
     fitted = geometry.scaled_to(info.width, info.height)
     suggested_min, suggested_max = default_area_limits(info.width, info.height)
     ref_limits = fitted.vehicle_area_limits()
@@ -276,7 +290,7 @@ def process_video(
                 error=f"Could not load detector weights {weights}: {exc}",
             )
         infer_device = device or detect_device()
-        device_label = f"trained detector ({weights.name}) on {describe_device(infer_device)}"
+        device_label = f"trained detector ({weights.name}) on {inference_device_label(infer_device)}"
         model_label = device_label
     else:
         infer_device = None
@@ -288,8 +302,9 @@ def process_video(
     if progress_cb:
         progress_cb(
             0,
-            info.frame_count or 1,
-            f"{device_label}  •  box {min_area}–{max_area} px²",
+            window_frames,
+            f"{device_label}  •  box {min_area}–{max_area} px²"
+            + (f"  •  {start_s:.1f}–{end_s:.1f}s" if window_s < info.duration_s - 0.05 else ""),
         )
 
     pending = _Pending(
@@ -306,7 +321,8 @@ def process_video(
     subtractor = None if use_detector else create_subtractor()
     prev_gray = None
     trace_frame: np.ndarray | None = None
-    trace_at = max(1, int((info.frame_count or 1) * 0.4))
+    start_frame = int(round(start_s * info.fps)) if info.fps else 0
+    trace_at = start_frame + max(1, int(window_frames * 0.4))
 
     cap = cv2.VideoCapture(str(info.path))
     if not cap.isOpened():
@@ -314,12 +330,18 @@ def process_video(
             info, [], device_label, fitted, error=f"Could not open {info.path}"
         )
 
-    frame_idx = 0
+    frame_idx = start_frame
+    if start_s > 0:
+        cap.set(cv2.CAP_PROP_POS_MSEC, start_s * 1000.0)
+        pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        if pos and pos > 0:
+            frame_idx = int(pos)
     try:
         while True:
             if cancel_flag and cancel_flag():
+                _shift_result_times(trips, pending.issues, start_s)
                 return ProcessResult(
-                    info,
+                    _windowed_info(info, start_s, end_s, frame_idx - start_frame),
                     trips,
                     device_label,
                     fitted,
@@ -327,6 +349,7 @@ def process_video(
                     start_crossings=start_crossings,
                     end_crossings=end_crossings,
                     frames_with_tracks=frames_with_tracks,
+                    issues=list(pending.issues),
                 )
 
             ok, frame = cap.read()
@@ -334,6 +357,10 @@ def process_video(
                 break
             frame_idx += 1
             elapsed_s = frame_idx / info.fps
+            if elapsed_s < start_s - 1e-3:
+                continue
+            if elapsed_s > end_s + 1e-3:
+                break
             if use_detector and detector is not None:
                 if should_run_detector(frame_idx, stride):
                     detections, mask = boxes_from_detector(
@@ -370,10 +397,10 @@ def process_video(
                 classes = ["vehicle"] * len(boxes)
                 confs = [1.0] * len(boxes)
 
-            if frame_idx == 1 or frame_idx == trace_at:
+            if frame_idx == start_frame + 1 or frame_idx == trace_at:
                 trace_frame = frame.copy()
 
-            if use_detector or elapsed_s >= MOTION_WARMUP_S:
+            if use_detector or (elapsed_s - start_s) >= MOTION_WARMUP_S:
                 pending.frame_index = frame_idx
                 starts, ends = _record_crossings(
                     boxes,
@@ -395,32 +422,36 @@ def process_video(
                     pending, fitted, trips, info.name, elapsed_s, infer_path=use_trace
                 )
 
-            if preview_cb and should_emit_preview(frame_idx, preview_every):
+            done = max(1, frame_idx - start_frame)
+            if preview_cb and should_emit_preview(done, preview_every):
                 preview = _draw_motion_preview(
                     frame, mask, boxes, pending, fitted, trips, active_only=use_detector
                 )
                 preview_cb(preview)
 
-            if progress_cb and (frame_idx == 1 or frame_idx % 10 == 0):
+            if progress_cb and (done == 1 or frame_idx % 10 == 0):
                 progress_cb(
-                    frame_idx,
-                    info.frame_count or frame_idx,
-                    f"{info.name}  •  {frame_idx}/{info.frame_count or '?'}  •  {len(trips)} trips",
+                    min(done, window_frames),
+                    window_frames,
+                    f"{info.name}  •  {done}/{window_frames}  •  {len(trips)} trips",
                 )
     finally:
         cap.release()
 
+    last_s = min(end_s, frame_idx / max(info.fps, 1e-6))
     end_crossings += _expire_tracks(
         pending,
         fitted,
         trips,
         info.name,
-        (frame_idx / max(info.fps, 1e-6)) + MOTION_COAST_S + 1.0,
+        last_s + MOTION_COAST_S + 1.0,
         coast_s=0.0,
         infer_path=use_trace,
     )
+    _shift_result_times(trips, pending.issues, start_s)
+    result_info = _windowed_info(info, start_s, end_s, max(0, frame_idx - start_frame))
     if progress_cb:
-        progress_cb(info.frame_count or frame_idx, info.frame_count or frame_idx, f"Finished {info.name}")
+        progress_cb(window_frames, window_frames, f"Finished {info.name}")
     _dbg(
         "H5",
         "processor.py:process_video",
@@ -442,7 +473,7 @@ def process_video(
         overlay = _draw_path_overlay(trace_frame, trips, pending, fitted)
         route_images = _route_path_overlays(trace_frame, trips, pending, fitted)
     return ProcessResult(
-        info,
+        result_info,
         trips,
         device_label,
         fitted,
@@ -454,6 +485,20 @@ def process_video(
         route_images=route_images,
         issues=list(pending.issues),
     )
+
+
+def _windowed_info(info: VideoInfo, start_s: float, end_s: float, frames: int) -> VideoInfo:
+    return replace(info, duration_s=max(0.0, end_s - start_s), frame_count=max(0, frames))
+
+
+def _shift_result_times(trips: list[Trip], issues: list[TrackIssue], origin_s: float) -> None:
+    if origin_s <= 0:
+        return
+    for trip in trips:
+        trip.start_time_s -= origin_s
+        trip.end_time_s -= origin_s
+    for issue in issues:
+        issue.time_s -= origin_s
 
 
 PATH_WIDTH = 1

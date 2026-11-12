@@ -107,6 +107,15 @@ def describe_device(device: str) -> str:
     return device
 
 
+def inference_device_label(device: str | None = None) -> str:
+    """Human label for process-time inference, including FP16 when CUDA is used."""
+    chosen = device or detect_device()
+    label = describe_device(chosen)
+    if chosen == "cuda":
+        return f"{label} • FP16"
+    return label
+
+
 def device_report(timeout_s: float = 30.0) -> DeviceReport:
     device = detect_device(timeout_s)
     gpus = nvidia_gpu_names()

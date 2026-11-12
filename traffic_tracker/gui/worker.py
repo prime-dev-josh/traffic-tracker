@@ -19,8 +19,8 @@ from traffic_tracker.config import (
     EXPORT_SUBFOLDER_PATTERN,
     PREVIEW_EVERY,
 )
-from traffic_tracker.core.geometry import Geometry
 from traffic_tracker.core.processor import ProcessResult, process_video
+from traffic_tracker.core.project import ProcessJob
 from traffic_tracker.core.report import Trip, export_tmc_workbook
 from traffic_tracker.core.settings import export_workbook_path
 from traffic_tracker.core.trainer import train_visdrone_detector
@@ -35,7 +35,7 @@ class ProcessWorker(QThread):
 
     def __init__(
         self,
-        jobs: list[tuple[Path, Geometry]],
+        jobs: list[ProcessJob],
         export_dir: Path,
         clock_start: datetime | None,
         parent: QObject | None = None,
@@ -75,13 +75,22 @@ class ProcessWorker(QThread):
     def cancel(self) -> None:
         self._cancel = True
 
+    def set_preview_every(self, every: int) -> None:
+        """Change live preview while a clip is running. 0 skips drawing."""
+        try:
+            self._preview_every = int(every)
+        except (TypeError, ValueError):
+            self._preview_every = PREVIEW_EVERY
+
     def run(self) -> None:
         results: list[ProcessResult] = []
         started_at = datetime.now()
         try:
-            for video, geometry in self._jobs:
+            for job in self._jobs:
                 if self._cancel:
                     break
+                video = job.path
+                geometry = job.geometry
 
                 def progress_cb(current: int, total: int, message: str) -> None:
                     self.progress.emit(current, total, message)
@@ -92,10 +101,12 @@ class ProcessWorker(QThread):
                 result = process_video(
                     str(video),
                     geometry,
+                    start_s=job.start_s,
+                    end_s=job.end_s,
                     cancel_flag=lambda: self._cancel,
                     progress_cb=progress_cb,
-                    preview_cb=preview_cb if self._preview_every > 0 else None,
-                    preview_every=self._preview_every,
+                    preview_cb=preview_cb,
+                    preview_every=lambda: self._preview_every,
                     detector_mode=self._detector_mode,
                     weights_path=self._weights_path,
                     detector_conf=self._detector_conf,

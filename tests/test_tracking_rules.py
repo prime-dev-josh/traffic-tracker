@@ -27,7 +27,10 @@ from traffic_tracker.core.processor import (
     _id_label_color,
     _record_crossings,
     _route_label,
+    _shift_result_times,
     draw_issue_overlay,
+    preview_interval,
+    process_video,
     should_emit_preview,
     should_run_detector,
 )
@@ -626,6 +629,60 @@ class ProcessSpeedHelpersTests(unittest.TestCase):
         self.assertTrue(should_emit_preview(15, 15))
         self.assertTrue(should_emit_preview(30, 30))
         self.assertFalse(should_emit_preview(29, 30))
+
+    def test_preview_interval_reads_live_callable(self) -> None:
+        state = {"every": 15}
+        getter = lambda: state["every"]
+        self.assertEqual(preview_interval(getter), 15)
+        self.assertTrue(should_emit_preview(15, getter))
+        state["every"] = 0
+        self.assertEqual(preview_interval(getter), 0)
+        self.assertFalse(should_emit_preview(15, getter))
+        self.assertEqual(preview_interval(30), 30)
+
+
+class ClipWindowTests(unittest.TestCase):
+    def test_shift_result_times_rebases_to_the_window_start(self) -> None:
+        trips = [Trip("a.mp4", 1, "N", 40.0, "SB", 55.0)]
+        issues = [TrackIssue("long_trace", 42.0, 1, "jump")]
+        _shift_result_times(trips, issues, 30.0)
+        self.assertAlmostEqual(trips[0].start_time_s, 10.0)
+        self.assertAlmostEqual(trips[0].end_time_s, 25.0)
+        self.assertAlmostEqual(issues[0].time_s, 12.0)
+        _shift_result_times(trips, issues, 0.0)
+        self.assertAlmostEqual(trips[0].start_time_s, 10.0)
+
+    def test_process_video_stops_at_end_s(self) -> None:
+        import cv2
+        import numpy as np
+
+        geom = Geometry(64, 64, north=Line(32, 56, 32, 8))
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "clip.avi"
+            writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 10.0, (64, 64))
+            if not writer.isOpened():
+                self.skipTest("OpenCV cannot write MJPG")
+            for index in range(20):
+                frame = np.full((64, 64, 3), (index * 12) % 255, dtype=np.uint8)
+                writer.write(frame)
+            writer.release()
+            totals: list[int] = []
+
+            def progress(current: int, total: int, _message: str) -> None:
+                totals.append(total)
+
+            result = process_video(
+                str(path),
+                geom,
+                detector_mode="motion",
+                preview_every=0,
+                start_s=0.0,
+                end_s=1.0,
+                progress_cb=progress,
+            )
+        self.assertIsNone(result.error)
+        self.assertAlmostEqual(result.video.duration_s, 1.0, delta=0.2)
+        self.assertLessEqual(max(totals), 12)
 
 
 if __name__ == "__main__":

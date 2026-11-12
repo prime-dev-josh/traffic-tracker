@@ -8,8 +8,18 @@ from typing import Any, Literal
 import json
 
 from traffic_tracker.core.geometry import Geometry, Transform
+from traffic_tracker.core.video import clamp_clip_window
 
 ClipStatus = Literal["reference", "needs_align", "aligned", "redrawn"]
+
+
+@dataclass
+class ProcessJob:
+    path: Path
+    geometry: Geometry
+    start_s: float = 0.0
+    end_s: float | None = None
+    duration_s: float = 0.0
 
 
 @dataclass
@@ -18,13 +28,21 @@ class ClipRecord:
     status: ClipStatus = "needs_align"
     transform: Transform = field(default_factory=Transform)
     geometry_override: Geometry | None = None
+    process_start_s: float = 0.0
+    process_end_s: float | None = None
+
+    def window(self, duration_s: float) -> tuple[float, float]:
+        return clamp_clip_window(self.process_start_s, self.process_end_s, duration_s)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "path": str(self.path),
             "status": self.status,
             "transform": self.transform.to_dict(),
+            "process_start_s": self.process_start_s,
         }
+        if self.process_end_s is not None:
+            data["process_end_s"] = self.process_end_s
         if self.geometry_override is not None:
             data["geometry_override"] = self.geometry_override.to_dict()
         return data
@@ -35,11 +53,22 @@ class ClipRecord:
         status = data.get("status", "needs_align")
         if status not in ("reference", "needs_align", "aligned", "redrawn"):
             status = "needs_align"
+        end_raw = data.get("process_end_s")
+        try:
+            start_s = float(data.get("process_start_s") or 0.0)
+        except (TypeError, ValueError):
+            start_s = 0.0
+        try:
+            end_s = float(end_raw) if end_raw is not None else None
+        except (TypeError, ValueError):
+            end_s = None
         return cls(
             path=Path(data["path"]),
             status=status,
             transform=Transform.from_dict(data.get("transform")),
             geometry_override=Geometry.from_dict(override) if override else None,
+            process_start_s=max(0.0, start_s),
+            process_end_s=None if end_s is None else max(0.0, end_s),
         )
 
 
@@ -72,25 +101,30 @@ class BundleProject:
         if videos:
             self.reference = videos[0]
 
-    def ready_jobs(self, reference_geometry: Geometry) -> list[tuple[Path, Geometry]]:
+    def ready_jobs(self, reference_geometry: Geometry) -> list[ProcessJob]:
         """Confirmed clips with geometry ready for processing."""
-        jobs: list[tuple[Path, Geometry]] = []
+        jobs: list[ProcessJob] = []
         for clip in self.clips:
             if clip.status == "needs_align":
                 continue
-            if clip.status == "redrawn" and clip.geometry_override is not None:
-                jobs.append((clip.path, clip.geometry_override))
-                continue
+            duration_s = 0.0
             probe_w, probe_h = reference_geometry.frame_width, reference_geometry.frame_height
             try:
                 from traffic_tracker.core.video import probe_video
 
                 info = probe_video(clip.path)
                 probe_w, probe_h = info.width, info.height
+                duration_s = info.duration_s
             except Exception:
                 pass
+            start_s, end_s = clip.window(duration_s)
+            if clip.status == "redrawn" and clip.geometry_override is not None:
+                jobs.append(ProcessJob(clip.path, clip.geometry_override, start_s, end_s, duration_s))
+                continue
             fitted = reference_geometry.scaled_to(probe_w, probe_h)
-            jobs.append((clip.path, clip.transform.apply_geometry(fitted)))
+            jobs.append(
+                ProcessJob(clip.path, clip.transform.apply_geometry(fitted), start_s, end_s, duration_s)
+            )
         return jobs
 
     def to_dict(self) -> dict[str, Any]:

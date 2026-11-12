@@ -32,7 +32,7 @@ class FrameCanvas(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(640, 400)
+        self.setMinimumSize(320, 180)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
         self._pixmap = QPixmap()
@@ -53,6 +53,7 @@ class FrameCanvas(QWidget):
         self.on_nudge: Callable[[float, float], None] | None = None
         self.on_scale: Callable[[float], None] | None = None
         self.on_point: Callable[[float, float], None] | None = None
+        self._empty_message = "Load a video to see a frame here"
 
     def set_mode(self, mode: Mode) -> None:
         self._mode = mode
@@ -90,6 +91,14 @@ class FrameCanvas(QWidget):
         self._image_size = (width, height)
         image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(image)
+        self.update()
+
+    def clear_frame(self, message: str | None = None) -> None:
+        """Drop the current still so a new process does not keep the last preview."""
+        self._pixmap = QPixmap()
+        self._image_size = (1, 1)
+        if message is not None:
+            self._empty_message = message
         self.update()
 
     def set_geometry(self, geometry: Geometry | None) -> None:
@@ -255,7 +264,7 @@ class FrameCanvas(QWidget):
         painter.fillRect(self.rect(), letterbox)
         if self._pixmap.isNull():
             painter.setPen(QColor(36, 50, 138) if self._theme == "light" else LABEL_COLOR)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Load a video to see a frame here")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._empty_message)
             return
 
         rect = self._display_rect()

@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 from traffic_tracker.core.geometry import Box, Geometry, Line, NamedLine, Transform, transform_from_matches
 from traffic_tracker.core.project import BundleProject, ClipRecord
-from traffic_tracker.core.video import format_duration, is_onedrive_path
+from traffic_tracker.core.video import clamp_clip_window, format_clip_window, format_duration, is_onedrive_path
 
 
 def _geom(width: int = 200, height: int = 100) -> Geometry:
@@ -77,7 +77,24 @@ class ProjectTests(unittest.TestCase):
         ]
         jobs = project.ready_jobs(geom)
         self.assertEqual(len(jobs), 1)
-        self.assertEqual(jobs[0][0], Path("a.mp4"))
+        self.assertEqual(jobs[0].path, Path("a.mp4"))
+        self.assertEqual(jobs[0].start_s, 0.0)
+
+    def test_clip_window_roundtrip(self) -> None:
+        geom = Geometry(10, 10)
+        project = BundleProject(reference=Path("a.mp4"), geometry=geom)
+        project.clips = [
+            ClipRecord(Path("a.mp4"), status="reference", process_start_s=12.0, process_end_s=210.0)
+        ]
+        with TemporaryDirectory() as raw:
+            path = Path(raw) / "bundle.ttproj.json"
+            project.save(path)
+            loaded = BundleProject.load(path)
+        self.assertEqual(loaded.clips[0].process_start_s, 12.0)
+        self.assertEqual(loaded.clips[0].process_end_s, 210.0)
+        start, end = loaded.clips[0].window(240.0)
+        self.assertEqual(start, 12.0)
+        self.assertEqual(end, 210.0)
 
     def test_project_file_roundtrip(self) -> None:
         geom = Geometry(
@@ -102,6 +119,22 @@ class VideoHelperTests(unittest.TestCase):
     def test_format_duration(self) -> None:
         self.assertEqual(format_duration(90), "1m 30s")
         self.assertTrue(format_duration(3700).startswith("1h"))
+
+    def test_clamp_clip_window_drops_the_tail(self) -> None:
+        start, end = clamp_clip_window(0.0, 210.0, 240.0)
+        self.assertEqual(start, 0.0)
+        self.assertEqual(end, 210.0)
+        start, end = clamp_clip_window(None, None, 240.0)
+        self.assertEqual((start, end), (0.0, 240.0))
+        start, end = clamp_clip_window(300.0, 10.0, 240.0)
+        self.assertGreaterEqual(end - start, 1.0)
+        self.assertLessEqual(end, 240.0)
+
+    def test_format_clip_window_mentions_skipped_tail(self) -> None:
+        text = format_clip_window(0.0, 210.0, 240.0)
+        self.assertIn("skip last", text)
+        self.assertIn("30s", text)
+        self.assertIn("Full clip", format_clip_window(0.0, 240.0, 240.0))
 
     def test_onedrive_detect(self) -> None:
         self.assertTrue(is_onedrive_path(Path("C:/Users/x/OneDrive - Firm/clip.mp4")))

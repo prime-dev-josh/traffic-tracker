@@ -70,6 +70,41 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m {secs:02d}s"
 
 
+def clamp_clip_window(
+    start_s: float | None,
+    end_s: float | None,
+    duration_s: float,
+) -> tuple[float, float]:
+    """Return a start/end pair inside the clip. End is exclusive of the unused tail."""
+    duration = max(0.0, float(duration_s or 0.0))
+    start = 0.0 if start_s is None else float(start_s)
+    end = duration if end_s is None else float(end_s)
+    start = min(max(0.0, start), duration)
+    end = min(max(0.0, end), duration)
+    min_span = min(1.0, duration) if duration > 0 else 0.0
+    if end < start + min_span:
+        if start + min_span <= duration:
+            end = min(duration, start + min_span)
+        else:
+            start = max(0.0, end - min_span)
+    return start, end
+
+
+def format_clip_window(start_s: float | None, end_s: float | None, duration_s: float) -> str:
+    start, end = clamp_clip_window(start_s, end_s, duration_s)
+    if duration_s <= 0:
+        return "Full clip"
+    if start <= 0.05 and end >= duration_s - 0.05:
+        return f"Full clip · {format_duration(duration_s)}"
+    parts = [f"{format_duration(start)}–{format_duration(end)} of {format_duration(duration_s)}"]
+    if start > 0.2:
+        parts.append(f"skip first {format_duration(start)}")
+    tail = duration_s - end
+    if tail > 0.2:
+        parts.append(f"skip last {format_duration(tail)}")
+    return " · ".join(parts)
+
+
 def file_size_gb(path: str | Path) -> float:
     try:
         return Path(path).stat().st_size / (1024**3)
@@ -113,9 +148,19 @@ def grab_frame_at(path: str | Path, time_s: float) -> tuple[np.ndarray, int]:
         cap.release()
 
 
-def grab_random_frame(path: str | Path, rng: random.Random | None = None) -> tuple[np.ndarray, int]:
+def grab_random_frame(
+    path: str | Path,
+    rng: random.Random | None = None,
+    start_s: float | None = None,
+    end_s: float | None = None,
+) -> tuple[np.ndarray, int]:
     """Return (BGR frame, frame index) from the middle portion of the video."""
     info = probe_video(path)
+    if start_s is not None or end_s is not None:
+        start, end = clamp_clip_window(start_s, end_s, info.duration_s)
+        picker = rng or random.Random()
+        t = start + picker.random() * max(0.0, end - start)
+        return grab_frame_at(path, t)
     if info.frame_count <= 1:
         cap = cv2.VideoCapture(str(path))
         ok, frame = cap.read()

@@ -168,6 +168,15 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(loaded.preview_every, 0)
             self.assertFalse(loaded.infer_trips_from_traces)
 
+    def test_missing_theme_defaults_to_light(self) -> None:
+        from traffic_tracker.config import SETTINGS_FILE_NAME
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / SETTINGS_FILE_NAME).write_text('{"export_dir": "out"}', encoding="utf-8")
+            self.assertEqual(load_settings(base).theme, "light")
+            self.assertEqual(AppSettings().theme, "light")
+
     def test_missing_export_pattern_uses_default(self) -> None:
         from traffic_tracker.config import SETTINGS_FILE_NAME
 

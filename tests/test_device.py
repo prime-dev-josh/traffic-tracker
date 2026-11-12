@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from traffic_tracker.core.device import (
     device_report,
+    inference_device_label,
     nvidia_gpu_names,
     reset_device_cache,
     torch_cuda_build,
@@ -43,6 +44,18 @@ class DeviceReportTests(unittest.TestCase):
 
     def test_torch_cuda_build_reads_version(self) -> None:
         self.assertIsInstance(torch_cuda_build(), bool)
+
+    def test_inference_device_label_marks_fp16(self) -> None:
+        with patch(
+            "traffic_tracker.core.device.describe_device",
+            return_value="CUDA (NVIDIA GeForce RTX 4060)",
+        ):
+            self.assertEqual(
+                inference_device_label("cuda"),
+                "CUDA (NVIDIA GeForce RTX 4060) • FP16",
+            )
+        self.assertEqual(inference_device_label("cpu"), "CPU")
+        self.assertEqual(inference_device_label("mps"), "MPS (Apple Silicon)")
 
     def test_yolo_runtime_uses_cuda_index_and_fp16(self) -> None:
         self.assertEqual(yolo_runtime("cuda"), (0, 16))

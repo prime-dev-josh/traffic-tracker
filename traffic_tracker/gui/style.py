@@ -259,6 +259,24 @@ QScrollBar::handle:horizontal {
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
 }
+QSplitter::handle {
+    background-color: #4A4278;
+    border-radius: 2px;
+}
+QSplitter::handle:hover {
+    background-color: #F15B2C;
+}
+QSplitter::handle:horizontal {
+    width: 10px;
+    margin: 0 3px;
+}
+QSplitter::handle:vertical {
+    height: 10px;
+    margin: 3px 0;
+}
+QComboBox#flowCombo {
+    min-width: 118px;
+}
 QTabWidget::pane {
     border: 1px solid #4A4278;
     background-color: #2C2460;
@@ -518,6 +536,24 @@ QScrollBar::handle:horizontal {
 }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
+}
+QSplitter::handle {
+    background-color: #D4D8EC;
+    border-radius: 2px;
+}
+QSplitter::handle:hover {
+    background-color: #F05D2A;
+}
+QSplitter::handle:horizontal {
+    width: 10px;
+    margin: 0 3px;
+}
+QSplitter::handle:vertical {
+    height: 10px;
+    margin: 3px 0;
+}
+QComboBox#flowCombo {
+    min-width: 118px;
 }
 QTabWidget::pane {
     border: 1px solid #D4D8EC;

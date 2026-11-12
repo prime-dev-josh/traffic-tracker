@@ -117,11 +117,13 @@ from traffic_tracker.core.detector import (
     load_detector,
     reset_detector_cache,
 )
-from traffic_tracker.core.device import device_report
+from traffic_tracker.core.device import device_report, inference_device_label
 from traffic_tracker.core.training import visdrone_weights_path
 from traffic_tracker.gui.style import load_brand_pixmap, stylesheet_for
 from traffic_tracker.core.video import (
+    clamp_clip_window,
     file_size_gb,
+    format_clip_window,
     format_duration,
     grab_frame_at,
     grab_random_frame,
@@ -130,8 +132,10 @@ from traffic_tracker.core.video import (
     list_videos_in_folder,
     probe_video,
 )
+from traffic_tracker.gui.wheel_guard import ComboWheelGuard
+from traffic_tracker.gui.widgets.flow_layout import FlowLayout
 from traffic_tracker.gui.widgets.frame_canvas import FrameCanvas
-from traffic_tracker.gui.widgets.home_menu import HomeStage
+from traffic_tracker.gui.widgets.responsive_split import ResponsiveSplit
 from traffic_tracker.gui.worker import ProcessWorker, TrainWorker
 
 (
@@ -169,11 +173,14 @@ class MainWindow(QMainWindow):
         self._redraw_target = None
         self._align_index = 0
         self._ref_frame = None
+        self._check_frame = None
+        self._check_frame_note = ""
         self._ref_size = (1, 1)
         self._match_ref: list[tuple[float, float]] = []
         self._match_clip: list[tuple[float, float]] = []
         self._match_side = "ref"
         self._redrawing = False
+        self._filling_clip_window = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -203,11 +210,30 @@ class MainWindow(QMainWindow):
         self.header_bar.setVisible(False)
         self._root_layout.addWidget(self.header_bar)
 
-        self.steps = QLabel("1. Videos   →   2. Routes   →   3. Align   →   4. Process   →   5. Report")
-        self.steps.setObjectName("hint")
-        self.steps.setContentsMargins(16, 8, 16, 0)
-        self.steps.setVisible(False)
-        self._root_layout.addWidget(self.steps)
+        self.steps = QWidget()
+        self.steps.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        step_flow = FlowLayout(self.steps, spacing=8)
+        self.step_buttons: list[tuple[int, QPushButton]] = []
+        for page, label in (
+            (PAGE_SETUP, "1. Videos"),
+            (PAGE_ROUTES, "2. Routes"),
+            (PAGE_ALIGN, "3. Align"),
+            (PAGE_PROCESS, "4. Process"),
+            (PAGE_REPORT, "5. Report"),
+        ):
+            button = QPushButton(label)
+            button.setMinimumHeight(36)
+            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _checked=False, target=page: self._go_step(target))
+            step_flow.addWidget(button)
+            self.step_buttons.append((page, button))
+        step_host = QWidget()
+        step_host_layout = QVBoxLayout(step_host)
+        step_host_layout.setContentsMargins(16, 8, 16, 0)
+        step_host_layout.addWidget(self.steps)
+        self.step_host = step_host
+        self.step_host.setVisible(False)
+        self._root_layout.addWidget(self.step_host)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_home_page())
@@ -227,6 +253,12 @@ class MainWindow(QMainWindow):
         self._root_layout.addWidget(self.content_shell, 1)
 
         self.statusBar().hide()
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            self._wheel_guard = ComboWheelGuard(self)
+            app.installEventFilter(self._wheel_guard)
         self._apply_theme(self.settings.theme)
         self._sync_detector_ui()
         QTimer.singleShot(0, self._refresh_device_status)
@@ -259,29 +291,57 @@ class MainWindow(QMainWindow):
         return button
 
     def _build_home_page(self) -> QWidget:
-        self.home_stage = HomeStage(
-            [
-                (
-                    "01",
-                    "Process",
-                    "Add clips, set North and gates, align later videos, then export the TMC.",
-                    self._go_process_feature,
-                ),
-                (
-                    "02",
-                    "Training",
-                    "Train VisDrone once. New installs need this; weights are not bundled.",
-                    self._go_training,
-                ),
-                (
-                    "03",
-                    "Settings",
-                    "Export folder, OneDrive warning, and Motion vs Trained detector.",
-                    self._go_settings,
-                ),
-            ]
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setSpacing(8)
+        logo = QLabel()
+        logo.setObjectName("brandMark")
+        self.home_logo = logo
+        layout.addWidget(logo)
+        title = QLabel(APP_NAME)
+        title.setObjectName("title")
+        layout.addWidget(title)
+        subtitle = QLabel("Count vehicles across N, S, E, and W gates, then export a 15-minute TMC.")
+        subtitle.setObjectName("subtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+        layout.addSpacing(12)
+        choices = (
+            (
+                "Process",
+                "Add clips, set North and gates, align later videos, then export the TMC.",
+                self._go_process_feature,
+                True,
+            ),
+            (
+                "Training",
+                "Train VisDrone once. New installs need this; weights are not bundled.",
+                self._go_training,
+                False,
+            ),
+            (
+                "Settings",
+                "Theme, export folder, and Motion vs Trained detector.",
+                self._go_settings,
+                False,
+            ),
         )
-        return self.home_stage
+        for label, blurb, slot, primary in choices:
+            button = QPushButton(label)
+            button.setMinimumHeight(52)
+            if primary:
+                button.setObjectName("primary")
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+            hint = QLabel(blurb)
+            hint.setObjectName("hint")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            layout.addSpacing(6)
+        layout.addStretch(1)
+        self.home_stage = page
+        return page
 
     def _build_training_page(self) -> QWidget:
         page = QWidget()
@@ -529,11 +589,15 @@ class MainWindow(QMainWindow):
         speed_hint = QLabel(
             "These only change how fast a clip processes. GPU FP16 is used automatically when CUDA is available. "
             "A smaller detect size and detecting every 2nd or 3rd frame are faster but can miss small cars. "
-            "Live preview off skips drawing while the clip runs."
+            "Live preview is on the process page so you can turn it off while a clip is running."
         )
         speed_hint.setObjectName("hint")
         speed_hint.setWordWrap(True)
         form.addWidget(speed_hint)
+        self.speed_device_status = QLabel("Checking GPU…")
+        self.speed_device_status.setObjectName("hint")
+        self.speed_device_status.setWordWrap(True)
+        form.addWidget(self.speed_device_status)
 
         imgsz_row = QHBoxLayout()
         imgsz_row.addWidget(QLabel("Detect size"))
@@ -567,44 +631,54 @@ class MainWindow(QMainWindow):
         stride_row.addWidget(self.detect_stride_combo, 1)
         form.addLayout(stride_row)
 
-        preview_row = QHBoxLayout()
-        preview_row.addWidget(QLabel("Live preview"))
-        self.preview_every_combo = QComboBox()
-        preview_labels = {0: "Off", 15: "Every 15 frames", 30: "Every 30 frames", 60: "Every 60 frames"}
-        for every in PREVIEW_EVERY_CHOICES:
-            self.preview_every_combo.addItem(preview_labels.get(every, str(every)), every)
-        self.preview_every_combo.setCurrentIndex(
-            max(0, self.preview_every_combo.findData(self.settings.preview_every))
-        )
-        self.preview_every_combo.setToolTip("Off is fastest. Counts do not depend on the live picture.")
-        self.preview_every_combo.currentIndexChanged.connect(self._settings_changed)
-        preview_row.addWidget(self.preview_every_combo, 1)
-        form.addLayout(preview_row)
-
         form.addStretch(1)
         layout.addWidget(card, 1)
         scroll.setWidget(body)
 
-        split = QHBoxLayout()
-        split.setContentsMargins(0, 0, 0, 0)
-        split.setSpacing(16)
-        split.addWidget(scroll, 1)
-
         preview_card = self._card()
         preview = QVBoxLayout(preview_card)
-        preview.addWidget(self._step_title("Frame check"))
+        check_header = QHBoxLayout()
+        check_header.addWidget(self._step_title("Frame check"))
+        check_header.addStretch(1)
+        random_frame = QPushButton("Random Frame")
+        random_frame.setObjectName("primary")
+        random_frame.setToolTip("Grab a new still from the selected clip and rerun the detector. Does not change the route drawing frame.")
+        random_frame.clicked.connect(self._random_check_frame)
+        check_header.addWidget(random_frame)
+        preview.addLayout(check_header)
         self.frame_check_status = QLabel(
-            "Freeze this still and rerun the detector when confidence, overlap, or weights change. Not a full clip."
+            "Add clips here or on Process, then Random Frame. Changing confidence or overlap reruns this still."
         )
         self.frame_check_status.setObjectName("hint")
         self.frame_check_status.setWordWrap(True)
         preview.addWidget(self.frame_check_status)
         self.check_canvas = FrameCanvas()
         self.check_canvas.set_mode("view")
-        self.check_canvas.setMinimumSize(360, 240)
+        self.check_canvas.setMinimumSize(320, 180)
         preview.addWidget(self.check_canvas, 1)
-        split.addWidget(preview_card, 1)
-        outer.addLayout(split)
+        self.settings_video_list = QListWidget()
+        self.settings_video_list.setMaximumHeight(110)
+        preview.addWidget(self.settings_video_list)
+        clip_buttons = QHBoxLayout()
+        add_video = QPushButton("Add video")
+        add_folder = QPushButton("Add folder")
+        remove = QPushButton("Remove")
+        add_video.clicked.connect(self._add_videos)
+        add_folder.clicked.connect(self._add_folder)
+        remove.clicked.connect(self._remove_selected_videos)
+        clip_buttons.addWidget(add_video)
+        clip_buttons.addWidget(add_folder)
+        clip_buttons.addWidget(remove)
+        preview.addLayout(clip_buttons)
+        outer.addWidget(
+            ResponsiveSplit(
+                scroll,
+                preview_card,
+                narrow_picture_first=False,
+                leading_stretch=1,
+                trailing_stretch=1,
+            )
+        )
 
         self._frame_check_timer = QTimer(self)
         self._frame_check_timer.setSingleShot(True)
@@ -648,8 +722,8 @@ class MainWindow(QMainWindow):
 
     def _build_setup_page(self) -> QWidget:
         page = QWidget()
-        row = QHBoxLayout(page)
-        row.setSpacing(16)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         left = self._card()
         left_layout = QVBoxLayout(left)
@@ -719,7 +793,6 @@ class MainWindow(QMainWindow):
         next_btn.setObjectName("primary")
         next_btn.clicked.connect(self._go_routes)
         left_layout.addWidget(next_btn)
-        row.addWidget(left, 1)
 
         right = self._card()
         right_layout = QVBoxLayout(right)
@@ -737,13 +810,15 @@ class MainWindow(QMainWindow):
         help_text.setWordWrap(True)
         right_layout.addWidget(help_text)
         right_layout.addStretch(1)
-        row.addWidget(right, 1)
+        outer.addWidget(
+            ResponsiveSplit(left, right, narrow_picture_first=False, leading_stretch=1, trailing_stretch=1)
+        )
         return page
 
     def _build_routes_page(self) -> QWidget:
         page = QWidget()
-        row = QHBoxLayout(page)
-        row.setSpacing(16)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         left = self._card()
         left_layout = QVBoxLayout(left)
@@ -869,17 +944,24 @@ class MainWindow(QMainWindow):
         self.canvas.on_box_drawn = self._on_setup_box_drawn
         self.canvas.on_polygon_finished = self._on_roadway_finished
         right_layout.addWidget(self.canvas, 1)
-        row.addWidget(left, 0)
-        row.addWidget(right, 1)
-        left.setMinimumWidth(420)
-        left.setMaximumWidth(480)
+        left.setMinimumWidth(360)
+        outer.addWidget(
+            ResponsiveSplit(
+                left,
+                right,
+                narrow_picture_first=True,
+                leading_stretch=0,
+                trailing_stretch=1,
+                leading_max=520,
+            )
+        )
         self._refresh_route_list()
         return page
 
     def _build_align_page(self) -> QWidget:
         page = QWidget()
-        row = QHBoxLayout(page)
-        row.setSpacing(16)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
 
         left = self._card()
         left_layout = QVBoxLayout(left)
@@ -957,7 +1039,7 @@ class MainWindow(QMainWindow):
         nav.addWidget(back)
         nav.addWidget(nxt)
         left_layout.addLayout(nav)
-        left.setMaximumWidth(380)
+        left.setMinimumWidth(320)
 
         right = self._card()
         right_layout = QVBoxLayout(right)
@@ -977,16 +1059,60 @@ class MainWindow(QMainWindow):
         self.align_time_label.setObjectName("hint")
         right_layout.addWidget(self.align_time_label)
 
-        canvases = QHBoxLayout()
-        ref_box = QVBoxLayout()
+        right_layout.addWidget(self._section("Count window"))
+        trim_hint = QLabel(
+            "Only this span is processed. Seek the preview, then Start here / End here "
+            "to drop takeoff or the flight home."
+        )
+        trim_hint.setObjectName("hint")
+        trim_hint.setWordWrap(True)
+        right_layout.addWidget(trim_hint)
+        trim_grid = QGridLayout()
+        trim_grid.addWidget(QLabel("From"), 0, 0)
+        self.clip_start_spin = QDoubleSpinBox()
+        self.clip_start_spin.setDecimals(1)
+        self.clip_start_spin.setSuffix(" s")
+        self.clip_start_spin.setRange(0.0, 24 * 3600.0)
+        self.clip_start_spin.setSingleStep(1.0)
+        self.clip_start_spin.valueChanged.connect(self._clip_window_changed)
+        trim_grid.addWidget(self.clip_start_spin, 0, 1)
+        start_here = QPushButton("Start here")
+        start_here.setToolTip("Count from this preview frame.")
+        start_here.clicked.connect(self._clip_start_here)
+        trim_grid.addWidget(start_here, 0, 2)
+        trim_grid.addWidget(QLabel("Until"), 1, 0)
+        self.clip_end_spin = QDoubleSpinBox()
+        self.clip_end_spin.setDecimals(1)
+        self.clip_end_spin.setSuffix(" s")
+        self.clip_end_spin.setRange(0.0, 24 * 3600.0)
+        self.clip_end_spin.setSingleStep(1.0)
+        self.clip_end_spin.valueChanged.connect(self._clip_window_changed)
+        trim_grid.addWidget(self.clip_end_spin, 1, 1)
+        end_here = QPushButton("End here")
+        end_here.setToolTip("Stop counting at this preview frame.")
+        end_here.clicked.connect(self._clip_end_here)
+        trim_grid.addWidget(end_here, 1, 2)
+        reset_trim = QPushButton("Full clip")
+        reset_trim.clicked.connect(self._clip_window_reset)
+        trim_grid.addWidget(reset_trim, 0, 3, 2, 1)
+        right_layout.addLayout(trim_grid)
+        self.clip_window_label = QLabel("Full clip")
+        self.clip_window_label.setObjectName("hint")
+        self.clip_window_label.setWordWrap(True)
+        right_layout.addWidget(self.clip_window_label)
+
+        ref_host = QWidget()
+        ref_box = QVBoxLayout(ref_host)
+        ref_box.setContentsMargins(0, 0, 0, 0)
         ref_box.addWidget(QLabel("Reference (for match points)"))
         self.ref_canvas = FrameCanvas()
-        self.ref_canvas.setMinimumSize(280, 180)
+        self.ref_canvas.setMinimumSize(320, 180)
         self.ref_canvas.on_point = self._on_ref_point
         ref_box.addWidget(self.ref_canvas, 1)
-        canvases.addLayout(ref_box, 1)
 
-        clip_box = QVBoxLayout()
+        clip_host = QWidget()
+        clip_box = QVBoxLayout(clip_host)
+        clip_box.setContentsMargins(0, 0, 0, 0)
         clip_box.addWidget(QLabel("This clip — drag overlay"))
         self.align_canvas = FrameCanvas()
         self.align_canvas.on_nudge = self._on_nudge
@@ -994,11 +1120,28 @@ class MainWindow(QMainWindow):
         self.align_canvas.on_point = self._on_clip_point
         self.align_canvas.on_line_drawn = self._on_redraw_line
         clip_box.addWidget(self.align_canvas, 1)
-        canvases.addLayout(clip_box, 2)
-        right_layout.addLayout(canvases, 1)
+        right_layout.addWidget(
+            ResponsiveSplit(
+                ref_host,
+                clip_host,
+                breakpoint=800,
+                narrow_picture_first=True,
+                leading_stretch=1,
+                trailing_stretch=2,
+            ),
+            1,
+        )
 
-        row.addWidget(left, 0)
-        row.addWidget(right, 1)
+        outer.addWidget(
+            ResponsiveSplit(
+                left,
+                right,
+                narrow_picture_first=True,
+                leading_stretch=0,
+                trailing_stretch=1,
+                leading_max=420,
+            )
+        )
         return page
 
     def _build_process_page(self) -> QWidget:
@@ -1012,14 +1155,35 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         layout.addWidget(self.progress)
-        body = QHBoxLayout()
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("Live preview"))
+        self.preview_every_combo = QComboBox()
+        preview_labels = {0: "Off", 15: "Every 15 frames", 30: "Every 30 frames", 60: "Every 60 frames"}
+        for every in PREVIEW_EVERY_CHOICES:
+            self.preview_every_combo.addItem(preview_labels.get(every, str(every)), every)
+        self.preview_every_combo.setCurrentIndex(
+            max(0, self.preview_every_combo.findData(self.settings.preview_every))
+        )
+        self.preview_every_combo.setToolTip(
+            "Off is fastest and can be changed while the clip runs. Counts do not use the live picture."
+        )
+        self.preview_every_combo.currentIndexChanged.connect(self._live_preview_changed)
+        preview_row.addWidget(self.preview_every_combo, 1)
+        layout.addLayout(preview_row)
         self.preview_canvas = FrameCanvas()
         self.preview_canvas.set_mode("view")
-        body.addWidget(self.preview_canvas, 3)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        body.addWidget(self.log, 2)
-        layout.addLayout(body, 1)
+        layout.addWidget(
+            ResponsiveSplit(
+                self.preview_canvas,
+                self.log,
+                narrow_picture_first=False,
+                leading_stretch=3,
+                trailing_stretch=2,
+            ),
+            1,
+        )
         nav = QHBoxLayout()
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("danger")
@@ -1066,9 +1230,11 @@ class MainWindow(QMainWindow):
         self.report_tabs.addTab(gates_page, "Gate Statistics")
         self.report_tabs.addTab(self.tmc_table, "TMC Summary")
         review_page = QWidget()
-        review_layout = QHBoxLayout(review_page)
+        review_layout = QVBoxLayout(review_page)
         review_layout.setContentsMargins(0, 0, 0, 0)
-        review_col = QVBoxLayout()
+        issue_host = QWidget()
+        review_col = QVBoxLayout(issue_host)
+        review_col.setContentsMargins(0, 0, 0, 0)
         review_hint = QLabel(
             "Dots mark every drop, jump, and stacked box. Click a row to seek that still and highlight the event."
         )
@@ -1078,17 +1244,26 @@ class MainWindow(QMainWindow):
         self.issue_list = QListWidget()
         self.issue_list.itemClicked.connect(self._seek_review_issue)
         review_col.addWidget(self.issue_list, 1)
-        review_layout.addLayout(review_col, 1)
-        review_still = QVBoxLayout()
+        still_host = QWidget()
+        review_still = QVBoxLayout(still_host)
+        review_still.setContentsMargins(0, 0, 0, 0)
         self.review_status = QLabel("All issues on this clip.")
         self.review_status.setObjectName("hint")
         self.review_status.setWordWrap(True)
         review_still.addWidget(self.review_status)
         self.review_canvas = FrameCanvas()
         self.review_canvas.set_mode("view")
-        self.review_canvas.setMinimumSize(360, 220)
+        self.review_canvas.setMinimumSize(320, 180)
         review_still.addWidget(self.review_canvas, 1)
-        review_layout.addLayout(review_still, 2)
+        review_layout.addWidget(
+            ResponsiveSplit(
+                issue_host,
+                still_host,
+                narrow_picture_first=True,
+                leading_stretch=1,
+                trailing_stretch=2,
+            )
+        )
         self.report_tabs.addTab(review_page, "Review")
         layout.addWidget(self.report_tabs, 1)
         nav = QHBoxLayout()
@@ -1104,7 +1279,12 @@ class MainWindow(QMainWindow):
         return page
 
     def _refresh_device_status(self) -> None:
-        self.statusBar().showMessage("Ready  •  motion mask")
+        report = device_report()
+        text = f"Inference: {inference_device_label(report.device)}"
+        if report.device == "cpu" and report.warning:
+            text = f"{text}. {report.warning}"
+        if hasattr(self, "speed_device_status"):
+            self.speed_device_status.setText(text)
 
     def _step_title(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -1126,9 +1306,13 @@ class MainWindow(QMainWindow):
             return f"{path.name}  (unreadable: {exc})"
 
     def _refresh_setup_list(self) -> None:
-        self.video_list.clear()
-        for path in self.videos:
-            self.video_list.addItem(self._video_label(path))
+        labels = [self._video_label(path) for path in self.videos]
+        for widget in (getattr(self, "video_list", None), getattr(self, "settings_video_list", None)):
+            if widget is None:
+                continue
+            widget.clear()
+            for label in labels:
+                widget.addItem(label)
         if self.settings.warn_onedrive and self.videos and any(is_onedrive_path(p) for p in self.videos):
             self.onedrive_warn.setText(
                 "These files are under OneDrive. Seeking 2–5 GB clips over sync is slow and can stall. "
@@ -1154,22 +1338,52 @@ class MainWindow(QMainWindow):
             self._append_videos(list_videos_in_folder(folder))
 
     def _append_videos(self, paths: list[Path]) -> None:
+        added = False
         for path in paths:
             if not is_video_file(path):
                 continue
             if path not in self.videos:
                 self.videos.append(path)
+                added = True
         self.project.ensure_clips(self.videos)
         self._refresh_setup_list()
         self.statusBar().showMessage(f"{len(self.videos)} video(s) queued")
+        if added and hasattr(self, "stack") and self.stack.currentIndex() == PAGE_SETTINGS:
+            if self._check_frame is None:
+                self._load_check_still()
+            else:
+                self._schedule_frame_check()
+        else:
+            self._schedule_frame_check()
+
+    def _selected_video_rows(self) -> list[int]:
+        rows: set[int] = set()
+        for widget in (getattr(self, "video_list", None), getattr(self, "settings_video_list", None)):
+            if widget is None:
+                continue
+            rows.update(idx.row() for idx in widget.selectedIndexes())
+        return sorted(rows, reverse=True)
+
+    def _selected_video_path(self) -> Path | None:
+        for widget in (getattr(self, "settings_video_list", None), getattr(self, "video_list", None)):
+            if widget is None:
+                continue
+            row = widget.currentRow()
+            if 0 <= row < len(self.videos):
+                return self.videos[row]
+        return self.videos[0] if self.videos else None
 
     def _remove_selected_videos(self) -> None:
-        rows = sorted({idx.row() for idx in self.video_list.selectedIndexes()}, reverse=True)
+        rows = self._selected_video_rows()
         for row in rows:
             if 0 <= row < len(self.videos):
                 del self.videos[row]
         self.project.ensure_clips(self.videos)
+        if self._selected_video_path() is None:
+            self._check_frame = None
+            self._check_frame_note = ""
         self._refresh_setup_list()
+        self._schedule_frame_check()
 
     def _choose_export_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose export folder")
@@ -1306,6 +1520,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(label, 1)
         if name_options and on_name:
             combo = QComboBox()
+            combo.setObjectName("nameCombo")
+            combo.setMinimumWidth(44)
             for name in name_options:
                 combo.addItem(name, name)
             if current_name:
@@ -1314,6 +1530,9 @@ class MainWindow(QMainWindow):
             layout.addWidget(combo)
         if flow_options and on_flow:
             flow = QComboBox()
+            flow.setObjectName("flowCombo")
+            flow.setMinimumWidth(118)
+            flow.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
             for value in flow_options:
                 flow.addItem(GATE_FLOW_LABELS.get(value, value), value)
             if current_flow:
@@ -2009,7 +2228,9 @@ class MainWindow(QMainWindow):
         self._match_side = "ref"
         try:
             info = probe_video(clip.path)
-            t = min(info.duration_s * 0.2, max(0.0, info.duration_s - 0.1))
+            start_s, end_s = clip.window(info.duration_s)
+            span = max(0.0, end_s - start_s)
+            t = min(start_s + span * 0.2, max(start_s, end_s - 0.1))
             frame, _ = grab_frame_at(clip.path, t)
             self.align_canvas.set_frame(frame)
             self.align_time.setValue(int(t / info.duration_s * 1000) if info.duration_s else 0)
@@ -2020,6 +2241,7 @@ class MainWindow(QMainWindow):
         self.rotate_spin.blockSignals(True)
         self.rotate_spin.setValue(clip.transform.rotation_deg)
         self.rotate_spin.blockSignals(False)
+        self._load_clip_window(clip, info)
         self.align_canvas.set_geometry(self._fitted_overlay(clip))
         self.align_canvas.set_match_points([])
         self.ref_canvas.set_match_points([])
@@ -2038,9 +2260,10 @@ class MainWindow(QMainWindow):
         if clip is None:
             return
         try:
-            frame, index = grab_random_frame(clip.path)
-            self.align_canvas.set_frame(frame)
             info = probe_video(clip.path)
+            start_s, end_s = clip.window(info.duration_s)
+            frame, index = grab_random_frame(clip.path, start_s=start_s, end_s=end_s)
+            self.align_canvas.set_frame(frame)
             t = index / info.fps if info.fps else 0
             self.align_time.setValue(int(t / info.duration_s * 1000) if info.duration_s else 0)
             self.align_time_label.setText(format_duration(t))
@@ -2054,13 +2277,94 @@ class MainWindow(QMainWindow):
             return
         try:
             info = probe_video(clip.path)
-            t = (self.align_time.value() / 1000.0) * info.duration_s
+            t = self._align_slider_time(info.duration_s)
             frame, _ = grab_frame_at(clip.path, t)
             self.align_canvas.set_frame(frame)
             self.align_time_label.setText(format_duration(t))
             self.align_canvas.set_geometry(self._fitted_overlay(clip))
         except Exception as exc:
             QMessageBox.warning(self, APP_NAME, str(exc))
+
+    def _align_slider_time(self, duration_s: float) -> float:
+        if duration_s <= 0:
+            return 0.0
+        return (self.align_time.value() / 1000.0) * duration_s
+
+    def _load_clip_window(self, clip: ClipRecord, info) -> None:
+        start_s, end_s = clip.window(info.duration_s)
+        self._filling_clip_window = True
+        self.clip_start_spin.setRange(0.0, max(0.0, info.duration_s))
+        self.clip_end_spin.setRange(0.0, max(0.0, info.duration_s))
+        self.clip_start_spin.setValue(start_s)
+        self.clip_end_spin.setValue(end_s)
+        self._filling_clip_window = False
+        self.clip_window_label.setText(format_clip_window(start_s, end_s, info.duration_s))
+
+    def _clip_window_changed(self) -> None:
+        if self._filling_clip_window:
+            return
+        clip = self._current_clip()
+        if clip is None:
+            return
+        try:
+            info = probe_video(clip.path)
+        except Exception:
+            return
+        start_s = self.clip_start_spin.value()
+        end_s = self.clip_end_spin.value()
+        if end_s < start_s + 1.0:
+            sender = self.sender()
+            self._filling_clip_window = True
+            if sender is self.clip_start_spin:
+                end_s = min(info.duration_s, start_s + 1.0)
+                self.clip_end_spin.setValue(end_s)
+            else:
+                start_s = max(0.0, end_s - 1.0)
+                self.clip_start_spin.setValue(start_s)
+            self._filling_clip_window = False
+        start_s, end_s = clamp_clip_window(start_s, end_s, info.duration_s)
+        clip.process_start_s = start_s
+        clip.process_end_s = None if end_s >= info.duration_s - 0.05 else end_s
+        self.clip_window_label.setText(format_clip_window(start_s, end_s, info.duration_s))
+
+    def _clip_start_here(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        try:
+            info = probe_video(clip.path)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self.clip_start_spin.setValue(self._align_slider_time(info.duration_s))
+
+    def _clip_end_here(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        try:
+            info = probe_video(clip.path)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self.clip_end_spin.setValue(self._align_slider_time(info.duration_s))
+
+    def _clip_window_reset(self) -> None:
+        clip = self._current_clip()
+        if clip is None:
+            return
+        try:
+            info = probe_video(clip.path)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self._filling_clip_window = True
+        self.clip_start_spin.setValue(0.0)
+        self.clip_end_spin.setValue(info.duration_s)
+        self._filling_clip_window = False
+        clip.process_start_s = 0.0
+        clip.process_end_s = None
+        self.clip_window_label.setText(format_clip_window(0.0, info.duration_s, info.duration_s))
 
     def _on_nudge(self, dx: float, dy: float) -> None:
         clip = self._current_clip()
@@ -2324,13 +2628,28 @@ class MainWindow(QMainWindow):
                 "Weights are not included with a new install.",
             )
             return
+        report = device_report()
+        if mode == "trained" and report.device == "cpu":
+            go = QMessageBox.question(
+                self,
+                APP_NAME,
+                (report.warning or "No GPU is ready.")
+                + "\n\nThe trained detector will run on CPU. A 20-minute clip can take longer than the video. Continue?",
+            )
+            if go != QMessageBox.StandardButton.Yes:
+                return
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.stack.setCurrentIndex(PAGE_PROCESS)
         self.log.clear()
         self.results = []
         self.progress.setValue(0)
         self.cancel_btn.setEnabled(True)
+        preview_every = clamp_preview_every(self.preview_every_combo.currentData())
+        self.preview_canvas.clear_frame(
+            "Waiting for live preview…" if preview_every > 0 else "Live preview off"
+        )
         if mode == "trained":
+            self._append_log(f"Device: {inference_device_label(report.device)}")
             self._append_log(
                 f"Detection: trained detector  •  {weights}  •  "
                 f"conf {self.settings.detector_conf:.2f}  •  NMS {self.settings.detector_iou:.2f}  •  "
@@ -2343,8 +2662,7 @@ class MainWindow(QMainWindow):
             self._append_log("Trips: traces can infer gate hits when boxes miss the tripwire")
         else:
             self._append_log("Trips: confirmed box-to-box gate crossings only")
-        if self.settings.preview_every <= 0:
-            self._append_log("Live preview: off")
+        self._append_log(f"Live preview: {self._live_preview_label()}")
         limits = self.geometry.vehicle_area_limits()
         if limits:
             self._append_log(
@@ -2359,10 +2677,12 @@ class MainWindow(QMainWindow):
             self._append_log(f"Drop zones: {len(self.geometry.occlusions)} (recover a brief gap; detections inside still count)")
         self._append_log(f"Processing {len(jobs)} clip(s); skipped {len(skipped)}")
         self._append_log(f"Movements: {', '.join(self.geometry.movement_names())}")
-        example_stem = Path(jobs[0][0]).stem if jobs else self._export_example_stem()
+        example_stem = jobs[0].path.stem if jobs else self._export_example_stem()
         self._append_log(
             f"Export: {resolve_export_folder(self.export_dir, self._current_export_pattern(), video_stem=example_stem)}"
         )
+        for job in jobs:
+            self._append_log(f"{job.path.name}: {format_clip_window(job.start_s, job.end_s, job.duration_s)}")
 
         self.worker = ProcessWorker(
             jobs=jobs,
@@ -2378,7 +2698,7 @@ class MainWindow(QMainWindow):
             path_jump=self.settings.path_jump,
             detector_imgsz=self.settings.detector_imgsz,
             detect_stride=self.settings.detect_stride,
-            preview_every=self.settings.preview_every,
+            preview_every=preview_every,
             theme=self.settings.theme,
             infer_trips_from_traces=self.settings.infer_trips_from_traces,
         )
@@ -2388,6 +2708,24 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self._on_failed)
         self.worker.all_done.connect(self._on_all_done)
         self.worker.start()
+
+    def _live_preview_label(self, every: int | None = None) -> str:
+        value = self.settings.preview_every if every is None else every
+        if hasattr(self, "preview_every_combo") and every is None:
+            value = clamp_preview_every(self.preview_every_combo.currentData())
+        labels = {0: "off", 15: "every 15 frames", 30: "every 30 frames", 60: "every 60 frames"}
+        return labels.get(int(value), str(value))
+
+    def _live_preview_changed(self, *_args) -> None:
+        every = clamp_preview_every(self.preview_every_combo.currentData())
+        self._persist_settings()
+        if every <= 0:
+            self.preview_canvas.clear_frame("Live preview off")
+        elif not self.preview_canvas.has_frame():
+            self.preview_canvas.clear_frame("Waiting for live preview…")
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.set_preview_every(every)
+            self._append_log(f"Live preview: {self._live_preview_label(every)}")
 
     def _cancel_process(self) -> None:
         if self.worker:
@@ -2401,6 +2739,8 @@ class MainWindow(QMainWindow):
         self.process_status.setText(message)
 
     def _on_preview(self, frame: np.ndarray) -> None:
+        if clamp_preview_every(self.preview_every_combo.currentData()) <= 0:
+            return
         self.preview_canvas.set_frame(frame)
 
     def _on_video_done(self, result: ProcessResult) -> None:
@@ -2539,7 +2879,6 @@ class MainWindow(QMainWindow):
             return
         marked = draw_issue_overlay(frame, result.issues, result.geometry, highlight=highlight)
         self.review_canvas.set_frame(marked)
-        self.preview_canvas.set_frame(marked)
         minutes = int(highlight.time_s) // 60
         seconds = int(highlight.time_s) % 60
         self.review_status.setText(f"{minutes}:{seconds:02d}  {highlight.message}")
@@ -2585,15 +2924,40 @@ class MainWindow(QMainWindow):
     def _reset_flow(self) -> None:
         self.stack.setCurrentIndex(PAGE_SETUP)
 
+    def _go_step(self, page: int) -> None:
+        if page == PAGE_SETUP:
+            self.stack.setCurrentIndex(PAGE_SETUP)
+        elif page == PAGE_ROUTES:
+            self._go_routes()
+        elif page == PAGE_ALIGN:
+            self._go_align()
+        elif page == PAGE_PROCESS:
+            self.stack.setCurrentIndex(PAGE_PROCESS)
+        elif page == PAGE_REPORT:
+            if self.results:
+                self._populate_report()
+            self.stack.setCurrentIndex(PAGE_REPORT)
+
+    def _mark_active_step(self, index: int) -> None:
+        for page, button in getattr(self, "step_buttons", []):
+            button.setObjectName("primary" if page == index else "")
+            style = button.style()
+            if style is not None:
+                style.unpolish(button)
+                style.polish(button)
+            button.update()
+
     def _on_page_changed(self, index: int) -> None:
         home = index == PAGE_HOME
         self.header_bar.setVisible(not home)
-        self.steps.setVisible(index in PROCESS_PAGES)
+        on_process = index in PROCESS_PAGES
+        self.step_host.setVisible(on_process)
+        self.steps.setVisible(on_process)
+        self._mark_active_step(index)
         self.home_btn.setVisible(not home)
         if home:
             self.content_layout.setContentsMargins(0, 0, 0, 0)
             self.statusBar().hide()
-            self.home_stage.focus_menu()
         else:
             self.content_layout.setContentsMargins(16, 12, 16, 16)
             self.statusBar().show()
@@ -2648,6 +3012,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "detector_imgsz_combo"):
             imgsz = clamp_detector_imgsz(self.detector_imgsz_combo.currentData())
             stride = clamp_detect_stride(self.detect_stride_combo.currentData())
+        if hasattr(self, "preview_every_combo"):
             preview_every = clamp_preview_every(self.preview_every_combo.currentData())
         infer_trips = self.settings.infer_trips_from_traces
         sender = self.sender()
@@ -2760,12 +3125,13 @@ class MainWindow(QMainWindow):
 
     def _refresh_detector_status(self) -> None:
         path = visdrone_weights_path()
+        device = inference_device_label()
         if path.is_file():
-            text = f"VisDrone weights ready: {path}"
+            text = f"VisDrone weights ready: {path}  •  {device}"
         else:
             text = (
                 "VisDrone not trained yet. Open Training and run Train VisDrone "
-                f"(writes {path.name}; weights are not shipped)."
+                f"(writes {path.name}; weights are not shipped).  •  {device}"
             )
         if hasattr(self, "detector_status"):
             self.detector_status.setText(text)
@@ -2784,8 +3150,9 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(stylesheet_for(theme))
         if hasattr(self, "header_logo"):
             self.header_logo.setPixmap(load_brand_pixmap(theme, 40))
-        if hasattr(self, "home_stage"):
-            self.home_stage.set_theme(theme)
+        if hasattr(self, "home_logo"):
+            self.home_logo.setPixmap(load_brand_pixmap(theme, 48))
+        self._mark_active_step(self.stack.currentIndex() if hasattr(self, "stack") else PAGE_HOME)
         for name in (
             "canvas",
             "ref_canvas",
@@ -2807,6 +3174,8 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
     def _refresh_settings_page(self) -> None:
+        self._refresh_setup_list()
+        self._refresh_device_status()
         if hasattr(self, "export_pattern_edit"):
             self.export_pattern_edit.blockSignals(True)
             self.export_pattern_edit.setText(self.settings.export_pattern)
@@ -2830,6 +3199,7 @@ class MainWindow(QMainWindow):
                 max(0, self.detect_stride_combo.findData(self.settings.detect_stride))
             )
             self.detect_stride_combo.blockSignals(False)
+        if hasattr(self, "preview_every_combo"):
             self.preview_every_combo.blockSignals(True)
             self.preview_every_combo.setCurrentIndex(
                 max(0, self.preview_every_combo.findData(self.settings.preview_every))
@@ -2849,6 +3219,8 @@ class MainWindow(QMainWindow):
         timer.start()
 
     def _frame_check_still(self):
+        if self._check_frame is not None:
+            return self._check_frame
         if self._ref_frame is not None:
             return self._ref_frame
         if not self.videos:
@@ -2859,13 +3231,37 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _random_check_frame(self) -> None:
+        if not self.videos:
+            self._add_videos()
+            if self._check_frame is not None:
+                return
+        self._load_check_still()
+
+    def _load_check_still(self) -> None:
+        path = self._selected_video_path()
+        if path is None:
+            if hasattr(self, "frame_check_status"):
+                self.frame_check_status.setText(
+                    "Add a clip here or on Process, then click Random Frame."
+                )
+            return
+        try:
+            frame, index = grab_random_frame(path)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self._check_frame = frame
+        self._check_frame_note = f"Frame {index} from {path.name}"
+        self._run_frame_check()
+
     def _run_frame_check(self) -> None:
         if not hasattr(self, "check_canvas"):
             return
         still = self._frame_check_still()
         if still is None:
             self.frame_check_status.setText(
-                "Open a video and draw routes first so this still has a frame to check."
+                "Add a clip here or on Process, then click Random Frame."
             )
             return
         if self.settings.detector_mode != "trained":
@@ -2901,9 +3297,10 @@ class MainWindow(QMainWindow):
                 imgsz=self.settings.detector_imgsz,
             )
             self.check_canvas.set_frame(draw_detection_preview(still, detections))
+            note = f"  •  {self._check_frame_note}" if self._check_frame_note else ""
             self.frame_check_status.setText(
                 f"{len(detections)} box(es) on this still  •  "
-                f"conf {self.settings.detector_conf:.2f}  •  NMS {self.settings.detector_iou:.2f}"
+                f"conf {self.settings.detector_conf:.2f}  •  NMS {self.settings.detector_iou:.2f}{note}"
             )
         except Exception as exc:
             self.check_canvas.set_frame(still)
